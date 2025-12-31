@@ -595,3 +595,197 @@ class TestJITCompilation:
         x = jax.random.normal(k2, (batch, seq, model_dim))
         y, _ = forward(attn, x)
         assert y.shape == (batch, seq, model_dim)
+
+
+# -----------------------------------------------------------------------------
+# Streaming Equivalence Tests
+# -----------------------------------------------------------------------------
+
+
+class TestStreamingEquivalence:
+    """Tests for streaming (token-by-token) equivalence with batch processing."""
+
+    def test_chunked_attention_streaming_equivalence(self, random_seed):
+        """Verify streaming with cache matches batch processing within a chunk."""
+        batch, heads, head_dim, value_dim = 1, 2, 16, 16
+        chunk_size = 8
+        seq_len = 6  # Within one chunk
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        # Generate full sequence Q/K/V
+        q_full = jax.random.normal(k2, (batch, seq_len, heads, head_dim))
+        k_full = jax.random.normal(k3, (batch, seq_len, heads, head_dim))
+        v_full = jax.random.normal(k4, (batch, seq_len, heads, value_dim))
+
+        # Batch processing (no cache)
+        out_batch, _, _ = attn(q_full, k_full, v_full, return_cache=False)
+
+        # Streaming processing (token by token with cache)
+        streaming_outputs = []
+        cache = None
+        for i in range(seq_len):
+            q_i = q_full[:, i : i + 1, :, :]
+            k_i = k_full[:, i : i + 1, :, :]
+            v_i = v_full[:, i : i + 1, :, :]
+
+            out_i, cache, _ = attn(q_i, k_i, v_i, cache=cache, return_cache=True)
+            streaming_outputs.append(out_i)
+
+        out_streaming = jnp.concatenate(streaming_outputs, axis=1)
+
+        # Outputs should match (within a single chunk)
+        np.testing.assert_allclose(
+            np.array(out_batch),
+            np.array(out_streaming),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Streaming output should match batch output within a single chunk",
+        )
+
+    def test_chunk_boundary_cache_reset(self, random_seed):
+        """Verify cache is reset at chunk boundaries."""
+        batch, heads, head_dim, value_dim = 1, 2, 8, 8
+        chunk_size = 4
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        # Process tokens 0-3 (first chunk), then tokens 4-5 (second chunk)
+        cache = None
+        for i in range(6):
+            q = jax.random.normal(jax.random.fold_in(k2, i), (batch, 1, heads, head_dim))
+            k = jax.random.normal(jax.random.fold_in(k3, i), (batch, 1, heads, head_dim))
+            v = jax.random.normal(jax.random.fold_in(k4, i), (batch, 1, heads, value_dim))
+
+            _, cache, position = attn(q, k, v, cache=cache, return_cache=True)
+
+            pos_in_chunk = i % chunk_size
+            if pos_in_chunk == 0 and i > 0:
+                # At chunk boundary, cache should have been reset
+                # Cache should only have 1 entry (the new token)
+                assert cache.k.shape[1] == 1, (
+                    f"Cache should reset at chunk boundary (pos {i}), "
+                    f"got cache size {cache.k.shape[1]}"
+                )
+            else:
+                # Within chunk, cache should accumulate
+                expected_size = pos_in_chunk + 1
+                assert cache.k.shape[1] == expected_size, (
+                    f"Cache should have {expected_size} entries at pos {i}, got {cache.k.shape[1]}"
+                )
+
+    def test_cache_trim_cross_chunk(self, random_seed):
+        """Test that cache spanning previous chunk is trimmed correctly."""
+        batch, heads, head_dim, value_dim = 1, 2, 8, 8
+        chunk_size = 4
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        # Build a cache that spans a chunk boundary by manually constructing it
+        from megalodon_jax.types import AttentionCache
+
+        # Simulate being at position 5 (pos_in_chunk=1) with a cache of 3 entries
+        # The cache should be trimmed to only 1 entry (the current chunk's entries)
+        fake_k = jax.random.normal(k2, (batch, 3, heads, head_dim))
+        fake_v = jax.random.normal(k3, (batch, 3, heads, value_dim))
+        fake_cache = AttentionCache(k=fake_k, v=fake_v, count=jnp.array(5, dtype=jnp.int32))
+
+        # Process a new token at position 5
+        q = jax.random.normal(k4, (batch, 1, heads, head_dim))
+        k = jax.random.normal(jax.random.fold_in(k4, 1), (batch, 1, heads, head_dim))
+        v = jax.random.normal(jax.random.fold_in(k4, 2), (batch, 1, heads, value_dim))
+
+        _, new_cache, _ = attn(q, k, v, cache=fake_cache, return_cache=True)
+
+        # pos_in_chunk = 5 % 4 = 1, so cache should be trimmed to 1 + 1 = 2 entries
+        # (1 from previous position in current chunk + 1 new token)
+        assert new_cache.k.shape[1] == 2, (
+            f"Cache should be trimmed to 2 entries (pos_in_chunk=1 + 1 new), "
+            f"got {new_cache.k.shape[1]}"
+        )
+
+
+# -----------------------------------------------------------------------------
+# Parity Tests
+# -----------------------------------------------------------------------------
+
+
+class TestParity:
+    """Additional parity tests for MegalodonAttention and related modules."""
+
+    def test_chunked_attention_block_diagonal_structure(self, random_seed):
+        """Verify block-diagonal attention structure across chunks."""
+        batch, heads, head_dim, value_dim = 1, 2, 8, 8
+        chunk_size = 4
+        seq_len = 8  # Two full chunks
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        # Generate full sequence Q/K/V
+        q = jax.random.normal(k2, (batch, seq_len, heads, head_dim))
+        k = jax.random.normal(k3, (batch, seq_len, heads, head_dim))
+        v = jax.random.normal(k4, (batch, seq_len, heads, value_dim))
+
+        # Get batch output
+        out, _, _ = attn(q, k, v)
+
+        # Process each chunk separately and compare
+        # First chunk: positions 0-3
+        q1, k1, v1 = q[:, :4], k[:, :4], v[:, :4]
+        out1, _, _ = attn(q1, k1, v1)
+
+        # Second chunk: positions 4-7
+        q2, k2, v2 = q[:, 4:], k[:, 4:], v[:, 4:]
+        out2, _, _ = attn(q2, k2, v2)
+
+        # Block-diagonal: each chunk's output should match processing independently
+        np.testing.assert_allclose(
+            np.array(out[:, :4]),
+            np.array(out1),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="First chunk output should match independent processing",
+        )
+        np.testing.assert_allclose(
+            np.array(out[:, 4:]),
+            np.array(out2),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Second chunk output should match independent processing",
+        )

@@ -36,7 +36,6 @@ def attention_single_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch kv_seq heads head_dim"],
     v: Float[Array, "batch kv_seq heads value_dim"],
-    mask: Bool[Array, "batch seq"] | None = None,
     kv_mask: Bool[Array, "batch kv_seq"] | None = None,
     causal: bool = True,
     dropout_rate: float = 0.0,
@@ -53,7 +52,6 @@ def attention_single_chunk(
         q: Query tensor of shape (batch, seq, heads, head_dim).
         k: Key tensor of shape (batch, kv_seq, heads, head_dim).
         v: Value tensor of shape (batch, kv_seq, heads, value_dim).
-        mask: Optional query mask where True marks valid positions.
         kv_mask: Optional key/value mask where True marks valid positions.
         causal: Whether to apply causal masking (default True).
         dropout_rate: Attention dropout rate.
@@ -159,7 +157,6 @@ def attention_multi_chunk(
             q_rot,
             k_rot,
             v,
-            mask=None,
             kv_mask=mask,
             causal=True,
             dropout_rate=dropout_rate,
@@ -226,7 +223,6 @@ def attention_multi_chunk(
             q_c[None, ...],
             k_c[None, ...],
             v_c[None, ...],
-            mask=None,
             kv_mask=m_c[None, ...] if m_c is not None else None,
             causal=True,
             dropout_rate=dropout_rate,
@@ -403,33 +399,39 @@ class ChunkedAttention(eqx.Module):
             return out, None, position + L
 
         # Streaming path: use cache
-        # Check for chunk boundary reset
+        # Enforce block-diagonal structure by resetting/trimming cache at chunk boundaries
+        # This matches the "faithful_chunk_local" logic in the PyTorch reference.
         pos_in_chunk = position % self.chunk_size
 
         # Apply RoPE to new Q and K
         q_rot, k_rot = self.rotary(q, k, position)
 
-        # Handle cache
+        # Handle cache with faithful_chunk_local logic
         if cache is None or pos_in_chunk == 0:
-            # Start fresh: either first token or chunk boundary
+            # Start fresh: either first token or chunk boundary reset
             k_cached = k_rot
             v_cached = v
+        elif cache.k.shape[1] > pos_in_chunk:
+            # Cache spans previous chunk - trim to only keep current chunk's entries
+            # This enforces block-diagonal structure during streaming
+            k_cached = jnp.concatenate([cache.k[:, -pos_in_chunk:], k_rot], axis=1)
+            v_cached = jnp.concatenate([cache.v[:, -pos_in_chunk:], v], axis=1)
         else:
-            # Extend within chunk
+            # Normal case: extend within chunk
             k_cached = jnp.concatenate([cache.k, k_rot], axis=1)
             v_cached = jnp.concatenate([cache.v, v], axis=1)
 
-            # Clamp to max_cache_len
-            if k_cached.shape[1] > max_cache_len:
-                k_cached = k_cached[:, -max_cache_len:]
-                v_cached = v_cached[:, -max_cache_len:]
+        # Clamp to max_cache_len (shouldn't exceed chunk_size for faithful mode)
+        if k_cached.shape[1] > max_cache_len:
+            k_cached = k_cached[:, -max_cache_len:]
+            v_cached = v_cached[:, -max_cache_len:]
 
         # Build mask for cached keys
         kv_mask = None
         if mask is not None:
-            if cache is not None and cache.k.shape[1] > 0 and pos_in_chunk != 0:
+            cache_len = k_cached.shape[1] - L
+            if cache_len > 0:
                 # Extend mask for cached positions (all valid)
-                cache_len = k_cached.shape[1] - L
                 cache_mask = jnp.ones((B, cache_len), dtype=jnp.bool_)
                 kv_mask = jnp.concatenate([cache_mask, mask], axis=1)
             else:
@@ -440,7 +442,6 @@ class ChunkedAttention(eqx.Module):
             q_rot,
             k_cached,
             v_cached,
-            mask=None,
             kv_mask=kv_mask,
             causal=True,
             dropout_rate=self.attention_dropout,
@@ -620,11 +621,11 @@ class MegalodonAttention(eqx.Module):
         Dh = self.head_dim
         Dv = self.value_head_dim
 
-        # Split keys for dropout
+        # Split keys for dropout (4 keys: attention, mx_dropout, gated_dropout, output_dropout)
         if key is not None:
-            k1, k2, k3 = jax.random.split(key, 3)
+            k1, k2, k3, k4 = jax.random.split(key, 4)
         else:
-            k1 = k2 = k3 = None
+            k1 = k2 = k3 = k4 = None
 
         # Extract cache components
         norm_state = cache.norm if cache is not None else None
@@ -643,8 +644,11 @@ class MegalodonAttention(eqx.Module):
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
-        # RMSNorm on CEMA output
+        # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
         mx = self.rmsnorm(y_cema)
+        if not deterministic and self.hidden_dropout > 0.0 and k2 is not None:
+            keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, mx.shape)
+            mx = jnp.where(keep, mx / (1.0 - self.hidden_dropout), 0.0)
 
         # Shared Z projection for Q/K
         z = jax.vmap(jax.vmap(self.wz))(mx)  # (B, L, z_dim)
@@ -690,17 +694,17 @@ class MegalodonAttention(eqx.Module):
         # Apply gate
         gated = out * r
 
-        # Hidden dropout
-        if not deterministic and self.hidden_dropout > 0.0 and k2 is not None:
-            keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, gated.shape)
+        # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
+        if not deterministic and self.hidden_dropout > 0.0 and k3 is not None:
+            keep = jax.random.bernoulli(k3, 1.0 - self.hidden_dropout, gated.shape)
             gated = jnp.where(keep, gated / (1.0 - self.hidden_dropout), 0.0)
 
         # Output projections
         h = jax.vmap(jax.vmap(self.wh1))(mx) + jax.vmap(jax.vmap(self.wh2))(gated)
 
         # Output dropout
-        if not deterministic and self.dropout > 0.0 and k3 is not None:
-            keep = jax.random.bernoulli(k3, 1.0 - self.dropout, h.shape)
+        if not deterministic and self.dropout > 0.0 and k4 is not None:
+            keep = jax.random.bernoulli(k4, 1.0 - self.dropout, h.shape)
             h = jnp.where(keep, h / (1.0 - self.dropout), 0.0)
 
         # Residual
