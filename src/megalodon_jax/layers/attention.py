@@ -398,65 +398,126 @@ class ChunkedAttention(eqx.Module):
             )
             return out, None, position + L
 
-        # Streaming path: use cache
-        # Enforce block-diagonal structure by resetting/trimming cache at chunk boundaries
-        # This matches the "faithful_chunk_local" logic in the PyTorch reference.
-        pos_in_chunk = position % self.chunk_size
+        # Streaming path: use cache with faithful_chunk_local logic
+        # When L > 1 and sequence spans chunk boundary, we must loop to avoid
+        # cross-chunk attention (which would violate block-diagonal structure).
+        # This matches the PyTorch reference lines 1074-1103.
 
-        # Apply RoPE to new Q and K
-        q_rot, k_rot = self.rotary(q, k, position)
+        def _attend_single_step(
+            q_step: Float[Array, "batch step_len heads head_dim"],
+            k_step: Float[Array, "batch step_len heads head_dim"],
+            v_step: Float[Array, "batch step_len heads value_dim"],
+            cur_cache: AttentionCache | None,
+            cur_pos: Int[Array, ""],
+            mask_step: Bool[Array, "batch step_len"] | None,
+            key_step: PRNGKeyArray | None,
+        ) -> tuple[
+            Float[Array, "batch step_len heads value_dim"],
+            AttentionCache,
+            Int[Array, ""],
+        ]:
+            """Process one chunk step with faithful_chunk_local cache handling."""
+            step_len = q_step.shape[1]
+            pos_in_chunk = cur_pos % self.chunk_size
 
-        # Handle cache with faithful_chunk_local logic
-        if cache is None or pos_in_chunk == 0:
-            # Start fresh: either first token or chunk boundary reset
-            k_cached = k_rot
-            v_cached = v
-        elif cache.k.shape[1] > pos_in_chunk:
-            # Cache spans previous chunk - trim to only keep current chunk's entries
-            # This enforces block-diagonal structure during streaming
-            k_cached = jnp.concatenate([cache.k[:, -pos_in_chunk:], k_rot], axis=1)
-            v_cached = jnp.concatenate([cache.v[:, -pos_in_chunk:], v], axis=1)
-        else:
-            # Normal case: extend within chunk
-            k_cached = jnp.concatenate([cache.k, k_rot], axis=1)
-            v_cached = jnp.concatenate([cache.v, v], axis=1)
+            # Apply RoPE to new Q and K
+            q_rot, k_rot = self.rotary(q_step, k_step, cur_pos)
 
-        # Clamp to max_cache_len (shouldn't exceed chunk_size for faithful mode)
-        if k_cached.shape[1] > max_cache_len:
-            k_cached = k_cached[:, -max_cache_len:]
-            v_cached = v_cached[:, -max_cache_len:]
-
-        # Build mask for cached keys
-        kv_mask = None
-        if mask is not None:
-            cache_len = k_cached.shape[1] - L
-            if cache_len > 0:
-                # Extend mask for cached positions (all valid)
-                cache_mask = jnp.ones((B, cache_len), dtype=jnp.bool_)
-                kv_mask = jnp.concatenate([cache_mask, mask], axis=1)
+            # Handle cache with faithful_chunk_local logic
+            if cur_cache is None or pos_in_chunk == 0:
+                # Start fresh: either first token or chunk boundary reset
+                k_cached = k_rot
+                v_cached = v_step
+            elif cur_cache.k.shape[1] > pos_in_chunk:
+                # Cache spans previous chunk - trim to only keep current chunk's entries
+                k_cached = jnp.concatenate([cur_cache.k[:, -pos_in_chunk:], k_rot], axis=1)
+                v_cached = jnp.concatenate([cur_cache.v[:, -pos_in_chunk:], v_step], axis=1)
             else:
-                kv_mask = mask
+                # Normal case: extend within chunk
+                k_cached = jnp.concatenate([cur_cache.k, k_rot], axis=1)
+                v_cached = jnp.concatenate([cur_cache.v, v_step], axis=1)
 
-        # Attention with cached K/V
-        out = attention_single_chunk(
-            q_rot,
-            k_cached,
-            v_cached,
-            kv_mask=kv_mask,
-            causal=True,
-            dropout_rate=self.attention_dropout,
-            deterministic=deterministic,
-            key=key,
-        )
+            # Clamp to max_cache_len
+            if k_cached.shape[1] > max_cache_len:
+                k_cached = k_cached[:, -max_cache_len:]
+                v_cached = v_cached[:, -max_cache_len:]
 
-        # Update cache
-        new_position = position + L
-        if return_cache:
-            new_cache = AttentionCache(k=k_cached, v=v_cached, count=new_position)
-        else:
-            new_cache = None
+            # Build mask for cached keys
+            kv_mask = None
+            if mask_step is not None:
+                cache_len = k_cached.shape[1] - step_len
+                if cache_len > 0:
+                    cache_mask = jnp.ones((B, cache_len), dtype=jnp.bool_)
+                    kv_mask = jnp.concatenate([cache_mask, mask_step], axis=1)
+                else:
+                    kv_mask = mask_step
 
-        return out, new_cache, new_position
+            # Attention with cached K/V
+            out_step = attention_single_chunk(
+                q_rot,
+                k_cached,
+                v_cached,
+                kv_mask=kv_mask,
+                causal=True,
+                dropout_rate=self.attention_dropout,
+                deterministic=deterministic,
+                key=key_step,
+            )
+
+            new_pos = cur_pos + step_len
+            step_cache = AttentionCache(k=k_cached, v=v_cached, count=new_pos)
+            return out_step, step_cache, new_pos
+
+        # Check if we need to loop (L > 1 and might cross chunk boundary)
+        pos_in_chunk = position % self.chunk_size
+        tokens_until_boundary = self.chunk_size - pos_in_chunk
+
+        if L <= tokens_until_boundary:
+            # All tokens fit in current chunk - single pass
+            out, new_cache, new_position = _attend_single_step(q, k, v, cache, position, mask, key)
+            if not return_cache:
+                new_cache = None
+            return out, new_cache, new_position
+
+        # Multi-token call spanning chunk boundary - loop through chunks
+        outputs = []
+        cur_cache = cache
+        cur_pos = position
+        offset = 0
+
+        while offset < L:
+            remaining = L - offset
+            cur_pos_in_chunk = cur_pos % self.chunk_size
+
+            # Calculate how many tokens we can process without crossing a boundary
+            chunk_len = min(remaining, self.chunk_size - cur_pos_in_chunk)
+            end = offset + chunk_len
+
+            # Slice inputs for this chunk
+            q_chunk = q[:, offset:end]
+            k_chunk = k[:, offset:end]
+            v_chunk = v[:, offset:end]
+            mask_chunk = mask[:, offset:end] if mask is not None else None
+
+            # Split key for this chunk if needed
+            if key is not None:
+                key, key_chunk = jax.random.split(key)
+            else:
+                key_chunk = None
+
+            out_chunk, cur_cache, cur_pos = _attend_single_step(
+                q_chunk, k_chunk, v_chunk, cur_cache, cur_pos, mask_chunk, key_chunk
+            )
+            outputs.append(out_chunk)
+            offset = end
+
+        out = jnp.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
+        new_position = cur_pos
+
+        if not return_cache:
+            cur_cache = None
+
+        return out, cur_cache, new_position
 
 
 # -----------------------------------------------------------------------------

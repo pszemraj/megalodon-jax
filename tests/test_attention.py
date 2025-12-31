@@ -789,3 +789,301 @@ class TestParity:
             atol=1e-5,
             err_msg="Second chunk output should match independent processing",
         )
+
+    def test_multi_token_streaming_across_boundary(self, random_seed):
+        """Test that multi-token streaming calls properly split across chunk boundaries."""
+        batch, heads, head_dim, value_dim = 1, 2, 8, 8
+        chunk_size = 4
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        # Generate a sequence that spans chunk boundary
+        seq_len = 6  # Will span positions 0-5 when starting from position 2
+        q = jax.random.normal(k2, (batch, seq_len, heads, head_dim))
+        k = jax.random.normal(k3, (batch, seq_len, heads, head_dim))
+        v = jax.random.normal(k4, (batch, seq_len, heads, value_dim))
+
+        # Start at position 2, so tokens will span positions 2,3 | 4,5,6,7
+        # chunk boundary at position 4
+        from megalodon_jax.types import AttentionCache
+
+        # Pre-fill cache with 2 tokens at positions 0-1
+        init_k = jax.random.normal(jax.random.fold_in(k1, 0), (batch, 2, heads, head_dim))
+        init_v = jax.random.normal(jax.random.fold_in(k1, 1), (batch, 2, heads, value_dim))
+        # Apply RoPE to initial K
+        init_k_rot, _ = attn.rotary(init_k, init_k, jnp.array(0))
+        cache = AttentionCache(k=init_k_rot, v=init_v, count=jnp.array(2, dtype=jnp.int32))
+
+        # Process multi-token call that spans boundary
+        out_multi, cache_multi, pos_multi = attn(
+            q, k, v, cache=cache, return_cache=True
+        )
+
+        # Now compare with token-by-token processing
+        streaming_outputs = []
+        cache_stream = cache
+        for i in range(seq_len):
+            q_i = q[:, i : i + 1]
+            k_i = k[:, i : i + 1]
+            v_i = v[:, i : i + 1]
+            out_i, cache_stream, _ = attn(
+                q_i, k_i, v_i, cache=cache_stream, return_cache=True
+            )
+            streaming_outputs.append(out_i)
+
+        out_streaming = jnp.concatenate(streaming_outputs, axis=1)
+
+        # Multi-token and streaming should produce same result
+        np.testing.assert_allclose(
+            np.array(out_multi),
+            np.array(out_streaming),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Multi-token streaming should match token-by-token when crossing chunk boundary",
+        )
+
+        # Final cache positions should match
+        assert int(pos_multi) == int(cache_stream.count), (
+            f"Final positions should match: multi={int(pos_multi)}, stream={int(cache_stream.count)}"
+        )
+
+
+# -----------------------------------------------------------------------------
+# MegalodonAttention Parity Tests
+# -----------------------------------------------------------------------------
+
+
+class TestMegalodonAttentionParity:
+    """Parity tests for MegalodonAttention against PyTorch reference."""
+
+    def test_megalodon_attention_forward_parity(self, random_seed):
+        """Test MegalodonAttention forward pass parity with PyTorch reference."""
+        pytest = __import__("pytest")
+
+        # Check if PyTorch reference is available
+        try:
+            import sys
+
+            sys.path.insert(
+                0,
+                "/home/pszemraj/workspace/LLM/experimental-arch/megalodon-2512/megalodon-jax/src",
+            )
+            from megalodon.modeling_megalodon import MegalodonAttention as TorchMegalodonAttention
+            from megalodon.modeling_megalodon import MegalodonConfig as TorchConfig
+        except ImportError:
+            pytest.skip("PyTorch reference not available")
+
+        # Config matching both implementations
+        batch, seq_len = 1, 8
+        model_dim = 32
+        z_dim = 16
+        value_dim = 16
+        num_heads = 2
+        cema_ndim = 2
+        chunk_size = 4
+        norm_num_groups = 2
+
+        # Create PyTorch module
+        torch_cfg = TorchConfig(
+            model_dim=model_dim,
+            num_heads=num_heads,
+            z_dim=z_dim,
+            value_dim=value_dim,
+            cema_ndim=cema_ndim,
+            chunk_size=chunk_size,
+            norm_num_groups=norm_num_groups,
+            norm_eps=1e-5,
+            norm_affine=True,
+            rope_base=10000.0,
+            dropout=0.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        torch_attn = TorchMegalodonAttention(torch_cfg)
+        torch_attn.eval()
+
+        # Create JAX module with same config
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+
+        jax_attn = MegalodonAttention(
+            model_dim=model_dim,
+            z_dim=z_dim,
+            value_dim=value_dim,
+            num_heads=num_heads,
+            cema_ndim=cema_ndim,
+            chunk_size=chunk_size,
+            norm_num_groups=norm_num_groups,
+            norm_eps=1e-5,
+            rope_base=10000.0,
+            dropout=0.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            key=k1,
+        )
+
+        # Copy weights from PyTorch to JAX
+        # TimestepNorm
+        jax_attn = eqx.tree_at(
+            lambda m: m.timenorm.weight, jax_attn, to_jax(torch_attn.timenorm.weight)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.timenorm.bias, jax_attn, to_jax(torch_attn.timenorm.bias)
+        )
+
+        # ComplexEMA (alpha, delta, theta stored as real tensors)
+        jax_attn = eqx.tree_at(
+            lambda m: m.cema.alpha,
+            jax_attn,
+            to_jax(torch_attn.cema.alpha),
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.cema.delta,
+            jax_attn,
+            to_jax(torch_attn.cema.delta),
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.cema.theta,
+            jax_attn,
+            to_jax(torch_attn.cema.theta),
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.cema.gamma_real,
+            jax_attn,
+            to_jax(torch_attn.cema.gamma_real),
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.cema.gamma_imag,
+            jax_attn,
+            to_jax(torch_attn.cema.gamma_imag),
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.cema.omega,
+            jax_attn,
+            to_jax(torch_attn.cema.omega),
+        )
+
+        # RMSNorm
+        jax_attn = eqx.tree_at(
+            lambda m: m.rmsnorm.gamma, jax_attn, to_jax(torch_attn.rmsnorm.gamma)
+        )
+
+        # Projections (both PyTorch and Equinox use (out_features, in_features) layout)
+        jax_attn = eqx.tree_at(
+            lambda m: m.wz.weight, jax_attn, to_jax(torch_attn.wz.weight)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wz.bias, jax_attn, to_jax(torch_attn.wz.bias)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wv.weight, jax_attn, to_jax(torch_attn.wv.weight)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wv.bias, jax_attn, to_jax(torch_attn.wv.bias)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wr.weight, jax_attn, to_jax(torch_attn.wr.weight)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wr.bias, jax_attn, to_jax(torch_attn.wr.bias)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wh1.weight, jax_attn, to_jax(torch_attn.wh1.weight)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wh1.bias, jax_attn, to_jax(torch_attn.wh1.bias)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wh2.weight, jax_attn, to_jax(torch_attn.wh2.weight)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.wh2.bias, jax_attn, to_jax(torch_attn.wh2.bias)
+        )
+
+        # Q/K affine parameters
+        jax_attn = eqx.tree_at(
+            lambda m: m.gamma, jax_attn, to_jax(torch_attn.gamma)
+        )
+        jax_attn = eqx.tree_at(
+            lambda m: m.beta, jax_attn, to_jax(torch_attn.beta)
+        )
+
+        # Inner attention rotary
+        jax_attn = eqx.tree_at(
+            lambda m: m.inner.rotary.inv_freq,
+            jax_attn,
+            to_jax(torch_attn.inner.rope.inv_freq),
+        )
+
+        # Generate input
+        x_jax = jax.random.normal(k2, (batch, seq_len, model_dim))
+        x_torch = to_torch(x_jax)
+
+        # Forward pass
+        with torch.no_grad():
+            y_torch, _ = torch_attn(x_torch)
+
+        y_jax, _ = jax_attn(x_jax, deterministic=True)
+
+        # Compare outputs
+        np.testing.assert_allclose(
+            np.array(y_jax),
+            y_torch.numpy(),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="MegalodonAttention output should match PyTorch reference",
+        )
+
+    def test_megalodon_attention_gradient_flow(self, random_seed):
+        """Verify gradients flow through all parameters without NaN."""
+        batch, seq_len = 1, 8
+        model_dim = 32
+        z_dim = 16
+        value_dim = 16
+        num_heads = 2
+        cema_ndim = 2
+        chunk_size = 4
+        norm_num_groups = 2
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+
+        attn = MegalodonAttention(
+            model_dim=model_dim,
+            z_dim=z_dim,
+            value_dim=value_dim,
+            num_heads=num_heads,
+            cema_ndim=cema_ndim,
+            chunk_size=chunk_size,
+            norm_num_groups=norm_num_groups,
+            key=k1,
+        )
+
+        x = jax.random.normal(k2, (batch, seq_len, model_dim))
+
+        def loss_fn(model):
+            y, _ = model(x, deterministic=True)
+            return jnp.mean(y**2)
+
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(attn)
+
+        # Check loss is finite
+        assert jnp.isfinite(loss), f"Loss should be finite, got {loss}"
+
+        # Check all gradients are finite
+        grad_leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+        for i, g in enumerate(grad_leaves):
+            assert jnp.all(jnp.isfinite(g)), f"Gradient {i} has non-finite values"
+
+        # Check at least some gradients are non-zero
+        non_zero_grads = sum(1 for g in grad_leaves if jnp.any(g != 0))
+        assert non_zero_grads > 0, "At least some gradients should be non-zero"
