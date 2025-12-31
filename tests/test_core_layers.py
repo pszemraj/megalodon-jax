@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
-from megalodon_jax.types import NormState
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -52,9 +51,7 @@ class TestTimestepNormParity:
         y_jax, state_jax = jax_norm(x_jax)
 
         # Compare outputs
-        np.testing.assert_allclose(
-            np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
         # Compare output state
         np.testing.assert_allclose(
@@ -85,8 +82,11 @@ class TestTimestepNormParity:
 
         # Outputs should match (with some tolerance due to floating point)
         np.testing.assert_allclose(
-            np.array(y_chunked), np.array(y_full), rtol=1e-4, atol=1e-5,
-            err_msg="Chunked processing should match full sequence"
+            np.array(y_chunked),
+            np.array(y_full),
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg="Chunked processing should match full sequence",
         )
 
     def test_weight_initialization(self):
@@ -116,10 +116,13 @@ class TestTimestepNormParity:
         x = jax.random.normal(key, (batch, seq, dim))
 
         # Create mask: first 8 positions valid, rest masked
-        mask = jnp.concatenate([
-            jnp.ones((batch, 8), dtype=jnp.bool_),
-            jnp.zeros((batch, 8), dtype=jnp.bool_),
-        ], axis=1)
+        mask = jnp.concatenate(
+            [
+                jnp.ones((batch, 8), dtype=jnp.bool_),
+                jnp.zeros((batch, 8), dtype=jnp.bool_),
+            ],
+            axis=1,
+        )
 
         y_masked, state_masked = jax_norm(x, mask=mask)
 
@@ -167,12 +170,8 @@ class TestComplexEMAParity:
         p_jax, q_jax, gamma_jax = jax_ema._coeffs()
 
         # Compare
-        np.testing.assert_allclose(
-            np.array(p_jax), p_torch.detach().numpy(), rtol=1e-5, atol=1e-6
-        )
-        np.testing.assert_allclose(
-            np.array(q_jax), q_torch.detach().numpy(), rtol=1e-5, atol=1e-6
-        )
+        np.testing.assert_allclose(np.array(p_jax), p_torch.detach().numpy(), rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(np.array(q_jax), q_torch.detach().numpy(), rtol=1e-5, atol=1e-6)
         np.testing.assert_allclose(
             np.array(gamma_jax), gamma_torch.detach().numpy(), rtol=1e-5, atol=1e-6
         )
@@ -206,9 +205,7 @@ class TestComplexEMAParity:
         y_jax, _ = jax_ema(x_jax, h_init=None, return_state=False)
 
         # Compare outputs
-        np.testing.assert_allclose(
-            np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
     def test_sequential_forward_parity(self, random_seed):
         """Test sequential path forward pass matches PyTorch."""
@@ -239,14 +236,10 @@ class TestComplexEMAParity:
         y_jax, h_jax = jax_ema(x_jax, h_init=None, return_state=True)
 
         # Compare outputs
-        np.testing.assert_allclose(
-            np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
         # Compare final state
-        np.testing.assert_allclose(
-            np.array(h_jax), h_torch.detach().numpy(), rtol=1e-4, atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(h_jax), h_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
     def test_fft_vs_sequential_equivalence(self, random_seed):
         """Test that FFT and sequential paths produce equivalent outputs."""
@@ -270,8 +263,11 @@ class TestComplexEMAParity:
 
         # Should produce equivalent outputs
         np.testing.assert_allclose(
-            np.array(y_fft), np.array(y_seq), rtol=1e-4, atol=1e-5,
-            err_msg="FFT and sequential paths should produce equivalent outputs"
+            np.array(y_fft),
+            np.array(y_seq),
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg="FFT and sequential paths should produce equivalent outputs",
         )
 
     def test_state_continuity(self, random_seed):
@@ -298,8 +294,11 @@ class TestComplexEMAParity:
 
         # Should match (within numerical tolerance)
         np.testing.assert_allclose(
-            np.array(y_chunked), np.array(y_full), rtol=1e-4, atol=1e-5,
-            err_msg="Chunked processing should match full sequence"
+            np.array(y_chunked),
+            np.array(y_full),
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg="Chunked processing should match full sequence",
         )
 
     def test_q_magnitude_bounded(self, random_seed):
@@ -339,6 +338,181 @@ class TestComplexEMAParity:
         y2, _ = forward(jax_ema, x)
 
         np.testing.assert_array_equal(np.array(y1), np.array(y2))
+
+
+class TestPrecisionPolicy:
+    """Tests for bf16/fp16 precision handling."""
+
+    def test_timestep_norm_bf16_input(self, random_seed):
+        """Test TimestepNorm works correctly with bf16 inputs."""
+        dim = 64
+        num_groups = 8
+
+        jax_norm = TimestepNorm(dim, num_groups)
+
+        batch, seq = 2, 16
+        key = jax.random.PRNGKey(random_seed)
+
+        # Create bf16 input
+        x_f32 = jax.random.normal(key, (batch, seq, dim))
+        x_bf16 = x_f32.astype(jnp.bfloat16)
+
+        # Forward pass should work
+        y_bf16, state = jax_norm(x_bf16)
+
+        # Output dtype should match input dtype
+        assert y_bf16.dtype == jnp.bfloat16
+
+        # Compare with fp32 path (within bf16 tolerance)
+        y_f32, _ = jax_norm(x_f32)
+        np.testing.assert_allclose(
+            np.array(y_bf16.astype(jnp.float32)),
+            np.array(y_f32),
+            rtol=1e-2,
+            atol=1e-2,
+            err_msg="bf16 output should be close to fp32 output",
+        )
+
+    def test_timestep_norm_fp16_rejected(self):
+        """Test TimestepNorm rejects fp16 inputs for stability."""
+        dim = 64
+        num_groups = 8
+
+        jax_norm = TimestepNorm(dim, num_groups)
+        x_fp16 = jnp.ones((2, 16, dim), dtype=jnp.float16)
+
+        with pytest.raises(TypeError, match="float16"):
+            jax_norm(x_fp16)
+
+    def test_complex_ema_bf16_params(self, random_seed):
+        """Test ComplexEMA computes coefficients in fp32 even with bf16 params."""
+        dim = 64
+        ndim = 16
+
+        key = jax.random.PRNGKey(random_seed)
+        ema_f32 = ComplexEMA(dim, ndim, key=key)
+
+        # Cast parameters to bf16
+        def to_bf16(x):
+            if eqx.is_array(x) and x.dtype == jnp.float32:
+                return x.astype(jnp.bfloat16)
+            return x
+
+        ema_bf16 = jax.tree.map(to_bf16, ema_f32)
+
+        # Coefficients should be computed in fp32
+        p_f32, q_f32, gamma_f32 = ema_f32._coeffs()
+        p_bf16, q_bf16, gamma_bf16 = ema_bf16._coeffs()
+
+        # All coefficient outputs should be fp32/complex64 regardless of param dtype
+        assert p_f32.dtype == jnp.float32
+        assert p_bf16.dtype == jnp.float32, f"Expected float32, got {p_bf16.dtype}"
+        assert q_f32.dtype == jnp.complex64
+        assert q_bf16.dtype == jnp.complex64, f"Expected complex64, got {q_bf16.dtype}"
+        assert gamma_f32.dtype == jnp.complex64
+        assert gamma_bf16.dtype == jnp.complex64, f"Expected complex64, got {gamma_bf16.dtype}"
+
+        # Values should be close, but bf16 params have quantization noise
+        # so we use bf16-appropriate tolerance (~1e-2)
+        np.testing.assert_allclose(
+            np.array(p_f32),
+            np.array(p_bf16),
+            rtol=1e-2,
+            atol=1e-3,
+            err_msg="bf16 params should produce fp32 coefficients close to fp32 params",
+        )
+
+    def test_complex_ema_bf16_forward(self, random_seed):
+        """Test ComplexEMA forward pass with bf16 inputs."""
+        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+
+        dim = 64
+        ndim = 16
+
+        torch_ema = TorchComplexEMA(dim, ndim)
+        key = jax.random.PRNGKey(random_seed)
+        jax_ema = ComplexEMA(dim, ndim, key=key)
+
+        # Copy parameters from PyTorch to JAX (in fp32)
+        jax_ema = eqx.tree_at(lambda m: m.alpha, jax_ema, to_jax(torch_ema.alpha))
+        jax_ema = eqx.tree_at(lambda m: m.delta, jax_ema, to_jax(torch_ema.delta))
+        jax_ema = eqx.tree_at(lambda m: m.theta, jax_ema, to_jax(torch_ema.theta))
+        jax_ema = eqx.tree_at(lambda m: m.gamma_real, jax_ema, to_jax(torch_ema.gamma_real))
+        jax_ema = eqx.tree_at(lambda m: m.gamma_imag, jax_ema, to_jax(torch_ema.gamma_imag))
+        jax_ema = eqx.tree_at(lambda m: m.omega, jax_ema, to_jax(torch_ema.omega))
+
+        # Cast JAX model to bf16
+        def to_bf16(x):
+            if eqx.is_array(x) and x.dtype == jnp.float32:
+                return x.astype(jnp.bfloat16)
+            return x
+
+        jax_ema_bf16 = jax.tree.map(to_bf16, jax_ema)
+
+        # Generate test input
+        batch, seq = 2, 32
+        x_torch = torch.randn(batch, dim, seq)
+        x_jax_f32 = to_jax(x_torch)
+        x_jax_bf16 = x_jax_f32.astype(jnp.bfloat16)
+
+        # PyTorch forward (fp32)
+        y_torch, _ = torch_ema(x_torch, hx=None, compute_last_state=False)
+
+        # JAX forward with bf16 params and bf16 input
+        y_jax_bf16, _ = jax_ema_bf16(x_jax_bf16, return_state=False)
+
+        # Output should be bf16
+        assert y_jax_bf16.dtype == jnp.bfloat16
+
+        # Compare with PyTorch (looser tolerance for bf16)
+        np.testing.assert_allclose(
+            np.array(y_jax_bf16.astype(jnp.float32)),
+            y_torch.detach().numpy(),
+            rtol=1e-2,
+            atol=1e-2,
+            err_msg="bf16 forward should be close to PyTorch fp32 reference",
+        )
+
+    def test_complex_ema_fft_vs_sequential_bf16(self, random_seed):
+        """Test FFT and sequential paths produce equivalent results in bf16."""
+        dim = 64
+        ndim = 16
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+
+        jax_ema = ComplexEMA(dim, ndim, key=k1)
+
+        # Cast to bf16
+        def to_bf16(x):
+            if eqx.is_array(x) and x.dtype == jnp.float32:
+                return x.astype(jnp.bfloat16)
+            return x
+
+        jax_ema_bf16 = jax.tree.map(to_bf16, jax_ema)
+
+        # Generate bf16 input
+        batch, seq = 2, 32
+        x_bf16 = jax.random.normal(k2, (batch, dim, seq)).astype(jnp.bfloat16)
+
+        # FFT path
+        y_fft, _ = jax_ema_bf16(x_bf16, return_state=False)
+
+        # Sequential path
+        y_seq, _ = jax_ema_bf16(x_bf16, return_state=True)
+
+        # Both should be bf16
+        assert y_fft.dtype == jnp.bfloat16
+        assert y_seq.dtype == jnp.bfloat16
+
+        # Should produce equivalent outputs (within bf16 tolerance)
+        np.testing.assert_allclose(
+            np.array(y_fft),
+            np.array(y_seq),
+            rtol=1e-2,
+            atol=1e-2,
+            err_msg="FFT and sequential paths should match in bf16",
+        )
 
 
 class TestIntegration:
@@ -388,7 +562,7 @@ class TestIntegration:
             x_normed, _ = norm(x)
             x_ema = jnp.transpose(x_normed, (0, 2, 1))
             y, _ = ema(x_ema)
-            return jnp.sum(y ** 2)
+            return jnp.sum(y**2)
 
         x = jax.random.normal(k2, (2, 32, dim))
 

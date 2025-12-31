@@ -15,6 +15,9 @@ from megalodon_jax.types import NormState
 # Variance floor to prevent division instability in early training
 VARIANCE_FLOOR = 1e-6
 
+# Supported input dtypes (fp16 rejected for numerical stability)
+_SUPPORTED_DTYPES = (jnp.float32, jnp.bfloat16)
+
 
 class TimestepNorm(eqx.Module):
     """Streaming group-wise normalization across time with optional state.
@@ -85,10 +88,21 @@ class TimestepNorm(eqx.Module):
 
         Returns:
             Tuple of (normalized tensor, updated NormState).
+
+        Raises:
+            ValueError: If input dimension doesn't match num_features.
+            TypeError: If input dtype is float16 (not supported for stability).
         """
         B, L, D = x.shape
         G = self.num_groups
         gs = self.group_size
+
+        # Reject fp16 for numerical stability (matches PyTorch reference)
+        if x.dtype == jnp.float16:
+            raise TypeError(
+                "TimestepNorm does not support float16 inputs due to numerical "
+                "stability concerns. Use float32 or bfloat16 instead."
+            )
 
         if D != self.num_features:
             raise ValueError(

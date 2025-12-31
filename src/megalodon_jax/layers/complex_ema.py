@@ -96,32 +96,43 @@ class ComplexEMA(eqx.Module):
     ) -> tuple[Float[Array, "dim ndim"], Complex[Array, "dim ndim"], Complex[Array, "dim ndim"]]:
         """Compute EMA coefficients (p, q, gamma).
 
+        All computations are forced to fp32/complex64 for numerical stability,
+        regardless of the parameter dtype. This matches the PyTorch reference
+        behavior and prevents precision loss when the model is cast to bf16.
+
         Returns:
             Tuple of (p, q, gamma) where:
-            - p: Real input coefficient (D, N)
-            - q: Complex recurrence coefficient with |q| < 1 (D, N)
-            - gamma: Complex output projection (D, N)
+            - p: Real input coefficient (D, N), dtype float32
+            - q: Complex recurrence coefficient with |q| < 1 (D, N), dtype complex64
+            - gamma: Complex output projection (D, N), dtype complex64
         """
         N = self.ndim
 
+        # Force fp32 for all coefficient computations to match PyTorch reference
+        alpha_f32 = self.alpha.astype(jnp.float32)
+        delta_f32 = self.delta.astype(jnp.float32)
+        theta_f32 = self.theta.astype(jnp.float32)
+        gamma_real_f32 = self.gamma_real.astype(jnp.float32)
+        gamma_imag_f32 = self.gamma_imag.astype(jnp.float32)
+
         # theta -> phase angles
-        theta = jax.nn.sigmoid(self.theta) * (2.0 * jnp.pi / float(N))  # (D, 1, 1)
+        theta = jax.nn.sigmoid(theta_f32) * (2.0 * jnp.pi / float(N))  # (D, 1, 1)
         wavelets = jnp.arange(1, N + 1, dtype=jnp.float32).reshape(1, N, 1)  # (1, N, 1)
         phi = wavelets * theta  # (D, N, 1)
         phi = phi.squeeze(-1)  # (D, N)
 
         # alpha, delta -> p, |q|
-        alpha = jax.nn.sigmoid(self.alpha)  # (D, N, 1)
-        delta = jax.nn.sigmoid(self.delta)  # (D, N, 1)
+        alpha = jax.nn.sigmoid(alpha_f32)  # (D, N, 1)
+        delta = jax.nn.sigmoid(delta_f32)  # (D, N, 1)
 
         p = alpha.squeeze(-1)  # (D, N) - real input coefficient
         magnitude = (1.0 - alpha * delta).squeeze(-1)  # (D, N)
 
         # q = magnitude * exp(i * phi) - complex with |q| < 1
-        q = magnitude * jnp.exp(1j * phi)  # (D, N) complex
+        q = magnitude * jnp.exp(1j * phi)  # (D, N) complex64
 
         # gamma from real/imag parts
-        gamma = (self.gamma_real + 1j * self.gamma_imag) * self.scale  # (D, N) complex
+        gamma = (gamma_real_f32 + 1j * gamma_imag_f32) * self.scale  # (D, N) complex64
 
         return p, q, gamma
 
@@ -190,7 +201,8 @@ class ComplexEMA(eqx.Module):
         Y = X * K[None, :, :]
         y = jnp.fft.irfft(Y, n=fft_len, axis=-1)[..., :L]
 
-        return y.astype(x.dtype)
+        # Return fp32 - caller handles dtype conversion
+        return y
 
     def _forward_sequential(
         self,
@@ -238,7 +250,8 @@ class ComplexEMA(eqx.Module):
         h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
         y = jnp.moveaxis(y_seq, 0, -1)  # (B, D, L)
 
-        return y.astype(x.dtype), h_final
+        # Return fp32 - caller handles dtype conversion
+        return y, h_final
 
     def __call__(
         self,
@@ -260,13 +273,18 @@ class ComplexEMA(eqx.Module):
             Tuple of (output, state) where state is None unless return_state=True
             or h_init was provided.
         """
-        # Omega-weighted residual skip
-        residual = x * self.omega[None, :, None]
+        # Store input dtype for output cast
+        input_dtype = x.dtype
+
+        # Cast omega to fp32 for residual computation (matches PyTorch reference)
+        omega_f32 = self.omega.astype(jnp.float32)
+        x_f32 = x.astype(jnp.float32)
+        residual = x_f32 * omega_f32[None, :, None]
 
         use_fft = h_init is None and not return_state
         if use_fft:
-            y = self._forward_fft(x)
-            return y + residual, None
+            y = self._forward_fft(x)  # already returns fp32 internally
+            return (y + residual).astype(input_dtype), None
 
-        y, h_final = self._forward_sequential(x, h_init)
-        return y + residual, h_final if return_state else None
+        y, h_final = self._forward_sequential(x, h_init)  # already returns fp32 internally
+        return (y + residual).astype(input_dtype), h_final if return_state else None
