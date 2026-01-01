@@ -172,6 +172,18 @@ class ComplexEMA(eqx.Module):
 
         # Build kernel in chunks to bound memory
         def compute_kernel_chunk(start: int, end: int) -> Complex[Array, "dim chunk"]:
+            """Compute a slice of the EMA kernel from position start to end.
+
+            Computes q^j for j in [start, end) where q = magnitude * exp(i*phi).
+            Uses magnitude/phase representation for numerical stability.
+
+            Args:
+                start: Starting position index (inclusive).
+                end: Ending position index (exclusive).
+
+            Returns:
+                Complex kernel slice of shape (dim, end-start).
+            """
             j = jnp.arange(start, end, dtype=jnp.float32)  # (chunk,)
             # q^j = radius^j * exp(i * phi * j)
             mag_chunk = radius[:, :, None] ** j[None, None, :]  # (D, N, chunk)

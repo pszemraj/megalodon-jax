@@ -189,9 +189,26 @@ def attention_multi_chunk(
     q_bc = q.reshape(B, num_chunks, chunk_size, H, Dh)
     k_bc = k.reshape(B, num_chunks, chunk_size, H, Dh)
 
-    def rope_one_batch(q_b, k_b):
-        # q_b, k_b: (num_chunks, chunk_size, H, D)
-        def rope_one_chunk(qk_offset):
+    def rope_one_batch(
+        q_b: Float[Array, "num_chunks chunk_size heads head_dim"],
+        k_b: Float[Array, "num_chunks chunk_size heads head_dim"],
+    ) -> tuple[
+        Float[Array, "num_chunks chunk_size heads head_dim"],
+        Float[Array, "num_chunks chunk_size heads head_dim"],
+    ]:
+        """Apply RoPE to all chunks in a single batch element."""
+
+        def rope_one_chunk(
+            qk_offset: tuple[
+                Float[Array, "chunk_size heads head_dim"],
+                Float[Array, "chunk_size heads head_dim"],
+                Int[Array, ""],
+            ],
+        ) -> tuple[
+            Float[Array, "chunk_size heads head_dim"],
+            Float[Array, "chunk_size heads head_dim"],
+        ]:
+            """Apply RoPE to a single chunk with its position offset."""
             q_c, k_c, offset = qk_offset
             q_r, k_r = rotary(q_c[None, ...], k_c[None, ...], start_index + offset)
             return q_r[0], k_r[0]
@@ -222,7 +239,18 @@ def attention_multi_chunk(
         keys = None
 
     # Attention per chunk (all in parallel via batch dimension)
-    def attn_one_chunk(inputs):
+    # Note: attn_one_chunk is defined but replaced by inline vmap lambdas below.
+    # Keeping for documentation of the intended signature.
+    def attn_one_chunk(
+        inputs: tuple[
+            Float[Array, "chunk_size heads head_dim"],  # q
+            Float[Array, "chunk_size heads head_dim"],  # k
+            Float[Array, "chunk_size heads value_dim"],  # v
+            Bool[Array, "chunk_size"] | None,  # mask
+            PRNGKeyArray | None,  # key
+        ],
+    ) -> Float[Array, "chunk_size heads value_dim"]:
+        """Compute attention for a single chunk (used in vmap below)."""
         q_c, k_c, v_c, m_c, key_c = inputs
         return attention_single_chunk(
             q_c[None, ...],
@@ -495,8 +523,33 @@ class ChunkedAttention(eqx.Module):
         # Pre-compute whether mask is provided for the body_fn closure
         has_input_mask = mask is not None
 
-        def body_fn(i, state):
-            """Process token i with fixed-size cache."""
+        def body_fn(
+            i: int,
+            state: tuple[
+                Float[Array, "batch seq heads value_dim"],  # out_buf
+                Float[Array, "batch cache_size heads head_dim"],  # c_k
+                Float[Array, "batch cache_size heads value_dim"],  # c_v
+                Int[Array, ""],  # w_idx
+                Int[Array, ""],  # cur_pos
+                PRNGKeyArray | None,  # rng
+            ],
+        ) -> tuple[
+            Float[Array, "batch seq heads value_dim"],
+            Float[Array, "batch cache_size heads head_dim"],
+            Float[Array, "batch cache_size heads value_dim"],
+            Int[Array, ""],
+            Int[Array, ""],
+            PRNGKeyArray | None,
+        ]:
+            """Process token i with fixed-size cache.
+
+            Args:
+                i: Token index within the current sequence.
+                state: Tuple of (output_buffer, cache_k, cache_v, write_idx, position, rng).
+
+            Returns:
+                Updated state tuple after processing token i.
+            """
             out_buf, c_k, c_v, w_idx, cur_pos, rng = state
 
             # Extract single token

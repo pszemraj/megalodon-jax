@@ -1,7 +1,7 @@
 """Utility functions for Megalodon JAX."""
 
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import equinox as eqx
 import jax
@@ -11,6 +11,21 @@ from jaxtyping import Array, PRNGKeyArray
 from megalodon_jax.config import InitMode
 
 T = TypeVar("T", bound=eqx.Module)
+
+
+def _is_linear(x: Any) -> bool:
+    """Check if x is an Equinox Linear layer.
+
+    Used as a leaf predicate for JAX tree traversal to identify
+    layers that should have their weights reinitialized.
+
+    Args:
+        x: Any pytree node to check.
+
+    Returns:
+        True if x is an eqx.nn.Linear instance, False otherwise.
+    """
+    return isinstance(x, eqx.nn.Linear)
 
 
 def get_initializer(
@@ -84,14 +99,11 @@ def reinit_linear_weights(
 
     init_fn = get_initializer(mode, dim)
 
-    # Find all Linear layers
-    def is_linear(x):
-        return isinstance(x, eqx.nn.Linear)
-
-    leaves, treedef = jax.tree_util.tree_flatten(model, is_leaf=is_linear)
+    # Find all Linear layers using module-level predicate
+    leaves, treedef = jax.tree_util.tree_flatten(model, is_leaf=_is_linear)
 
     # Count linear layers for key splitting
-    num_linears = sum(1 for leaf in leaves if is_linear(leaf))
+    num_linears = sum(1 for leaf in leaves if _is_linear(leaf))
     if num_linears == 0:
         return model
 
@@ -100,7 +112,7 @@ def reinit_linear_weights(
 
     new_leaves = []
     for leaf in leaves:
-        if is_linear(leaf):
+        if _is_linear(leaf):
             # Get weight shape and dtype
             weight = leaf.weight
             shape = weight.shape

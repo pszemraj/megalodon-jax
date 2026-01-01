@@ -7,22 +7,51 @@ All cache/state dataclasses are registered as JAX pytrees to work with jit/scan.
 """
 
 from dataclasses import dataclass, field, fields
+from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Complex, Float, Int
 
+T = TypeVar("T")
 
-def _register_pytree(cls):
-    """Register a dataclass as a JAX pytree node."""
 
-    def flatten(obj):
-        """Flatten dataclass to (children, aux_data)."""
+def _register_pytree(cls: type[T]) -> type[T]:
+    """Register a dataclass as a JAX pytree node.
+
+    This decorator enables JAX transformations (jit, vmap, scan) to work with
+    the decorated dataclass by defining how to flatten and unflatten it.
+
+    Args:
+        cls: A dataclass type to register.
+
+    Returns:
+        The same class, now registered as a pytree node.
+    """
+
+    def flatten(obj: T) -> tuple[tuple[Any, ...], None]:
+        """Flatten dataclass to (children, aux_data).
+
+        Args:
+            obj: Dataclass instance to flatten.
+
+        Returns:
+            Tuple of (field_values, None). aux_data is None since all
+            reconstruction info is in the class type itself.
+        """
         children = tuple(getattr(obj, f.name) for f in fields(obj))
         return children, None
 
-    def unflatten(aux_data, children):
-        """Reconstruct dataclass from children."""
+    def unflatten(aux_data: None, children: tuple[Any, ...]) -> T:
+        """Reconstruct dataclass from children.
+
+        Args:
+            aux_data: Unused auxiliary data (always None).
+            children: Tuple of field values in declaration order.
+
+        Returns:
+            Reconstructed dataclass instance.
+        """
         return cls(*children)
 
     jax.tree_util.register_pytree_node(cls, flatten, unflatten)
