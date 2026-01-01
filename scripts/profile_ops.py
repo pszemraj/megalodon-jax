@@ -98,9 +98,7 @@ def run_profile_for_len(
         allow_bf16 = True
     elif bf16_reduction == "off":
         allow_bf16 = False
-    configure_precision(
-        allow_tf32=True, allow_bf16_reduced_precision_reduction=allow_bf16
-    )
+    configure_precision(allow_tf32=True, allow_bf16_reduced_precision_reduction=allow_bf16)
 
     suffix = f"{dtype.__str__().split('.')[-1]}_{bf16_reduction}_L{seq_len}"
     run_dir = outdir / suffix
@@ -109,9 +107,7 @@ def run_profile_for_len(
     torch.manual_seed(0)
     model = build_model(device, dtype)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    batch = torch.randint(
-        0, model.config.vocab_size, (batch_size, seq_len), device=device
-    )
+    batch = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device=device)
 
     # Reset memory stats per run
     torch.cuda.reset_peak_memory_stats(device)
@@ -151,9 +147,7 @@ def run_profile_for_len(
     with open(run_dir / "reports" / "key_averages_cuda_time.txt", "w") as f:
         f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
     with open(run_dir / "reports" / "key_averages_mem.txt", "w") as f:
-        f.write(
-            prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=100)
-        )
+        f.write(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=100))
     peak = torch.cuda.max_memory_allocated(device) / (1024**3)
     with open(run_dir / "reports" / "peak_mem_gb.txt", "w") as f:
         f.write(f"peak_mem_gb={peak:.3f}\n")
