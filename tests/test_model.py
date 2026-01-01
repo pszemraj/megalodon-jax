@@ -578,24 +578,25 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).eval()
+        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         # Create JAX model
         key = jax.random.PRNGKey(random_seed)
         jax_model = MegalodonForCausalLM(config, key=key)
 
-        # Copy weights from PyTorch to JAX
-        jax_model = load_weights_from_torch(jax_model, torch_model.state_dict())
+        # Copy weights from PyTorch to JAX (from CPU state_dict)
+        cpu_state_dict = {k: v.cpu() for k, v in torch_model.state_dict().items()}
+        jax_model = load_weights_from_torch(jax_model, cpu_state_dict)
 
-        # Create test input
+        # Create test input on torch_device
         torch.manual_seed(random_seed)
-        input_ids_torch = torch.randint(0, config.vocab_size, (batch, seq))
-        input_ids_jax = to_jax(input_ids_torch)
+        input_ids_torch = torch.randint(0, config.vocab_size, (batch, seq), device=torch_device)
+        input_ids_jax = to_jax(input_ids_torch.cpu())
 
         # Forward pass
         with torch.no_grad():
             torch_out = torch_model(input_ids_torch, use_cache=False, return_dict=True)
-            torch_logits = torch_out.logits
+            torch_logits = torch_out.logits.cpu()
 
         jax_logits, _ = jax_model(input_ids_jax, return_cache=False)
 
@@ -637,17 +638,18 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).eval()
+        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
 
-        # Create JAX model and load weights
+        # Create JAX model and load weights (from CPU state_dict)
         key = jax.random.PRNGKey(random_seed)
         jax_model = MegalodonForCausalLM(config, key=key)
-        jax_model = load_weights_from_torch(jax_model, torch_model.state_dict())
+        cpu_state_dict = {k: v.cpu() for k, v in torch_model.state_dict().items()}
+        jax_model = load_weights_from_torch(jax_model, cpu_state_dict)
 
-        # Create prompt
+        # Create prompt on torch_device
         torch.manual_seed(random_seed)
-        prompt_torch = torch.randint(0, config.vocab_size, (batch, prompt_len))
-        prompt_jax = to_jax(prompt_torch)
+        prompt_torch = torch.randint(0, config.vocab_size, (batch, prompt_len), device=torch_device)
+        prompt_jax = to_jax(prompt_torch.cpu())
 
         # PyTorch streaming generation
         torch_generated = []
@@ -657,7 +659,7 @@ class TestParity:
 
             for _ in range(gen_len):
                 next_token = torch_out.logits[:, -1:].argmax(dim=-1)
-                torch_generated.append(next_token.item())
+                torch_generated.append(next_token.cpu().item())
                 torch_out = torch_model(
                     next_token, past_key_values=torch_pkv, use_cache=True, return_dict=True
                 )
@@ -775,9 +777,9 @@ class TestFix2PadTokenMasking:
         # We check embedding lookup directly
         embed = jax.vmap(jax.vmap(model.embed))(input_ids) * model.scale
 
-        # Mask pad tokens the same way as in the model
+        # Mask pad tokens the same way as in the model (dtype-matched zero)
         pad_mask = input_ids == config.pad_token_id
-        masked_embed = jnp.where(pad_mask[:, :, None], 0.0, embed)
+        masked_embed = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=embed.dtype), embed)
 
         # Positions 1 and 3 (pad tokens) should have all-zero embeddings
         np.testing.assert_array_equal(
@@ -789,6 +791,44 @@ class TestFix2PadTokenMasking:
             np.array(masked_embed[0, 3]),
             np.zeros(config.model_dim),
             err_msg="Pad token at position 3 should have zero embedding",
+        )
+
+    def test_pad_masking_preserves_bf16_dtype(self, random_seed):
+        """Test that pad token masking preserves bf16 dtype (no upcast to float32)."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            pad_token_id=0,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+
+        # Cast model to bf16
+        def to_bf16(x):
+            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(jnp.bfloat16)
+            return x
+
+        model_bf16 = jax.tree.map(to_bf16, model)
+
+        # Create input with pad tokens
+        input_ids = jnp.array([[5, 0, 10, 0, 15]])
+
+        # Forward pass should preserve bf16 dtype
+        hidden, _ = model_bf16(input_ids, return_cache=False)
+
+        assert hidden.dtype == jnp.bfloat16, (
+            f"Expected bf16 output, got {hidden.dtype}. "
+            "Pad masking may be upcasting to float32."
         )
 
 

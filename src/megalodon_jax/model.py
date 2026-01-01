@@ -278,7 +278,10 @@ class MegalodonModel(eqx.Module):
             input_ids: Token IDs of shape (batch, seq).
             attention_mask: Optional mask (True = valid token).
             cache: Optional ModelCache from previous forward.
-            return_cache: Whether to return updated cache.
+            return_cache: Whether to return updated cache. Defaults to True for
+                inference convenience. For training, use compute_loss() which
+                sets return_cache=False, or enable use_checkpoint in config
+                which forces cache=None during training.
             deterministic: If True, skip dropout.
             key: PRNG key for dropout.
 
@@ -291,8 +294,9 @@ class MegalodonModel(eqx.Module):
 
         # Zero-mask pad tokens (matches PyTorch padding_idx behavior)
         # This ensures pad tokens have zero embeddings and receive no gradient updates
+        # Use dtype-matched zero to avoid upcasting bf16 to float32
         pad_mask = input_ids == self.config.pad_token_id
-        x = jnp.where(pad_mask[:, :, None], 0.0, x)
+        x = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=x.dtype), x)
 
         # Parse cache with validation
         if cache is not None:
