@@ -1051,3 +1051,108 @@ class TestFix6InitMode:
         # BERT std=0.02 means var ~0.0004
         assert bert_var < 0.01, f"BERT init variance {bert_var} should be small"
         assert he_var != bert_var, "Different init modes should produce different weights"
+
+
+class TestComputeLossMasking:
+    """Tests for compute_loss attention mask handling."""
+
+    def test_masked_positions_excluded_from_loss(self, random_seed):
+        """Test that masked positions don't contribute to loss."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Create input with last 4 positions masked
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        labels = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        # Mask last 4 positions as invalid
+        attention_mask = jnp.ones((batch, seq), dtype=bool)
+        attention_mask = attention_mask.at[:, -4:].set(False)
+
+        # Loss with mask should differ from unmasked loss
+        masked_loss = model.compute_loss(input_ids, labels, attention_mask=attention_mask)
+        unmasked_loss = model.compute_loss(input_ids, labels, attention_mask=None)
+
+        # Losses should be different (unless extremely unlikely coincidence)
+        assert not jnp.allclose(masked_loss, unmasked_loss), (
+            "Masked and unmasked loss should differ"
+        )
+
+    def test_all_masked_returns_zero_loss(self, random_seed):
+        """Test that fully masked input returns zero loss (no valid positions)."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        labels = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        # All positions masked
+        attention_mask = jnp.zeros((batch, seq), dtype=bool)
+
+        loss = model.compute_loss(input_ids, labels, attention_mask=attention_mask)
+
+        # With all positions masked, loss should be 0 (sum of 0 / max(0,1) = 0)
+        assert loss == 0.0, f"Fully masked loss should be 0, got {loss}"
+
+
+class TestUntiedHeadInit:
+    """Tests for untied LM head initialization."""
+
+    def test_untied_head_gaussian_uses_unit_scale(self, random_seed):
+        """Test that untied LM head with gaussian init uses std=1.0 (not 1/sqrt(output_size))."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            output_size=1024,  # Large output_size to make the bug obvious
+            init_mode="gaussian",
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # The bug was: std = 1/sqrt(1024) = 0.03125, variance ~= 0.001
+        # Fixed: std = 1.0, variance ~= 0.6-0.9 (truncated normal)
+        lm_head_var = jnp.var(model.lm_head.weight)
+
+        # Should have variance > 0.2 (truncated normal with std=1.0)
+        # If buggy, would have variance ~0.001
+        assert lm_head_var > 0.2, (
+            f"Untied LM head variance {lm_head_var} is too small. "
+            "Gaussian init should use std=1.0, not 1/sqrt(output_size)."
+        )

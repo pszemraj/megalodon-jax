@@ -413,8 +413,10 @@ class MegalodonForCausalLM(eqx.Module):
         else:
             lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k2)
             # Apply init_mode to untied lm_head
+            # For gaussian init, use dim=None to get std=1.0 (matches PyTorch/other Linear layers)
             if config.init_mode != "none":
-                init_fn = get_initializer(config.init_mode, dim=lm_out)
+                linear_dim = None if config.init_mode == "gaussian" else lm_out
+                init_fn = get_initializer(config.init_mode, dim=linear_dim)
                 new_weight = init_fn(k3, lm_head.weight.shape, lm_head.weight.dtype)
                 lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
             self.lm_head = lm_head
@@ -505,5 +507,16 @@ class MegalodonForCausalLM(eqx.Module):
         seq_idx = jnp.arange(L)[None, :]
         target_log_probs = log_probs[batch_idx, seq_idx, shift_labels]
 
-        # Mean over all positions
-        return -target_log_probs.mean()
+        # Apply mask if provided (shift mask to match labels)
+        if attention_mask is not None:
+            shift_mask = attention_mask[:, 1:]  # (B, L-1), True = valid
+            # Mask out invalid positions (set their contribution to 0)
+            target_log_probs = jnp.where(shift_mask, target_log_probs, 0.0)
+            # Mean over valid positions only
+            num_valid = shift_mask.sum()
+            # Avoid division by zero
+            num_valid = jnp.maximum(num_valid, 1)
+            return -target_log_probs.sum() / num_valid
+        else:
+            # Mean over all positions
+            return -target_log_probs.mean()
