@@ -1,12 +1,16 @@
 """Utility functions for Megalodon JAX."""
 
 from collections.abc import Callable
+from typing import TypeVar
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, PRNGKeyArray
 
 from megalodon_jax.config import InitMode
+
+T = TypeVar("T", bound=eqx.Module)
 
 
 def get_initializer(
@@ -45,3 +49,82 @@ def get_initializer(
         return jax.nn.initializers.truncated_normal(stddev=std, lower=-3 * std, upper=3 * std)
 
     raise ValueError(f"Unknown init mode: {mode}")
+
+
+def reinit_linear_weights(
+    model: T,
+    mode: InitMode,
+    key: PRNGKeyArray,
+    dim: int | None = None,
+) -> T:
+    """Reinitialize all Linear layer weights in a model using the specified init mode.
+
+    This function traverses the Equinox module tree and replaces all Linear layer
+    weights with freshly initialized values. Biases are reset to zeros.
+
+    Args:
+        model: Equinox module to reinitialize.
+        mode: Initialization mode for weights.
+        key: PRNG key for random initialization.
+        dim: Dimension for "gaussian" mode (optional, falls back to weight shape).
+
+    Returns:
+        New model with reinitialized Linear weights.
+
+    Example:
+        >>> key = jax.random.PRNGKey(42)
+        >>> model = MegalodonAttention(...)
+        >>> model = reinit_linear_weights(model, "he", key)
+    """
+    if mode == "none":
+        return model  # Skip reinitialization
+
+    init_fn = get_initializer(mode, dim)
+
+    # Find all Linear layers
+    def is_linear(x):
+        return isinstance(x, eqx.nn.Linear)
+
+    leaves, treedef = jax.tree_util.tree_flatten(model, is_leaf=is_linear)
+
+    # Count linear layers for key splitting
+    num_linears = sum(1 for leaf in leaves if is_linear(leaf))
+    if num_linears == 0:
+        return model
+
+    keys = jax.random.split(key, num_linears)
+    key_idx = 0
+
+    new_leaves = []
+    for leaf in leaves:
+        if is_linear(leaf):
+            # Get weight shape and dtype
+            weight = leaf.weight
+            shape = weight.shape
+            dtype = weight.dtype
+
+            # Compute dim for gaussian mode if not provided
+            effective_dim = dim if dim is not None else shape[-1]
+            if mode == "gaussian":
+                local_init = get_initializer(mode, effective_dim)
+            else:
+                local_init = init_fn
+
+            # Initialize new weight
+            new_weight = local_init(keys[key_idx], shape, dtype)
+            key_idx += 1
+
+            # Reset bias to zeros if present
+            if leaf.bias is not None:
+                new_bias = jnp.zeros_like(leaf.bias)
+                new_leaf = eqx.tree_at(
+                    lambda linear: (linear.weight, linear.bias), leaf, (new_weight, new_bias)
+                )
+            else:
+                new_leaf = eqx.tree_at(lambda linear: linear.weight, leaf, new_weight)
+
+            new_leaves.append(new_leaf)
+        else:
+            new_leaves.append(leaf)
+
+    return jax.tree_util.tree_unflatten(treedef, new_leaves)

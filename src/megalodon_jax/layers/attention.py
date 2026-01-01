@@ -419,7 +419,18 @@ class ChunkedAttention(eqx.Module):
         # Buffer model: entries written at positions [0, write_idx), mask = positions < write_idx
 
         Dv = v.shape[-1]
-        cache_size = self.max_cache_len
+
+        # Determine cache behavior based on cache_unbounded flag
+        if self.cache_unbounded:
+            # Unbounded mode: cache grows linearly, no reset at chunk boundaries.
+            # For JIT compatibility, we still use a static buffer (max_cache_len),
+            # but don't reset write_idx at chunk boundaries.
+            cache_size = self.max_cache_len
+            reset_at_boundary = False
+        else:
+            # Standard mode: cache resets at chunk boundaries (block-diagonal attention).
+            cache_size = self.max_cache_len
+            reset_at_boundary = True
 
         # Initialize or extract fixed-size cache buffers
         if cache is None:
@@ -441,8 +452,13 @@ class ChunkedAttention(eqx.Module):
                 # Trim to cache_size (keep first cache_size entries)
                 cache_k = cache.k[:, :cache_size]
                 cache_v = cache.v[:, :cache_size]
-            # Compute write_idx from position within current chunk
-            write_idx = position % self.chunk_size
+            # Compute write_idx from position
+            if self.cache_unbounded:
+                # Unbounded mode: w_idx is total tokens written (may exceed cache_size)
+                write_idx = position
+            else:
+                # Bounded mode: w_idx resets at chunk boundaries
+                write_idx = position % self.chunk_size
 
         # Pre-allocate output buffer
         out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
@@ -456,21 +472,35 @@ class ChunkedAttention(eqx.Module):
             k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
             v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
 
-            # Check chunk boundary - reset write index
-            at_boundary = (cur_pos % self.chunk_size) == 0
-            w_idx = jax.lax.select(at_boundary, jnp.array(0, dtype=jnp.int32), w_idx)
+            # Check chunk boundary - reset write index (only in bounded mode)
+            if reset_at_boundary:
+                at_boundary = (cur_pos % self.chunk_size) == 0
+                w_idx = jax.lax.select(at_boundary, jnp.array(0, dtype=jnp.int32), w_idx)
+            # In unbounded mode, w_idx keeps incrementing (uses ring buffer via modulo)
 
             # Apply RoPE
             q_rot, k_rot = self.rotary(q_i, k_i, cur_pos)
 
-            # Write to cache at write_idx
-            c_k = jax.lax.dynamic_update_slice(c_k, k_rot, (0, w_idx, 0, 0))
-            c_v = jax.lax.dynamic_update_slice(c_v, v_i, (0, w_idx, 0, 0))
+            # Write to cache at write_idx (with wrapping for unbounded mode)
+            if reset_at_boundary:
+                write_pos = w_idx
+            else:
+                # Ring buffer: wrap around when cache is full
+                write_pos = w_idx % cache_size
+            c_k = jax.lax.dynamic_update_slice(c_k, k_rot, (0, write_pos, 0, 0))
+            c_v = jax.lax.dynamic_update_slice(c_v, v_i, (0, write_pos, 0, 0))
             w_idx = w_idx + 1
 
-            # Build validity mask: positions [0, w_idx) are valid
-            pos_indices = jnp.arange(cache_size)
-            kv_mask = pos_indices[None, :] < w_idx  # (1, cache_size)
+            # Build validity mask
+            if reset_at_boundary:
+                # Bounded mode: positions [0, w_idx) are valid
+                pos_indices = jnp.arange(cache_size)
+                kv_mask = pos_indices[None, :] < w_idx  # (1, cache_size)
+            else:
+                # Unbounded mode: all positions valid once buffer fills
+                # Before full: [0, w_idx), After full: all valid
+                pos_indices = jnp.arange(cache_size)
+                kv_mask = pos_indices[None, :] < jnp.minimum(w_idx, cache_size)
             kv_mask = jnp.broadcast_to(kv_mask, (B, cache_size))
 
             # Split RNG for this iteration
@@ -581,6 +611,7 @@ class MegalodonAttention(eqx.Module):
         chunk_size: int,
         norm_num_groups: int,
         norm_eps: float = 1e-5,
+        norm_affine: bool = True,
         rope_base: float = 10000.0,
         max_cache_len: int | None = None,
         cache_unbounded: bool = False,
@@ -601,6 +632,7 @@ class MegalodonAttention(eqx.Module):
             chunk_size: Attention chunk size.
             norm_num_groups: Number of groups for TimestepNorm.
             norm_eps: Epsilon for normalization.
+            norm_affine: Whether normalization layers include affine parameters.
             rope_base: Base for rotary embeddings.
             max_cache_len: Max KV cache length. None/-1 = chunk_size.
             cache_unbounded: If True, never clamp cache length.
@@ -624,10 +656,10 @@ class MegalodonAttention(eqx.Module):
 
         # Sub-modules
         self.timenorm = TimestepNorm(
-            num_features=model_dim, num_groups=norm_num_groups, eps=norm_eps
+            num_features=model_dim, num_groups=norm_num_groups, eps=norm_eps, affine=norm_affine
         )
         self.cema = ComplexEMA(embed_dim=model_dim, ndim=cema_ndim, key=keys[0])
-        self.rmsnorm = RMSNorm(dim=model_dim, eps=norm_eps)
+        self.rmsnorm = RMSNorm(dim=model_dim, eps=norm_eps, affine=norm_affine)
         self.inner = ChunkedAttention(
             num_heads=num_heads,
             head_dim=self.head_dim,
@@ -796,6 +828,7 @@ class NormalizedFFN(eqx.Module):
         x → LayerNorm → SiLU(fc1) * fc3 → fc2 → + residual
 
     Supports two-hop residual via residual_base parameter.
+    Supports optional residual rescaling (rescale_nffn) for training stability.
     """
 
     norm: eqx.nn.LayerNorm
@@ -808,13 +841,17 @@ class NormalizedFFN(eqx.Module):
     swiglu: bool = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
+    alpha: float | None = eqx.field(static=True)  # Residual rescale factor
 
     def __init__(
         self,
         model_dim: int,
         ffn_hidden_dim: int,
         norm_eps: float = 1e-5,
+        norm_affine: bool = True,
         swiglu: bool = False,
+        rescale: bool = False,
+        layer_id: int = 0,
         hidden_dropout: float = 0.0,
         dropout: float = 0.0,
         *,
@@ -826,7 +863,10 @@ class NormalizedFFN(eqx.Module):
             model_dim: Model hidden dimension.
             ffn_hidden_dim: FFN intermediate dimension.
             norm_eps: Epsilon for layer normalization.
+            norm_affine: Whether normalization includes affine parameters.
             swiglu: Whether to use SwiGLU activation.
+            rescale: Whether to apply residual rescaling (rescale_nffn).
+            layer_id: Layer index for computing rescale factor (0-indexed).
             hidden_dropout: Dropout after hidden layer.
             dropout: Dropout after output projection.
             key: PRNG key for initialization.
@@ -836,10 +876,14 @@ class NormalizedFFN(eqx.Module):
         self.swiglu = swiglu
         self.hidden_dropout = hidden_dropout
         self.dropout = dropout
+        # Compute rescale alpha: 0.1 * (0.5 ** layer_id)
+        self.alpha = (0.1 * (0.5**layer_id)) if rescale else None
 
         keys = jax.random.split(key, 3)
 
-        self.norm = eqx.nn.LayerNorm(shape=model_dim, eps=norm_eps)
+        self.norm = eqx.nn.LayerNorm(
+            shape=model_dim, eps=norm_eps, use_weight=norm_affine, use_bias=norm_affine
+        )
         self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, key=keys[0])
         self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, key=keys[1])
 
@@ -896,5 +940,9 @@ class NormalizedFFN(eqx.Module):
         if not deterministic and self.dropout > 0.0 and k2 is not None:
             keep = jax.random.bernoulli(k2, 1.0 - self.dropout, out.shape)
             out = jnp.where(keep, out / (1.0 - self.dropout), 0.0)
+
+        # Apply residual rescaling if enabled
+        if self.alpha is not None:
+            out = self.alpha * out
 
         return residual + out

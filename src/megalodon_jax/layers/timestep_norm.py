@@ -30,22 +30,25 @@ class TimestepNorm(eqx.Module):
         num_groups: Number of groups for group-wise statistics.
         group_size: Features per group (num_features // num_groups).
         eps: Numerical epsilon for variance stability.
-        weight: Scale parameter (effective scale = weight + 1.0).
-        bias: Shift parameter.
+        affine: Whether to include learnable affine parameters.
+        weight: Scale parameter (effective scale = weight + 1.0), or None if affine=False.
+        bias: Shift parameter, or None if affine=False.
     """
 
     num_features: int = eqx.field(static=True)
     num_groups: int = eqx.field(static=True)
     group_size: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
-    weight: Float[Array, "dim"]
-    bias: Float[Array, "dim"]
+    affine: bool = eqx.field(static=True)
+    weight: Float[Array, "dim"] | None
+    bias: Float[Array, "dim"] | None
 
     def __init__(
         self,
         num_features: int,
         num_groups: int,
         eps: float = 1e-5,
+        affine: bool = True,
         *,
         key: PRNGKeyArray | None = None,
     ):
@@ -55,6 +58,7 @@ class TimestepNorm(eqx.Module):
             num_features: Total number of feature channels D.
             num_groups: Number of groups for statistics computation.
             eps: Numerical epsilon for variance stability.
+            affine: Whether to include learnable affine parameters.
             key: PRNG key (unused, for API consistency).
 
         Raises:
@@ -69,9 +73,14 @@ class TimestepNorm(eqx.Module):
         self.num_groups = num_groups
         self.group_size = num_features // num_groups
         self.eps = eps
-        # Initialize weight to zeros (effective scale = weight + 1.0 = 1.0)
-        self.weight = jnp.zeros(num_features)
-        self.bias = jnp.zeros(num_features)
+        self.affine = affine
+        if affine:
+            # Initialize weight to zeros (effective scale = weight + 1.0 = 1.0)
+            self.weight = jnp.zeros(num_features)
+            self.bias = jnp.zeros(num_features)
+        else:
+            self.weight = None
+            self.bias = None
 
     def __call__(
         self,
@@ -194,10 +203,13 @@ class TimestepNorm(eqx.Module):
         var_b = var_t[:, :, :, None]  # (B, L, G, 1)
         x_hat = (x_groups - mean_b) * jax.lax.rsqrt(var_b + self.eps)
 
-        # Apply affine transform with +1 reparameterization
-        scale = (self.weight + 1.0).reshape(1, 1, G, gs).astype(stats_dtype)
-        bias = self.bias.reshape(1, 1, G, gs).astype(stats_dtype)
-        y = (x_hat * scale + bias).reshape(B, L, D).astype(x.dtype)
+        # Apply affine transform with +1 reparameterization (if affine=True)
+        if self.affine and self.weight is not None and self.bias is not None:
+            scale = (self.weight + 1.0).reshape(1, 1, G, gs).astype(stats_dtype)
+            bias = self.bias.reshape(1, 1, G, gs).astype(stats_dtype)
+            y = (x_hat * scale + bias).reshape(B, L, D).astype(x.dtype)
+        else:
+            y = x_hat.reshape(B, L, D).astype(x.dtype)
 
         # Output state from final position
         new_count = prev_count + mask.astype(jnp.int32).sum(axis=1)
