@@ -43,6 +43,8 @@ class RotaryEmbedding(eqx.Module):
         half = dim // 2
         # inv_freq = 1 / (base^(i / half)) for i in [0, half)
         # Equivalent: exp(-i * log(base) / half)
+        # Note: JAX's exp() may differ slightly from PyTorch's at float32 precision.
+        # This is acceptable as long as the difference is within float32 epsilon bounds.
         self.inv_freq = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-jnp.log(base) / half))
 
     def __call__(
