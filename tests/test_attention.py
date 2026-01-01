@@ -208,7 +208,8 @@ class TestChunkedAttention:
         # Check final cache state
         assert cache is not None
         assert cache.count == 8
-        assert cache.k.shape[1] == 8  # All 8 tokens cached
+        # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
+        assert cache.k.shape[1] == chunk_size
 
 
 # -----------------------------------------------------------------------------
@@ -567,6 +568,49 @@ class TestJITCompilation:
         out, _, _ = forward(attn, q, k, v)
         assert out.shape == (batch, seq, heads, value_dim)
 
+    def test_streaming_jit_no_recompile(self, random_seed):
+        """Verify streaming path is JIT-compatible without recompilation.
+
+        This test ensures that:
+        1. The streaming path can be JIT compiled
+        2. Multiple calls with the same shapes don't cause recompilation
+        3. The fori_loop with dynamic cache values works correctly
+        """
+        batch, heads, head_dim, value_dim = 1, 2, 8, 8
+        chunk_size = 4
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        @eqx.filter_jit
+        def step(model, q, k, v, cache):
+            return model(q, k, v, cache=cache, return_cache=True)
+
+        # Process 10 tokens one at a time
+        cache = None
+        for i in range(10):
+            ki = jax.random.fold_in(k2, i)
+            q = jax.random.normal(ki, (batch, 1, heads, head_dim))
+            k = jax.random.normal(jax.random.fold_in(ki, 1), (batch, 1, heads, head_dim))
+            v = jax.random.normal(jax.random.fold_in(ki, 2), (batch, 1, heads, value_dim))
+
+            out, cache, pos = step(attn, q, k, v, cache)
+            assert out.shape == (batch, 1, heads, value_dim)
+            assert cache is not None
+            assert int(pos) == i + 1
+
+        # Final cache should be fixed-size
+        assert cache.k.shape[1] == chunk_size
+        assert int(cache.count) == 10
+
     def test_megalodon_attention_jit(self, random_seed):
         """Test MegalodonAttention compiles without errors."""
         batch, seq = 2, 32
@@ -677,23 +721,17 @@ class TestStreamingEquivalence:
 
             _, cache, position = attn(q, k, v, cache=cache, return_cache=True)
 
-            pos_in_chunk = i % chunk_size
-            if pos_in_chunk == 0 and i > 0:
-                # At chunk boundary, cache should have been reset
-                # Cache should only have 1 entry (the new token)
-                assert cache.k.shape[1] == 1, (
-                    f"Cache should reset at chunk boundary (pos {i}), "
-                    f"got cache size {cache.k.shape[1]}"
-                )
-            else:
-                # Within chunk, cache should accumulate
-                expected_size = pos_in_chunk + 1
-                assert cache.k.shape[1] == expected_size, (
-                    f"Cache should have {expected_size} entries at pos {i}, got {cache.k.shape[1]}"
-                )
+            # Fixed-size buffer: shape is always max_cache_len
+            assert cache.k.shape[1] == chunk_size, (
+                f"Cache buffer should be fixed size {chunk_size}, got {cache.k.shape[1]}"
+            )
+            # The count tracks absolute position
+            assert cache.count == i + 1, (
+                f"Cache count should be {i + 1}, got {cache.count}"
+            )
 
-    def test_cache_trim_cross_chunk(self, random_seed):
-        """Test that cache spanning previous chunk is trimmed correctly."""
+    def test_cache_resize_on_input(self, random_seed):
+        """Test that incoming caches are resized to fixed buffer size."""
         batch, heads, head_dim, value_dim = 1, 2, 8, 8
         chunk_size = 4
 
@@ -708,28 +746,28 @@ class TestStreamingEquivalence:
             key=k1,
         )
 
-        # Build a cache that spans a chunk boundary by manually constructing it
         from megalodon_jax.types import AttentionCache
 
-        # Simulate being at position 5 (pos_in_chunk=1) with a cache of 3 entries
-        # The cache should be trimmed to only 1 entry (the current chunk's entries)
-        fake_k = jax.random.normal(k2, (batch, 3, heads, head_dim))
-        fake_v = jax.random.normal(k3, (batch, 3, heads, value_dim))
-        fake_cache = AttentionCache(k=fake_k, v=fake_v, count=jnp.array(5, dtype=jnp.int32))
+        # Create a smaller-than-expected cache (2 entries, but chunk_size=4)
+        # Simulates position 2 (has 2 cached entries from positions 0-1)
+        fake_k = jax.random.normal(k2, (batch, 2, heads, head_dim))
+        fake_v = jax.random.normal(k3, (batch, 2, heads, value_dim))
+        fake_cache = AttentionCache(k=fake_k, v=fake_v, count=jnp.array(2, dtype=jnp.int32))
 
-        # Process a new token at position 5
+        # Process a new token at position 2
         q = jax.random.normal(k4, (batch, 1, heads, head_dim))
         k = jax.random.normal(jax.random.fold_in(k4, 1), (batch, 1, heads, head_dim))
         v = jax.random.normal(jax.random.fold_in(k4, 2), (batch, 1, heads, value_dim))
 
-        _, new_cache, _ = attn(q, k, v, cache=fake_cache, return_cache=True)
+        _, new_cache, new_pos = attn(q, k, v, cache=fake_cache, return_cache=True)
 
-        # pos_in_chunk = 5 % 4 = 1, so cache should be trimmed to 1 + 1 = 2 entries
-        # (1 from previous position in current chunk + 1 new token)
-        assert new_cache.k.shape[1] == 2, (
-            f"Cache should be trimmed to 2 entries (pos_in_chunk=1 + 1 new), "
-            f"got {new_cache.k.shape[1]}"
+        # Output cache should be fixed size (chunk_size)
+        assert new_cache.k.shape[1] == chunk_size, (
+            f"Cache should be fixed size {chunk_size}, got {new_cache.k.shape[1]}"
         )
+        # Position should advance
+        assert new_pos == 3, f"Position should be 3, got {new_pos}"
+        assert new_cache.count == 3, f"Cache count should be 3, got {new_cache.count}"
 
 
 # -----------------------------------------------------------------------------

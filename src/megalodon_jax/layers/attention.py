@@ -94,8 +94,11 @@ def attention_single_chunk(
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
         scores = jnp.where(kv_mask_expanded, scores, jnp.finfo(jnp.float32).min)
 
-    # Softmax
+    # Softmax with NaN guard for fully-masked queries
+    # If all keys are masked for a query, softmax(all -inf) = NaN
+    # Detect and replace with zeros for safe behavior on padded batches
     attn_weights = jax.nn.softmax(scores, axis=-1)
+    attn_weights = jnp.where(jnp.isnan(attn_weights), 0.0, attn_weights)
 
     # Dropout if not deterministic
     if not deterministic and dropout_rate > 0.0:
@@ -300,6 +303,8 @@ class ChunkedAttention(eqx.Module):
         head_dim: Dimension per head for queries/keys.
         value_head_dim: Dimension per head for values.
         chunk_size: Size of attention chunks.
+        max_cache_len: Maximum cache length. None/-1 means chunk_size.
+        cache_unbounded: If True, never clamp cache length (grows with tokens).
         attention_dropout: Dropout rate for attention weights.
         rotary: RotaryEmbedding module.
     """
@@ -308,6 +313,8 @@ class ChunkedAttention(eqx.Module):
     head_dim: int = eqx.field(static=True)
     value_head_dim: int = eqx.field(static=True)
     chunk_size: int = eqx.field(static=True)
+    max_cache_len: int = eqx.field(static=True)
+    cache_unbounded: bool = eqx.field(static=True)
     attention_dropout: float = eqx.field(static=True)
 
     rotary: RotaryEmbedding
@@ -319,6 +326,8 @@ class ChunkedAttention(eqx.Module):
         value_head_dim: int,
         chunk_size: int,
         rope_base: float = 10000.0,
+        max_cache_len: int | None = None,
+        cache_unbounded: bool = False,
         attention_dropout: float = 0.0,
         *,
         key: PRNGKeyArray,
@@ -331,6 +340,8 @@ class ChunkedAttention(eqx.Module):
             value_head_dim: Dimension per head for values.
             chunk_size: Size of attention chunks.
             rope_base: Base for rotary embeddings.
+            max_cache_len: Maximum cache length. None/-1 = chunk_size.
+            cache_unbounded: If True, never clamp cache (memory grows linearly).
             attention_dropout: Dropout rate for attention weights.
             key: PRNG key for initialization.
         """
@@ -338,6 +349,12 @@ class ChunkedAttention(eqx.Module):
         self.head_dim = head_dim
         self.value_head_dim = value_head_dim
         self.chunk_size = chunk_size
+        # Handle None/-1 as "use chunk_size"
+        if max_cache_len is None or max_cache_len < 0:
+            self.max_cache_len = chunk_size
+        else:
+            self.max_cache_len = max_cache_len
+        self.cache_unbounded = cache_unbounded
         self.attention_dropout = attention_dropout
         self.rotary = RotaryEmbedding(dim=head_dim, base=rope_base)
 
@@ -348,7 +365,6 @@ class ChunkedAttention(eqx.Module):
         v: Float[Array, "batch seq heads value_dim"],
         cache: AttentionCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
-        max_cache_len: int | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -365,7 +381,6 @@ class ChunkedAttention(eqx.Module):
             v: Value tensor (batch, seq, heads, value_dim).
             cache: Optional cached K/V from previous tokens.
             mask: Optional mask where True marks valid positions.
-            max_cache_len: Maximum cache length (defaults to chunk_size).
             return_cache: Whether to return updated cache.
             deterministic: If True, skip dropout.
             key: PRNG key for dropout.
@@ -374,7 +389,6 @@ class ChunkedAttention(eqx.Module):
             Tuple of (output, updated_cache, new_position).
         """
         B, L, H, _ = q.shape
-        max_cache_len = max_cache_len or self.chunk_size
 
         # Determine current position
         if cache is None:
@@ -398,126 +412,102 @@ class ChunkedAttention(eqx.Module):
             )
             return out, None, position + L
 
-        # Streaming path: use cache with faithful_chunk_local logic
-        # When L > 1 and sequence spans chunk boundary, we must loop to avoid
-        # cross-chunk attention (which would violate block-diagonal structure).
-        # This matches the PyTorch reference lines 1074-1103.
+        # Streaming path: JIT-compatible token-by-token processing with fixed-size cache.
+        # Uses lax.fori_loop with static trip count (compiles to efficient scan).
+        # Cache resets at chunk boundaries to enforce block-diagonal structure.
+        #
+        # Buffer model: entries written at positions [0, write_idx), mask = positions < write_idx
 
-        def _attend_single_step(
-            q_step: Float[Array, "batch step_len heads head_dim"],
-            k_step: Float[Array, "batch step_len heads head_dim"],
-            v_step: Float[Array, "batch step_len heads value_dim"],
-            cur_cache: AttentionCache | None,
-            cur_pos: Int[Array, ""],
-            mask_step: Bool[Array, "batch step_len"] | None,
-            key_step: PRNGKeyArray | None,
-        ) -> tuple[
-            Float[Array, "batch step_len heads value_dim"],
-            AttentionCache,
-            Int[Array, ""],
-        ]:
-            """Process one chunk step with faithful_chunk_local cache handling."""
-            step_len = q_step.shape[1]
-            pos_in_chunk = cur_pos % self.chunk_size
+        Dv = v.shape[-1]
+        cache_size = self.max_cache_len
 
-            # Apply RoPE to new Q and K
-            q_rot, k_rot = self.rotary(q_step, k_step, cur_pos)
-
-            # Handle cache with faithful_chunk_local logic
-            if cur_cache is None or pos_in_chunk == 0:
-                # Start fresh: either first token or chunk boundary reset
-                k_cached = k_rot
-                v_cached = v_step
-            elif cur_cache.k.shape[1] > pos_in_chunk:
-                # Cache spans previous chunk - trim to only keep current chunk's entries
-                k_cached = jnp.concatenate([cur_cache.k[:, -pos_in_chunk:], k_rot], axis=1)
-                v_cached = jnp.concatenate([cur_cache.v[:, -pos_in_chunk:], v_step], axis=1)
+        # Initialize or extract fixed-size cache buffers
+        if cache is None:
+            cache_k = jnp.zeros((B, cache_size, H, self.head_dim), dtype=q.dtype)
+            cache_v = jnp.zeros((B, cache_size, H, Dv), dtype=v.dtype)
+            write_idx = jnp.array(0, dtype=jnp.int32)
+        else:
+            # Handle incoming cache - resize to fixed size if needed
+            existing_len = cache.k.shape[1]
+            if existing_len == cache_size:
+                cache_k = cache.k
+                cache_v = cache.v
+            elif existing_len < cache_size:
+                # Pad at the end (entries are at positions 0..existing_len-1)
+                pad_len = cache_size - existing_len
+                cache_k = jnp.pad(cache.k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+                cache_v = jnp.pad(cache.v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
             else:
-                # Normal case: extend within chunk
-                k_cached = jnp.concatenate([cur_cache.k, k_rot], axis=1)
-                v_cached = jnp.concatenate([cur_cache.v, v_step], axis=1)
+                # Trim to cache_size (keep first cache_size entries)
+                cache_k = cache.k[:, :cache_size]
+                cache_v = cache.v[:, :cache_size]
+            # Compute write_idx from position within current chunk
+            write_idx = position % self.chunk_size
 
-            # Clamp to max_cache_len
-            if k_cached.shape[1] > max_cache_len:
-                k_cached = k_cached[:, -max_cache_len:]
-                v_cached = v_cached[:, -max_cache_len:]
+        # Pre-allocate output buffer
+        out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
 
-            # Build mask for cached keys
-            kv_mask = None
-            if mask_step is not None:
-                cache_len = k_cached.shape[1] - step_len
-                if cache_len > 0:
-                    cache_mask = jnp.ones((B, cache_len), dtype=jnp.bool_)
-                    kv_mask = jnp.concatenate([cache_mask, mask_step], axis=1)
-                else:
-                    kv_mask = mask_step
+        def body_fn(i, state):
+            """Process token i with fixed-size cache."""
+            out_buf, c_k, c_v, w_idx, cur_pos, rng = state
 
-            # Attention with cached K/V
-            out_step = attention_single_chunk(
+            # Extract single token
+            q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
+            k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
+            v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
+
+            # Check chunk boundary - reset write index
+            at_boundary = (cur_pos % self.chunk_size) == 0
+            w_idx = jax.lax.select(at_boundary, jnp.array(0, dtype=jnp.int32), w_idx)
+
+            # Apply RoPE
+            q_rot, k_rot = self.rotary(q_i, k_i, cur_pos)
+
+            # Write to cache at write_idx
+            c_k = jax.lax.dynamic_update_slice(c_k, k_rot, (0, w_idx, 0, 0))
+            c_v = jax.lax.dynamic_update_slice(c_v, v_i, (0, w_idx, 0, 0))
+            w_idx = w_idx + 1
+
+            # Build validity mask: positions [0, w_idx) are valid
+            pos_indices = jnp.arange(cache_size)
+            kv_mask = pos_indices[None, :] < w_idx  # (1, cache_size)
+            kv_mask = jnp.broadcast_to(kv_mask, (B, cache_size))
+
+            # Split RNG for this iteration
+            if rng is not None:
+                rng, step_rng = jax.random.split(rng)
+            else:
+                step_rng = None
+
+            # Compute attention over fixed-size cache with validity mask
+            out_i = attention_single_chunk(
                 q_rot,
-                k_cached,
-                v_cached,
+                c_k,
+                c_v,
                 kv_mask=kv_mask,
-                causal=True,
+                causal=False,  # validity handled by mask
                 dropout_rate=self.attention_dropout,
                 deterministic=deterministic,
-                key=key_step,
+                key=step_rng,
             )
 
-            new_pos = cur_pos + step_len
-            step_cache = AttentionCache(k=k_cached, v=v_cached, count=new_pos)
-            return out_step, step_cache, new_pos
+            # Update output buffer
+            out_buf = jax.lax.dynamic_update_slice(out_buf, out_i, (0, i, 0, 0))
 
-        # Check if we need to loop (L > 1 and might cross chunk boundary)
-        pos_in_chunk = position % self.chunk_size
-        tokens_until_boundary = self.chunk_size - pos_in_chunk
+            return (out_buf, c_k, c_v, w_idx, cur_pos + 1, rng)
 
-        if L <= tokens_until_boundary:
-            # All tokens fit in current chunk - single pass
-            out, new_cache, new_position = _attend_single_step(q, k, v, cache, position, mask, key)
-            if not return_cache:
-                new_cache = None
-            return out, new_cache, new_position
+        # Run the loop
+        init_state = (out_buffer, cache_k, cache_v, write_idx, position, key)
+        out_buffer, final_k, final_v, final_w_idx, final_pos, _ = jax.lax.fori_loop(
+            0, L, body_fn, init_state
+        )
 
-        # Multi-token call spanning chunk boundary - loop through chunks
-        outputs = []
-        cur_cache = cache
-        cur_pos = position
-        offset = 0
-
-        while offset < L:
-            remaining = L - offset
-            cur_pos_in_chunk = cur_pos % self.chunk_size
-
-            # Calculate how many tokens we can process without crossing a boundary
-            chunk_len = min(remaining, self.chunk_size - cur_pos_in_chunk)
-            end = offset + chunk_len
-
-            # Slice inputs for this chunk
-            q_chunk = q[:, offset:end]
-            k_chunk = k[:, offset:end]
-            v_chunk = v[:, offset:end]
-            mask_chunk = mask[:, offset:end] if mask is not None else None
-
-            # Split key for this chunk if needed
-            if key is not None:
-                key, key_chunk = jax.random.split(key)
-            else:
-                key_chunk = None
-
-            out_chunk, cur_cache, cur_pos = _attend_single_step(
-                q_chunk, k_chunk, v_chunk, cur_cache, cur_pos, mask_chunk, key_chunk
-            )
-            outputs.append(out_chunk)
-            offset = end
-
-        out = jnp.concatenate(outputs, axis=1) if len(outputs) > 1 else outputs[0]
-        new_position = cur_pos
-
+        # Build return cache with fixed-size buffers
+        new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
         if not return_cache:
-            cur_cache = None
+            new_cache = None
 
-        return out, cur_cache, new_position
+        return out_buffer, new_cache, final_pos
 
 
 # -----------------------------------------------------------------------------
@@ -592,6 +582,8 @@ class MegalodonAttention(eqx.Module):
         norm_num_groups: int,
         norm_eps: float = 1e-5,
         rope_base: float = 10000.0,
+        max_cache_len: int | None = None,
+        cache_unbounded: bool = False,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         hidden_dropout: float = 0.0,
@@ -610,6 +602,8 @@ class MegalodonAttention(eqx.Module):
             norm_num_groups: Number of groups for TimestepNorm.
             norm_eps: Epsilon for normalization.
             rope_base: Base for rotary embeddings.
+            max_cache_len: Max KV cache length. None/-1 = chunk_size.
+            cache_unbounded: If True, never clamp cache length.
             dropout: Output dropout rate.
             attention_dropout: Attention weight dropout rate.
             hidden_dropout: Hidden layer dropout rate.
@@ -640,6 +634,8 @@ class MegalodonAttention(eqx.Module):
             value_head_dim=self.value_head_dim,
             chunk_size=chunk_size,
             rope_base=rope_base,
+            max_cache_len=max_cache_len,
+            cache_unbounded=cache_unbounded,
             attention_dropout=attention_dropout,
             key=keys[1],
         )
