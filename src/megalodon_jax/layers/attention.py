@@ -21,11 +21,13 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.config import InitMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
+from megalodon_jax.utils import reinit_linear_weights
 
 # -----------------------------------------------------------------------------
 # Attention Primitives (Pure Functions)
@@ -298,13 +300,30 @@ class ChunkedAttention(eqx.Module):
 
     Handles both training (multi-chunk) and inference (streaming with cache).
 
+    Cache Behavior:
+        The cache behavior is controlled by cache_unbounded and max_cache_len:
+
+        1. cache_unbounded=False, max_cache_len=chunk_size (default):
+           "Faithful chunk-local" mode - resets KV at chunk boundaries,
+           enforcing block-diagonal attention structure.
+
+        2. cache_unbounded=False, max_cache_len>chunk_size:
+           Sliding window mode - no reset at chunk boundaries, uses a ring
+           buffer of max_cache_len entries. Cross-chunk context is preserved.
+
+        3. cache_unbounded=True:
+           No boundary resets, uses ring buffer of max_cache_len entries.
+           Unlike PyTorch which allows truly unbounded growth, JAX requires
+           a static buffer size for JIT compatibility.
+
     Attributes:
         num_heads: Number of attention heads.
         head_dim: Dimension per head for queries/keys.
         value_head_dim: Dimension per head for values.
         chunk_size: Size of attention chunks.
-        max_cache_len: Maximum cache length. None/-1 means chunk_size.
-        cache_unbounded: If True, never clamp cache length (grows with tokens).
+        max_cache_len: Maximum cache length. None/-1 = chunk_size.
+        cache_unbounded: If True, disables chunk boundary resets (but buffer
+            is still bounded by max_cache_len for JIT compatibility).
         attention_dropout: Dropout rate for attention weights.
         rotary: RotaryEmbedding module.
     """
@@ -341,7 +360,9 @@ class ChunkedAttention(eqx.Module):
             chunk_size: Size of attention chunks.
             rope_base: Base for rotary embeddings.
             max_cache_len: Maximum cache length. None/-1 = chunk_size.
-            cache_unbounded: If True, never clamp cache (memory grows linearly).
+                Values > chunk_size enable sliding window attention.
+            cache_unbounded: If True, disables chunk boundary resets. Cache
+                is still bounded by max_cache_len for JIT compatibility.
             attention_dropout: Dropout rate for attention weights.
             key: PRNG key for initialization.
         """
@@ -414,23 +435,24 @@ class ChunkedAttention(eqx.Module):
 
         # Streaming path: JIT-compatible token-by-token processing with fixed-size cache.
         # Uses lax.fori_loop with static trip count (compiles to efficient scan).
-        # Cache resets at chunk boundaries to enforce block-diagonal structure.
         #
-        # Buffer model: entries written at positions [0, write_idx), mask = positions < write_idx
+        # Cache behavior is controlled by cache_unbounded and max_cache_len:
+        # - cache_unbounded=False, max_cache_len=chunk_size: "faithful_chunk_local" mode,
+        #   resets KV at chunk boundaries (block-diagonal attention)
+        # - cache_unbounded=False, max_cache_len>chunk_size: sliding window mode,
+        #   no reset, uses ring buffer with cache_size entries
+        # - cache_unbounded=True: no clamping, uses ring buffer with max_cache_len entries
+        #
+        # Buffer model: ring buffer with entries at [0, cache_size), mask tracks valid entries
 
         Dv = v.shape[-1]
+        cache_size = self.max_cache_len
 
-        # Determine cache behavior based on cache_unbounded flag
-        if self.cache_unbounded:
-            # Unbounded mode: cache grows linearly, no reset at chunk boundaries.
-            # For JIT compatibility, we still use a static buffer (max_cache_len),
-            # but don't reset write_idx at chunk boundaries.
-            cache_size = self.max_cache_len
-            reset_at_boundary = False
-        else:
-            # Standard mode: cache resets at chunk boundaries (block-diagonal attention).
-            cache_size = self.max_cache_len
-            reset_at_boundary = True
+        # Determine cache reset behavior (matching PyTorch faithful_chunk_local)
+        # Only reset at chunk boundaries when cache_limit == chunk_size exactly
+        faithful_chunk_local = (not self.cache_unbounded) and (
+            self.max_cache_len == self.chunk_size
+        )
 
         # Initialize or extract fixed-size cache buffers
         if cache is None:
@@ -453,15 +475,19 @@ class ChunkedAttention(eqx.Module):
                 cache_k = cache.k[:, :cache_size]
                 cache_v = cache.v[:, :cache_size]
             # Compute write_idx from position
-            if self.cache_unbounded:
-                # Unbounded mode: w_idx is total tokens written (may exceed cache_size)
-                write_idx = position
-            else:
-                # Bounded mode: w_idx resets at chunk boundaries
+            if faithful_chunk_local:
+                # Chunk-local mode: w_idx resets at chunk boundaries
                 write_idx = position % self.chunk_size
+            else:
+                # Sliding window or unbounded: w_idx is total tokens written
+                write_idx = position
 
         # Pre-allocate output buffer
         out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
+
+        # Pre-compute input mask for the body_fn closure
+        # If mask is provided, we'll extract per-token values in the loop
+        has_input_mask = mask is not None
 
         def body_fn(i, state):
             """Process token i with fixed-size cache."""
@@ -472,36 +498,49 @@ class ChunkedAttention(eqx.Module):
             k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
             v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
 
-            # Check chunk boundary - reset write index (only in bounded mode)
-            if reset_at_boundary:
+            # Check chunk boundary - reset write index (only in faithful_chunk_local mode)
+            if faithful_chunk_local:
                 at_boundary = (cur_pos % self.chunk_size) == 0
                 w_idx = jax.lax.select(at_boundary, jnp.array(0, dtype=jnp.int32), w_idx)
-            # In unbounded mode, w_idx keeps incrementing (uses ring buffer via modulo)
+            # In sliding window or unbounded mode, w_idx keeps incrementing
 
             # Apply RoPE
             q_rot, k_rot = self.rotary(q_i, k_i, cur_pos)
 
-            # Write to cache at write_idx (with wrapping for unbounded mode)
-            if reset_at_boundary:
-                write_pos = w_idx
-            else:
-                # Ring buffer: wrap around when cache is full
-                write_pos = w_idx % cache_size
+            # Write to cache using ring buffer (always use modulo for safety)
+            write_pos = w_idx % cache_size
             c_k = jax.lax.dynamic_update_slice(c_k, k_rot, (0, write_pos, 0, 0))
             c_v = jax.lax.dynamic_update_slice(c_v, v_i, (0, write_pos, 0, 0))
-            w_idx = w_idx + 1
+            w_idx_new = w_idx + 1
 
-            # Build validity mask
-            if reset_at_boundary:
-                # Bounded mode: positions [0, w_idx) are valid
-                pos_indices = jnp.arange(cache_size)
-                kv_mask = pos_indices[None, :] < w_idx  # (1, cache_size)
+            # Build cache validity mask
+            # Positions [0, min(w_idx_new, cache_size)) contain valid entries
+            pos_indices = jnp.arange(cache_size)
+            valid_count = jnp.minimum(w_idx_new, cache_size)
+            cache_valid_mask = pos_indices[None, :] < valid_count  # (1, cache_size)
+            cache_valid_mask = jnp.broadcast_to(cache_valid_mask, (B, cache_size))
+
+            # Incorporate input mask if provided
+            # The input mask marks which INPUT tokens are valid (padding=False)
+            # For streaming, we track which cache slots came from valid input tokens
+            # This is complex because cache slots are overwritten in ring buffer fashion
+            # SIMPLIFICATION: For streaming with mask, we assume:
+            # 1. Mask applies to CURRENT token only (valid query)
+            # 2. Previously cached tokens are assumed valid (came from unmasked input)
+            # If full mask tracking is needed, would require storing mask per cache slot
+            if has_input_mask:
+                # Extract current token's mask value: (B,)
+                mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
+                # If current token is masked (padding), zero out its contribution
+                # by masking the write position in the cache validity
+                # Actually, for query masking, we just need to ensure the query
+                # doesn't attend to itself if masked - but the key was still written
+                # For now, we mark the current write position as invalid if masked
+                write_slot_mask = pos_indices == write_pos  # (cache_size,)
+                current_invalid = ~mask_i[:, None] & write_slot_mask[None, :]  # (B, cache_size)
+                kv_mask = cache_valid_mask & ~current_invalid
             else:
-                # Unbounded mode: all positions valid once buffer fills
-                # Before full: [0, w_idx), After full: all valid
-                pos_indices = jnp.arange(cache_size)
-                kv_mask = pos_indices[None, :] < jnp.minimum(w_idx, cache_size)
-            kv_mask = jnp.broadcast_to(kv_mask, (B, cache_size))
+                kv_mask = cache_valid_mask
 
             # Split RNG for this iteration
             if rng is not None:
@@ -524,7 +563,7 @@ class ChunkedAttention(eqx.Module):
             # Update output buffer
             out_buf = jax.lax.dynamic_update_slice(out_buf, out_i, (0, i, 0, 0))
 
-            return (out_buf, c_k, c_v, w_idx, cur_pos + 1, rng)
+            return (out_buf, c_k, c_v, w_idx_new, cur_pos + 1, rng)
 
         # Run the loop
         init_state = (out_buffer, cache_k, cache_v, write_idx, position, key)
@@ -812,6 +851,69 @@ class MegalodonAttention(eqx.Module):
 
         return y, new_cache
 
+    @classmethod
+    def with_init(
+        cls,
+        model_dim: int,
+        z_dim: int,
+        value_dim: int,
+        num_heads: int,
+        cema_ndim: int,
+        chunk_size: int,
+        norm_num_groups: int,
+        norm_eps: float = 1e-5,
+        norm_affine: bool = True,
+        rope_base: float = 10000.0,
+        max_cache_len: int | None = None,
+        cache_unbounded: bool = False,
+        dropout: float = 0.0,
+        attention_dropout: float = 0.0,
+        hidden_dropout: float = 0.0,
+        init_mode: InitMode = "gaussian",
+        *,
+        key: PRNGKeyArray,
+    ) -> "MegalodonAttention":
+        """Create MegalodonAttention with custom weight initialization.
+
+        This is the recommended way to construct MegalodonAttention when using
+        custom initialization modes. Creates the module with default init,
+        then reinitializes all Linear weights according to init_mode.
+
+        Args:
+            Same as __init__, plus:
+            init_mode: Initialization mode for Linear weights. One of:
+                - "gaussian": Truncated normal with stddev=1/sqrt(dim)
+                - "xavier": Glorot uniform (Equinox default)
+                - "he": He normal (for ReLU networks)
+                - "bert": Normal with stddev=0.02
+                - "none": Skip reinitialization (use Equinox default)
+
+        Returns:
+            MegalodonAttention instance with reinitialized weights.
+        """
+        key1, key2 = jax.random.split(key)
+        instance = cls(
+            model_dim=model_dim,
+            z_dim=z_dim,
+            value_dim=value_dim,
+            num_heads=num_heads,
+            cema_ndim=cema_ndim,
+            chunk_size=chunk_size,
+            norm_num_groups=norm_num_groups,
+            norm_eps=norm_eps,
+            norm_affine=norm_affine,
+            rope_base=rope_base,
+            max_cache_len=max_cache_len,
+            cache_unbounded=cache_unbounded,
+            dropout=dropout,
+            attention_dropout=attention_dropout,
+            hidden_dropout=hidden_dropout,
+            key=key1,
+        )
+        if init_mode != "none":
+            instance = reinit_linear_weights(instance, init_mode, key2, dim=model_dim)
+        return instance
+
 
 # -----------------------------------------------------------------------------
 # NormalizedFFN
@@ -946,3 +1048,54 @@ class NormalizedFFN(eqx.Module):
             out = self.alpha * out
 
         return residual + out
+
+    @classmethod
+    def with_init(
+        cls,
+        model_dim: int,
+        ffn_hidden_dim: int,
+        norm_eps: float = 1e-5,
+        norm_affine: bool = True,
+        swiglu: bool = False,
+        rescale: bool = False,
+        layer_id: int = 0,
+        hidden_dropout: float = 0.0,
+        dropout: float = 0.0,
+        init_mode: InitMode = "gaussian",
+        *,
+        key: PRNGKeyArray,
+    ) -> "NormalizedFFN":
+        """Create NormalizedFFN with custom weight initialization.
+
+        This is the recommended way to construct NormalizedFFN when using
+        custom initialization modes. Creates the module with default init,
+        then reinitializes all Linear weights according to init_mode.
+
+        Args:
+            Same as __init__, plus:
+            init_mode: Initialization mode for Linear weights. One of:
+                - "gaussian": Truncated normal with stddev=1/sqrt(dim)
+                - "xavier": Glorot uniform (Equinox default)
+                - "he": He normal (for ReLU networks)
+                - "bert": Normal with stddev=0.02
+                - "none": Skip reinitialization (use Equinox default)
+
+        Returns:
+            NormalizedFFN instance with reinitialized weights.
+        """
+        key1, key2 = jax.random.split(key)
+        instance = cls(
+            model_dim=model_dim,
+            ffn_hidden_dim=ffn_hidden_dim,
+            norm_eps=norm_eps,
+            norm_affine=norm_affine,
+            swiglu=swiglu,
+            rescale=rescale,
+            layer_id=layer_id,
+            hidden_dropout=hidden_dropout,
+            dropout=dropout,
+            key=key1,
+        )
+        if init_mode != "none":
+            instance = reinit_linear_weights(instance, init_mode, key2, dim=model_dim)
+        return instance

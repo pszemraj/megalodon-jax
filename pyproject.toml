@@ -50,8 +50,8 @@ write_to = "src/megalodon_jax/_version.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-# Only run JAX tests by default; PyTorch reference tests are kept for parity checks
-testpaths = ["tests/test_foundation.py", "tests/test_core_layers.py", "tests/test_attention.py"]
+# Run all tests in tests/ directory
+testpaths = ["tests"]
 markers = [
     "cuda: tests that require a CUDA-capable device",
     "torch_ref: PyTorch reference tests (not run by default)",
