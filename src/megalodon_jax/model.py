@@ -248,8 +248,10 @@ class MegalodonModel(eqx.Module):
         # Apply init_mode to all Linear layers in blocks
         if config.init_mode != "none":
             layer_init_keys = jax.random.split(keys[-1], len(layers))
+            # Match PyTorch: gaussian Linear init uses std=1.0 (dim=None).
+            linear_dim = None if config.init_mode == "gaussian" else config.model_dim
             layers = tuple(
-                reinit_linear_weights(layer, config.init_mode, k, dim=config.model_dim)
+                reinit_linear_weights(layer, config.init_mode, k, dim=linear_dim)
                 for layer, k in zip(layers, layer_init_keys)
             )
         self.layers = layers

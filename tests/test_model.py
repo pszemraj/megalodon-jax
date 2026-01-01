@@ -903,6 +903,30 @@ class TestFix4CacheValidation:
 class TestFix6InitMode:
     """Tests for init_mode initialization (Fix 6)."""
 
+    def test_gaussian_linear_init_uses_unit_scale(self, random_seed):
+        """Test that gaussian init for Linear layers uses std ~ 1.0 (dim=None)."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            init_mode="gaussian",
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Linear weights should use std ~ 1.0 (truncated normal), not 1/sqrt(dim).
+        linear_weight = model.model.layers[0].attn.wz.weight
+        var = jnp.var(linear_weight)
+        assert var > 0.2, f"Gaussian Linear init variance too small: {var}"
+
     def test_he_init_applied(self, random_seed):
         """Test that He initialization is applied when init_mode='he'."""
         config = MegalodonConfig(
