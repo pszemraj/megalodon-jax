@@ -605,7 +605,7 @@ class TestJITCompilation:
 class TestStreamingEquivalence:
     """Tests for streaming (token-by-token) equivalence with batch processing."""
 
-    def test_chunked_attention_streaming_equivalence(self, random_seed):
+    def test_chunked_attention_streaming_equivalence(self, random_seed, force_fp32_matmul):
         """Verify streaming with cache matches batch processing within a chunk."""
         batch, heads, head_dim, value_dim = 1, 2, 16, 16
         chunk_size = 8
@@ -865,7 +865,7 @@ class TestParity:
 class TestMegalodonAttentionParity:
     """Parity tests for MegalodonAttention against PyTorch reference."""
 
-    def test_megalodon_attention_forward_parity(self, random_seed):
+    def test_megalodon_attention_forward_parity(self, random_seed, force_fp32_matmul):
         """Test MegalodonAttention forward pass parity with PyTorch reference."""
         pytest = __import__("pytest")
 
