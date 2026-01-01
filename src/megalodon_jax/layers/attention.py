@@ -445,16 +445,12 @@ class ChunkedAttention(eqx.Module):
         #
         # Buffer model: ring buffer with entries at [0, cache_size), mask tracks valid entries
         #
-        # IMPORTANT: Streaming path does not support input masking for padded batches.
-        # For padded sequences, use the training path (no cache) which handles masks correctly.
-        # This is a deliberate design choice to avoid the complexity and memory overhead
-        # of per-slot mask tracking in the cache.
-        if mask is not None:
-            raise ValueError(
-                "Streaming attention (with cache) does not support input masking. "
-                "For padded batches, use the training path (cache=None, return_cache=False). "
-                "Streaming is designed for autoregressive inference with unpadded sequences."
-            )
+        # Mask semantics (matching PyTorch reference):
+        # - If mask[i] = False (padding), current query won't attend to current key
+        # - The key is still cached; future queries CAN attend to it
+        # - This matches PyTorch where cached tokens use prefix_mask = all-ones
+        # - Rationale: streaming is for autoregressive decode (no mid-sequence padding)
+        # - For padded prefill, use the training path which has full mask support
 
         Dv = v.shape[-1]
         cache_size = self.max_cache_len
@@ -496,6 +492,9 @@ class ChunkedAttention(eqx.Module):
         # Pre-allocate output buffer
         out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
 
+        # Pre-compute whether mask is provided for the body_fn closure
+        has_input_mask = mask is not None
+
         def body_fn(i, state):
             """Process token i with fixed-size cache."""
             out_buf, c_k, c_v, w_idx, cur_pos, rng = state
@@ -524,8 +523,23 @@ class ChunkedAttention(eqx.Module):
             # Positions [0, min(w_idx_new, cache_size)) contain valid entries
             pos_indices = jnp.arange(cache_size)
             valid_count = jnp.minimum(w_idx_new, cache_size)
-            kv_mask = pos_indices[None, :] < valid_count  # (1, cache_size)
-            kv_mask = jnp.broadcast_to(kv_mask, (B, cache_size))
+            cache_valid_mask = pos_indices[None, :] < valid_count  # (1, cache_size)
+            cache_valid_mask = jnp.broadcast_to(cache_valid_mask, (B, cache_size))
+
+            # Apply input mask if provided (matches PyTorch prefix_mask behavior)
+            # - Cached tokens: always valid (same as PyTorch prefix_mask = ones)
+            # - Current token: valid only if mask[i] = True
+            # This means: if current token is masked, current query won't attend to
+            # current key, but future queries will (key is still cached).
+            if has_input_mask:
+                # Extract current token's mask value: (B,)
+                mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
+                # Mark current write slot as invalid if current token is masked
+                write_slot_mask = pos_indices == write_pos  # (cache_size,)
+                current_invalid = ~mask_i[:, None] & write_slot_mask[None, :]  # (B, cache_size)
+                kv_mask = cache_valid_mask & ~current_invalid
+            else:
+                kv_mask = cache_valid_mask
 
             # Split RNG for this iteration
             if rng is not None:
