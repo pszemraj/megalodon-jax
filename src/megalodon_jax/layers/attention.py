@@ -444,6 +444,17 @@ class ChunkedAttention(eqx.Module):
         # - cache_unbounded=True: no clamping, uses ring buffer with max_cache_len entries
         #
         # Buffer model: ring buffer with entries at [0, cache_size), mask tracks valid entries
+        #
+        # IMPORTANT: Streaming path does not support input masking for padded batches.
+        # For padded sequences, use the training path (no cache) which handles masks correctly.
+        # This is a deliberate design choice to avoid the complexity and memory overhead
+        # of per-slot mask tracking in the cache.
+        if mask is not None:
+            raise ValueError(
+                "Streaming attention (with cache) does not support input masking. "
+                "For padded batches, use the training path (cache=None, return_cache=False). "
+                "Streaming is designed for autoregressive inference with unpadded sequences."
+            )
 
         Dv = v.shape[-1]
         cache_size = self.max_cache_len
@@ -485,10 +496,6 @@ class ChunkedAttention(eqx.Module):
         # Pre-allocate output buffer
         out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
 
-        # Pre-compute input mask for the body_fn closure
-        # If mask is provided, we'll extract per-token values in the loop
-        has_input_mask = mask is not None
-
         def body_fn(i, state):
             """Process token i with fixed-size cache."""
             out_buf, c_k, c_v, w_idx, cur_pos, rng = state
@@ -517,30 +524,8 @@ class ChunkedAttention(eqx.Module):
             # Positions [0, min(w_idx_new, cache_size)) contain valid entries
             pos_indices = jnp.arange(cache_size)
             valid_count = jnp.minimum(w_idx_new, cache_size)
-            cache_valid_mask = pos_indices[None, :] < valid_count  # (1, cache_size)
-            cache_valid_mask = jnp.broadcast_to(cache_valid_mask, (B, cache_size))
-
-            # Incorporate input mask if provided
-            # The input mask marks which INPUT tokens are valid (padding=False)
-            # For streaming, we track which cache slots came from valid input tokens
-            # This is complex because cache slots are overwritten in ring buffer fashion
-            # SIMPLIFICATION: For streaming with mask, we assume:
-            # 1. Mask applies to CURRENT token only (valid query)
-            # 2. Previously cached tokens are assumed valid (came from unmasked input)
-            # If full mask tracking is needed, would require storing mask per cache slot
-            if has_input_mask:
-                # Extract current token's mask value: (B,)
-                mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
-                # If current token is masked (padding), zero out its contribution
-                # by masking the write position in the cache validity
-                # Actually, for query masking, we just need to ensure the query
-                # doesn't attend to itself if masked - but the key was still written
-                # For now, we mark the current write position as invalid if masked
-                write_slot_mask = pos_indices == write_pos  # (cache_size,)
-                current_invalid = ~mask_i[:, None] & write_slot_mask[None, :]  # (B, cache_size)
-                kv_mask = cache_valid_mask & ~current_invalid
-            else:
-                kv_mask = cache_valid_mask
+            kv_mask = pos_indices[None, :] < valid_count  # (1, cache_size)
+            kv_mask = jnp.broadcast_to(kv_mask, (B, cache_size))
 
             # Split RNG for this iteration
             if rng is not None:
@@ -911,7 +896,8 @@ class MegalodonAttention(eqx.Module):
             key=key1,
         )
         if init_mode != "none":
-            instance = reinit_linear_weights(instance, init_mode, key2, dim=model_dim)
+            # Don't pass dim - matches PyTorch behavior (std=1.0 for gaussian)
+            instance = reinit_linear_weights(instance, init_mode, key2)
         return instance
 
 
@@ -1097,5 +1083,6 @@ class NormalizedFFN(eqx.Module):
             key=key1,
         )
         if init_mode != "none":
-            instance = reinit_linear_weights(instance, init_mode, key2, dim=model_dim)
+            # Don't pass dim - matches PyTorch behavior (std=1.0 for gaussian)
+            instance = reinit_linear_weights(instance, init_mode, key2)
         return instance

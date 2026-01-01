@@ -43,9 +43,11 @@ def get_initializer(
         return jax.nn.initializers.normal(stddev=0.02)
 
     if mode == "gaussian":
+        # Match PyTorch: std=1.0 when dim is None, else 1/sqrt(dim)
         if dim is None:
-            raise ValueError("dim must be provided for 'gaussian' initialization")
-        std = 1.0 / jnp.sqrt(dim)
+            std = 1.0
+        else:
+            std = 1.0 / jnp.sqrt(dim)
         return jax.nn.initializers.truncated_normal(stddev=std, lower=-3 * std, upper=3 * std)
 
     raise ValueError(f"Unknown init mode: {mode}")
@@ -103,10 +105,10 @@ def reinit_linear_weights(
             shape = weight.shape
             dtype = weight.dtype
 
-            # Compute dim for gaussian mode if not provided
-            effective_dim = dim if dim is not None else shape[-1]
+            # For gaussian mode, use the provided dim (or None for std=1.0, matching PyTorch)
+            # For other modes, use the shared init_fn
             if mode == "gaussian":
-                local_init = get_initializer(mode, effective_dim)
+                local_init = get_initializer(mode, dim)
             else:
                 local_init = init_fn
 
