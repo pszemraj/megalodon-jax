@@ -865,8 +865,10 @@ class TestParity:
 class TestMegalodonAttentionParity:
     """Parity tests for MegalodonAttention against PyTorch reference."""
 
-    def test_megalodon_attention_forward_parity(self, random_seed, force_fp32_matmul):
+    def test_megalodon_attention_forward_parity(self, random_seed, torch_device):
         """Test MegalodonAttention forward pass parity with PyTorch reference."""
+        from conftest import sync_and_clear_torch
+
         pytest = __import__("pytest")
 
         # Check if PyTorch reference is available
@@ -892,7 +894,7 @@ class TestMegalodonAttentionParity:
         chunk_size = 4
         norm_num_groups = 2
 
-        # Create PyTorch module
+        # Create PyTorch module on same device as JAX (GPU if available)
         torch_cfg = TorchConfig(
             model_dim=model_dim,
             num_heads=num_heads,
@@ -908,7 +910,7 @@ class TestMegalodonAttentionParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_attn = TorchMegalodonAttention(torch_cfg)
+        torch_attn = TorchMegalodonAttention(torch_cfg).to(torch_device)
         torch_attn.eval()
 
         # Create JAX module with same config
@@ -1017,27 +1019,33 @@ class TestMegalodonAttentionParity:
             lambda m: m.beta, jax_attn, to_jax(torch_attn.beta)
         )
 
-        # Inner attention rotary
+        # Inner attention rotary (copy from CPU tensor)
         jax_attn = eqx.tree_at(
             lambda m: m.inner.rotary.inv_freq,
             jax_attn,
-            to_jax(torch_attn.inner.rope.inv_freq),
+            to_jax(torch_attn.inner.rope.inv_freq.cpu()),
         )
 
-        # Generate input
+        # Generate input on JAX, convert to PyTorch on same device
         x_jax = jax.random.normal(k2, (batch, seq_len, model_dim))
-        x_torch = to_torch(x_jax)
+        x_torch = to_torch(x_jax).to(torch_device)
 
-        # Forward pass
+        # Run PyTorch forward on GPU, then move result to CPU
         with torch.no_grad():
             y_torch, _ = torch_attn(x_torch)
+            y_torch_cpu = y_torch.cpu().numpy()
 
+        # Clean up PyTorch GPU memory before JAX forward
+        del y_torch, x_torch, torch_attn
+        sync_and_clear_torch()
+
+        # Run JAX forward
         y_jax, _ = jax_attn(x_jax, deterministic=True)
 
-        # Compare outputs
+        # Compare outputs (both ran on GPU with matching TF32 settings)
         np.testing.assert_allclose(
             np.array(y_jax),
-            y_torch.numpy(),
+            y_torch_cpu,
             rtol=1e-4,
             atol=1e-4,
             err_msg="MegalodonAttention output should match PyTorch reference",

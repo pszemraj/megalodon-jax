@@ -66,3 +66,44 @@ def force_fp32_matmul():
     jax.config.update("jax_default_matmul_precision", "float32")
     yield
     jax.config.update("jax_default_matmul_precision", original)
+
+
+@pytest.fixture
+def torch_device():
+    """Get the appropriate torch device and ensure TF32 settings match JAX.
+
+    Both PyTorch and JAX should use the same precision mode (TF32 on GPU).
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        # Enable TF32 to match JAX's default behavior
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    else:
+        device = torch.device("cpu")
+    return device
+
+
+def sync_and_clear_torch():
+    """Synchronize and clear PyTorch GPU memory before switching to JAX."""
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
+def sync_and_clear_jax():
+    """Synchronize and clear JAX GPU memory before switching to PyTorch."""
+    import gc
+
+    import jax
+
+    # Block until all JAX computations complete
+    for device in jax.devices():
+        if device.platform == "gpu":
+            # Force sync by blocking on a trivial computation
+            jax.device_get(jnp.array(0))
+            break
+    gc.collect()
