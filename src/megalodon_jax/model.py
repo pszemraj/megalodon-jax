@@ -6,7 +6,7 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any, TypeVar
 
 import equinox as eqx
@@ -264,7 +264,8 @@ class MegalodonModel(eqx.Module):
             Tuple of (hidden_states, updated_cache).
         """
         # Embedding with optional scaling
-        x = self.embed(input_ids) * self.scale
+        # eqx.nn.Embedding takes scalar indices, so vmap over batch and sequence
+        x = jax.vmap(jax.vmap(self.embed))(input_ids) * self.scale
 
         # Parse cache
         if cache is not None:

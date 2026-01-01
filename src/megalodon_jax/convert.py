@@ -55,6 +55,7 @@ def load_weights_from_torch(
     Raises:
         KeyError: If expected keys are missing from state_dict.
     """
+
     # Helper to get weight or raise informative error
     def get_weight(key: str) -> Array:
         if key not in state_dict:
@@ -137,17 +138,13 @@ def load_weights_from_torch(
         # Linear projections
         for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
             model = eqx.tree_at(
-                lambda m, idx=i, pn=proj_name: getattr(
-                    m.model.layers[idx].attn, pn
-                ).weight,
+                lambda m, idx=i, pn=proj_name: getattr(m.model.layers[idx].attn, pn).weight,
                 model,
                 get_weight(f"{attn_prefix}.{proj_name}.weight"),
             )
             if has_key(f"{attn_prefix}.{proj_name}.bias"):
                 model = eqx.tree_at(
-                    lambda m, idx=i, pn=proj_name: getattr(
-                        m.model.layers[idx].attn, pn
-                    ).bias,
+                    lambda m, idx=i, pn=proj_name: getattr(m.model.layers[idx].attn, pn).bias,
                     model,
                     get_weight(f"{attn_prefix}.{proj_name}.bias"),
                 )
@@ -198,9 +195,7 @@ def load_weights_from_torch(
             )
             if has_key(f"{ffn_prefix}.{fc_name}.bias"):
                 model = eqx.tree_at(
-                    lambda m, idx=i, fn=fc_name: getattr(
-                        m.model.layers[idx].ffn, fn
-                    ).bias,
+                    lambda m, idx=i, fn=fc_name: getattr(m.model.layers[idx].ffn, fn).bias,
                     model,
                     get_weight(f"{ffn_prefix}.{fc_name}.bias"),
                 )
@@ -282,9 +277,7 @@ def load_from_pretrained(
 
     # Config must be provided for now
     if config is None:
-        raise ValueError(
-            "config must be provided. Automatic config inference not yet implemented."
-        )
+        raise ValueError("config must be provided. Automatic config inference not yet implemented.")
 
     # Initialize JAX model
     model = MegalodonForCausalLM(config, key=key)
