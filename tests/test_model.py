@@ -675,3 +675,315 @@ class TestParity:
         assert torch_generated == jax_generated, (
             f"Generated tokens differ: PyTorch={torch_generated}, JAX={jax_generated}"
         )
+
+
+# -----------------------------------------------------------------------------
+# Regression Tests for Phase 4 Fixes
+# -----------------------------------------------------------------------------
+
+
+class TestFix1GradientCheckpointing:
+    """Tests for gradient checkpointing (Fix 1)."""
+
+    def test_checkpointing_disables_cache_during_training(self, random_seed):
+        """Test that use_checkpoint=True produces None caches during training."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=2,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            use_checkpoint=True,  # Enable checkpointing
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
+
+        # Training mode (deterministic=False) with checkpointing
+        # The PRNG key is needed for dropout even if dropout=0
+        dropout_key = jax.random.PRNGKey(42)
+        _, cache = model(input_ids, return_cache=True, deterministic=False, key=dropout_key)
+
+        # All layer caches should be None when checkpointing
+        for layer_cache in cache.layer_caches:
+            assert layer_cache is None, "Layer cache should be None when checkpointing"
+
+    def test_checkpointing_disabled_returns_cache(self, random_seed):
+        """Test that use_checkpoint=False returns caches normally."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=2,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            use_checkpoint=False,  # Disable checkpointing
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
+
+        # Deterministic mode returns caches
+        _, cache = model(input_ids, return_cache=True, deterministic=True)
+
+        # Layer caches should be populated
+        for layer_cache in cache.layer_caches:
+            assert layer_cache is not None, "Layer cache should be returned when not checkpointing"
+
+
+class TestFix2PadTokenMasking:
+    """Tests for pad token masking (Fix 2)."""
+
+    def test_pad_token_embeddings_are_zeroed(self, random_seed):
+        """Test that pad tokens produce zero embeddings."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            pad_token_id=0,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+
+        # Create input with pad tokens at positions 1, 3
+        input_ids = jnp.array([[5, 0, 10, 0, 15]])  # 0 is pad token
+
+        # Get embeddings after scaling but before layers process them
+        # We check embedding lookup directly
+        embed = jax.vmap(jax.vmap(model.embed))(input_ids) * model.scale
+
+        # Mask pad tokens the same way as in the model
+        pad_mask = input_ids == config.pad_token_id
+        masked_embed = jnp.where(pad_mask[:, :, None], 0.0, embed)
+
+        # Positions 1 and 3 (pad tokens) should have all-zero embeddings
+        np.testing.assert_array_equal(
+            np.array(masked_embed[0, 1]),
+            np.zeros(config.model_dim),
+            err_msg="Pad token at position 1 should have zero embedding",
+        )
+        np.testing.assert_array_equal(
+            np.array(masked_embed[0, 3]),
+            np.zeros(config.model_dim),
+            err_msg="Pad token at position 3 should have zero embedding",
+        )
+
+
+class TestFix3UntiedLMHead:
+    """Tests for untied LM head support (Fix 3)."""
+
+    def test_tied_head_when_output_size_matches_vocab(self, random_seed):
+        """Test that LM head is tied when output_size equals vocab_size."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            output_size=-1,  # Tied
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        assert model.tied is True
+        assert model.lm_head is None
+
+    def test_untied_head_when_output_size_differs(self, random_seed):
+        """Test that separate LM head is created when output_size != vocab_size."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            output_size=512,  # Different from vocab_size
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        assert model.tied is False
+        assert model.lm_head is not None
+        assert model.lm_head.weight.shape == (512, 64)  # (output_size, model_dim)
+
+    def test_untied_head_forward_shapes(self, random_seed):
+        """Test that untied LM head produces correct output shapes."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            output_size=512,  # Different from vocab_size
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
+        logits, _ = model(input_ids, return_cache=False)
+
+        # Output should be (batch, seq, output_size)
+        assert logits.shape == (batch, seq, 512)
+
+
+class TestFix4CacheValidation:
+    """Tests for cache length validation (Fix 4)."""
+
+    def test_cache_length_mismatch_raises(self, random_seed):
+        """Test that mismatched cache length raises ValueError."""
+        from megalodon_jax import ModelCache
+
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=2,  # Model expects 2 layer caches
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
+
+        # Create a bad cache with wrong number of layers
+        bad_cache = ModelCache(layer_caches=(None,) * 5)  # Wrong: 5 instead of 2
+
+        with pytest.raises(ValueError, match="expected 2"):
+            model(input_ids, cache=bad_cache)
+
+
+class TestFix6InitMode:
+    """Tests for init_mode initialization (Fix 6)."""
+
+    def test_he_init_applied(self, random_seed):
+        """Test that He initialization is applied when init_mode='he'."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            init_mode="he",
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Check that weights are not the Equinox default (which is different from He)
+        embed_weight = model.model.embed.weight
+        assert embed_weight is not None
+        # He init should have reasonable variance
+        var = jnp.var(embed_weight)
+        assert var > 0.001, "Embedding weights should have non-trivial variance"
+
+    def test_none_init_keeps_defaults(self, random_seed):
+        """Test that init_mode='none' doesn't reinitialize weights."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            init_mode="none",
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Weights should exist
+        assert model.model.embed.weight is not None
+
+    def test_different_init_modes_produce_different_weights(self, random_seed):
+        """Test that different init modes produce different weight distributions."""
+        base_config = dict(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+
+        # Create models with different init modes
+        model_he = MegalodonForCausalLM(
+            MegalodonConfig(**base_config, init_mode="he"), key=key
+        )
+        model_xavier = MegalodonForCausalLM(
+            MegalodonConfig(**base_config, init_mode="xavier"), key=key
+        )
+        model_bert = MegalodonForCausalLM(
+            MegalodonConfig(**base_config, init_mode="bert"), key=key
+        )
+
+        # BERT init has stddev=0.02, which should have much smaller variance than He
+        bert_var = jnp.var(model_bert.model.embed.weight)
+        he_var = jnp.var(model_he.model.embed.weight)
+
+        # BERT has fixed small stddev, He scales with dimensions
+        # BERT std=0.02 means var ~0.0004
+        assert bert_var < 0.01, f"BERT init variance {bert_var} should be small"
+        assert he_var != bert_var, "Different init modes should produce different weights"

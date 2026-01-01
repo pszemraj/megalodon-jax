@@ -17,6 +17,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
 from megalodon_jax.types import LayerCache, NormState
+from megalodon_jax.utils import get_initializer, reinit_linear_weights
 
 T = TypeVar("T")
 
@@ -205,6 +206,7 @@ class MegalodonModel(eqx.Module):
     layers: tuple[MegalodonBlock, ...]
     norm: TimestepNorm
     scale: float = eqx.field(static=True)
+    use_checkpoint: bool = eqx.field(static=True)
     config: MegalodonConfig = eqx.field(static=True)
 
     def __init__(
@@ -219,20 +221,38 @@ class MegalodonModel(eqx.Module):
             config: Model configuration.
             key: PRNG key for initialization.
         """
-        keys = jax.random.split(key, config.num_layers + 1)
+        # Split keys: layers + embed + embed_init + layer_init
+        keys = jax.random.split(key, config.num_layers + 4)
 
         self.config = config
         self.scale = float(jnp.sqrt(config.model_dim)) if config.scale_emb else 1.0
+        self.use_checkpoint = config.use_checkpoint
 
-        self.embed = eqx.nn.Embedding(
+        # Initialize embedding
+        embed = eqx.nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_size=config.model_dim,
             key=keys[0],
         )
 
-        self.layers = tuple(
-            MegalodonBlock(config, i, key=keys[i + 1]) for i in range(config.num_layers)
-        )
+        # Apply init_mode to embedding weights
+        if config.init_mode != "none":
+            init_fn = get_initializer(config.init_mode, dim=config.model_dim)
+            new_embed_weight = init_fn(keys[-2], embed.weight.shape, embed.weight.dtype)
+            embed = eqx.tree_at(lambda e: e.weight, embed, new_embed_weight)
+        self.embed = embed
+
+        # Initialize layers
+        layers = tuple(MegalodonBlock(config, i, key=keys[i + 1]) for i in range(config.num_layers))
+
+        # Apply init_mode to all Linear layers in blocks
+        if config.init_mode != "none":
+            layer_init_keys = jax.random.split(keys[-1], len(layers))
+            layers = tuple(
+                reinit_linear_weights(layer, config.init_mode, k, dim=config.model_dim)
+                for layer, k in zip(layers, layer_init_keys)
+            )
+        self.layers = layers
 
         self.norm = TimestepNorm(
             num_features=config.model_dim,
@@ -267,8 +287,18 @@ class MegalodonModel(eqx.Module):
         # eqx.nn.Embedding takes scalar indices, so vmap over batch and sequence
         x = jax.vmap(jax.vmap(self.embed))(input_ids) * self.scale
 
-        # Parse cache
+        # Zero-mask pad tokens (matches PyTorch padding_idx behavior)
+        # This ensures pad tokens have zero embeddings and receive no gradient updates
+        pad_mask = input_ids == self.config.pad_token_id
+        x = jnp.where(pad_mask[:, :, None], 0.0, x)
+
+        # Parse cache with validation
         if cache is not None:
+            if len(cache.layer_caches) != len(self.layers):
+                raise ValueError(
+                    f"Cache has {len(cache.layer_caches)} layer entries, "
+                    f"expected {len(self.layers)}"
+                )
             layer_caches = list(cache.layer_caches)
             final_norm_state = cache.final_norm
         else:
@@ -282,17 +312,38 @@ class MegalodonModel(eqx.Module):
             keys = [None] * len(self.layers)
 
         # Process layers
+        # When checkpointing is enabled during training (not deterministic),
+        # we disable caching per the Phase 4 spec (matches PyTorch behavior)
+        use_ckpt = self.use_checkpoint and not deterministic
         new_caches: list[LayerCache | None] = []
         for layer, layer_cache, layer_key in zip(self.layers, layer_caches, keys):
-            x, new_cache = layer(
-                x,
-                cache=layer_cache,
-                mask=attention_mask,
-                return_cache=return_cache,
-                deterministic=deterministic,
-                key=layer_key,
-            )
-            new_caches.append(new_cache)
+            if use_ckpt:
+                # Checkpointed path: disable cache during training
+                @eqx.filter_checkpoint
+                def run_layer(
+                    layer: MegalodonBlock,
+                    x: Float[Array, "batch seq dim"],
+                    mask: Bool[Array, "batch seq"] | None,
+                    key: PRNGKeyArray | None,
+                ) -> Float[Array, "batch seq dim"]:
+                    out, _ = layer(
+                        x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key
+                    )
+                    return out
+
+                x = run_layer(layer, x, attention_mask, layer_key)
+                new_caches.append(None)
+            else:
+                # Standard path with optional caching
+                x, new_cache = layer(
+                    x,
+                    cache=layer_cache,
+                    mask=attention_mask,
+                    return_cache=return_cache,
+                    deterministic=deterministic,
+                    key=layer_key,
+                )
+                new_caches.append(new_cache)
 
         # Final TimestepNorm
         x, final_norm_state = self.norm(x, state=final_norm_state, mask=attention_mask)
@@ -315,16 +366,19 @@ class MegalodonModel(eqx.Module):
 
 
 class MegalodonForCausalLM(eqx.Module):
-    """Megalodon decoder with tied LM head for causal language modeling.
+    """Megalodon decoder with LM head for causal language modeling.
 
-    The LM head shares weights with the input embeddings (weight tying).
-    This is implemented by directly computing logits as:
-        logits = hidden @ embed.weight.T
+    Supports both tied and untied LM heads:
+    - When output_size == vocab_size or output_size == -1: weights are tied
+    - When output_size != vocab_size: separate lm_head is created
 
-    No separate lm_head parameter is needed.
+    For tied weights, logits are computed as: hidden @ embed.weight.T
+    For untied weights, logits are computed via the lm_head Linear layer.
     """
 
     model: MegalodonModel
+    lm_head: eqx.nn.Linear | None  # None when tied
+    tied: bool = eqx.field(static=True)
     config: MegalodonConfig = eqx.field(static=True)
 
     def __init__(
@@ -333,14 +387,30 @@ class MegalodonForCausalLM(eqx.Module):
         *,
         key: PRNGKeyArray,
     ):
-        """Initialize model with tied embeddings.
+        """Initialize model with optional LM head.
 
         Args:
             config: Model configuration.
             key: PRNG key for initialization.
         """
+        k1, k2, k3 = jax.random.split(key, 3)
         self.config = config
-        self.model = MegalodonModel(config, key=key)
+        self.model = MegalodonModel(config, key=k1)
+
+        # Determine output size and whether to tie weights
+        lm_out = config.vocab_size if config.output_size in (-1, None) else config.output_size
+        self.tied = lm_out == config.vocab_size
+
+        if self.tied:
+            self.lm_head = None
+        else:
+            lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k2)
+            # Apply init_mode to untied lm_head
+            if config.init_mode != "none":
+                init_fn = get_initializer(config.init_mode, dim=lm_out)
+                new_weight = init_fn(k3, lm_head.weight.shape, lm_head.weight.dtype)
+                lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
+            self.lm_head = lm_head
 
     def __call__(
         self,
@@ -373,8 +443,13 @@ class MegalodonForCausalLM(eqx.Module):
             key=key,
         )
 
-        # Weight-tied projection (no separate lm_head)
-        logits = hidden @ self.model.embed.weight.T
+        if self.tied:
+            # Weight-tied projection
+            logits = hidden @ self.model.embed.weight.T
+        else:
+            # Separate LM head
+            # eqx.nn.Linear takes single vectors, so vmap over batch and sequence
+            logits = jax.vmap(jax.vmap(self.lm_head))(hidden)
 
         return logits, cache
 

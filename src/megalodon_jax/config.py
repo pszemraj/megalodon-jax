@@ -38,6 +38,8 @@ class MegalodonConfig:
     pad_token_id: int = 0
     max_positions: int = 1_000_000
     init_mode: InitMode = "gaussian"
+    use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
+    output_size: int = -1  # LM head size; -1 ties to vocab_size
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array
 
@@ -228,7 +229,13 @@ def load_weights_from_torch(
             get_weight("model.norm.bias"),
         )
 
-    # lm_head.weight is skipped - tied to embedding
+    # lm_head.weight - load only if untied (model.lm_head is not None)
+    if not model.tied and model.lm_head is not None and has_key("lm_head.weight"):
+        model = eqx.tree_at(
+            lambda m: m.lm_head.weight,
+            model,
+            get_weight("lm_head.weight"),
+        )
 
     return model
 
@@ -284,5 +291,16 @@ def load_from_pretrained(
 
     # Load weights
     model = load_weights_from_torch(model, state_dict)
+
+    # Apply dtype cast if requested
+    if dtype != jnp.float32:
+
+        def cast_arrays(x: Any) -> Any:
+            """Cast floating point arrays to target dtype."""
+            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(dtype)
+            return x
+
+        model = jax.tree.map(cast_arrays, model)
 
     return model
