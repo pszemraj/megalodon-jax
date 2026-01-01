@@ -881,7 +881,8 @@ class MegalodonAttention(eqx.Module):
         Args:
             Same as __init__, plus:
             init_mode: Initialization mode for Linear weights. One of:
-                - "gaussian": Truncated normal with stddev=1/sqrt(dim)
+                - "gaussian": Truncated normal with stddev=1/sqrt(dim) when dim is set,
+                  or stddev=1.0 when dim is None (PyTorch parity)
                 - "xavier": Glorot uniform (Equinox default)
                 - "he": He normal (for ReLU networks)
                 - "bert": Normal with stddev=0.02
@@ -1074,7 +1075,8 @@ class NormalizedFFN(eqx.Module):
         Args:
             Same as __init__, plus:
             init_mode: Initialization mode for Linear weights. One of:
-                - "gaussian": Truncated normal with stddev=1/sqrt(dim)
+                - "gaussian": Truncated normal with stddev=1/sqrt(dim) when dim is set,
+                  or stddev=1.0 when dim is None (PyTorch parity)
                 - "xavier": Glorot uniform (Equinox default)
                 - "he": He normal (for ReLU networks)
                 - "bert": Normal with stddev=0.02

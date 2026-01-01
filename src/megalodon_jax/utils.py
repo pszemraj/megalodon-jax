@@ -24,8 +24,9 @@ def get_initializer(
             - "he": He normal (variance scaling for ReLU)
             - "xavier": Xavier uniform (Glorot)
             - "bert": Normal with stddev=0.02
-            - "gaussian": Truncated normal with stddev=1/sqrt(dim)
-        dim: Dimension for computing stddev in "gaussian" mode.
+            - "gaussian": Truncated normal with stddev=1/sqrt(dim) when dim is set,
+              or stddev=1.0 when dim is None (PyTorch parity).
+        dim: Dimension for computing stddev in "gaussian" mode; if None uses stddev=1.0.
 
     Returns:
         Callable that takes (key, shape, dtype) and returns an array.
@@ -68,7 +69,7 @@ def reinit_linear_weights(
         model: Equinox module to reinitialize.
         mode: Initialization mode for weights.
         key: PRNG key for random initialization.
-        dim: Dimension for "gaussian" mode (optional, falls back to weight shape).
+        dim: Dimension for "gaussian" mode (optional; None uses stddev=1.0).
 
     Returns:
         New model with reinitialized Linear weights.
