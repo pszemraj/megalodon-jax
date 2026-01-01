@@ -328,6 +328,7 @@ class MegalodonModel(eqx.Module):
                     mask: Bool[Array, "batch seq"] | None,
                     key: PRNGKeyArray | None,
                 ) -> Float[Array, "batch seq dim"]:
+                    """Execute layer without caching for gradient checkpointing."""
                     out, _ = layer(
                         x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key
                     )

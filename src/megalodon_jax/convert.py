@@ -57,14 +57,14 @@ def load_weights_from_torch(
         KeyError: If expected keys are missing from state_dict.
     """
 
-    # Helper to get weight or raise informative error
     def get_weight(key: str) -> Array:
+        """Retrieve weight from state_dict or raise KeyError."""
         if key not in state_dict:
             raise KeyError(f"Missing key in state_dict: {key}")
         return _to_jax(state_dict[key])
 
-    # Helper to check if key exists
     def has_key(key: str) -> bool:
+        """Check if key exists in state_dict."""
         return key in state_dict
 
     # Embedding
