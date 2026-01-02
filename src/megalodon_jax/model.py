@@ -521,6 +521,7 @@ class MegalodonForCausalLM(eqx.Module):
         input_ids: Int[Array, "batch seq"],
         labels: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        ignore_index: int = -100,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
     ) -> Float[Array, ""]:
@@ -529,18 +530,18 @@ class MegalodonForCausalLM(eqx.Module):
         Computes cross-entropy loss for next-token prediction.
         Labels are automatically shifted: position i predicts position i+1.
 
-        Note: Unlike the PyTorch reference implementation, we correctly exclude
-        masked/padding positions from the loss computation. This is industry
-        standard practice (see HuggingFace Transformers' ignore_index=-100) and
-        prevents gradient noise from padding tokens. The PyTorch reference uses
-        plain F.cross_entropy without ignore_index, which includes padding in
-        the loss - this is likely an oversight we intentionally do not replicate.
+        Positions with labels equal to ignore_index are excluded from loss
+        computation, following HuggingFace Transformers convention. This allows
+        padding tokens to be marked with -100 in the labels array.
 
         Args:
             input_ids: Input token IDs of shape (batch, seq).
-            labels: Target token IDs of shape (batch, seq).
+            labels: Target token IDs of shape (batch, seq). Positions with value
+                equal to ignore_index are excluded from loss computation.
             attention_mask: Optional mask (True = valid token). Masked positions
                 are excluded from the loss to prevent gradient noise from padding.
+            ignore_index: Label value to ignore in loss computation. Default -100
+                matches HuggingFace Transformers convention.
             deterministic: If True, skip dropout.
             key: PRNG key for dropout.
 
@@ -565,14 +566,28 @@ class MegalodonForCausalLM(eqx.Module):
         if shift_labels.shape[1] == 0:
             return jnp.zeros((), dtype=shift_logits.dtype)  # Match model dtype
 
-        # Validate label bounds - prevents silent wrong gradients from JAX index wrapping
+        # Build valid mask: positions that contribute to loss
+        # Excludes both ignore_index labels and attention-masked positions
+        valid_mask = shift_labels != ignore_index
+        if attention_mask is not None:
+            shift_attn_mask = attention_mask[:, 1:]  # (B, L-1)
+            valid_mask = valid_mask & shift_attn_mask
+
+        # Validate label bounds only on positions that will be used
+        # Prevents silent wrong gradients from JAX index wrapping
         vocab_size = shift_logits.shape[-1]
-        has_invalid_labels = jnp.any((shift_labels < 0) | (shift_labels >= vocab_size))
+        # Check: any valid position has out-of-bounds label?
+        has_invalid_labels = jnp.any(
+            valid_mask & ((shift_labels < 0) | (shift_labels >= vocab_size))
+        )
         shift_labels = eqx.error_if(
             shift_labels,
             has_invalid_labels,
             f"labels contain out-of-bounds values. Valid range: [0, {vocab_size})",
         )
+
+        # Replace ignored labels with 0 for safe indexing (will be masked out)
+        safe_labels = jnp.where(valid_mask, shift_labels, 0)
 
         # Cross-entropy loss
         log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
@@ -581,18 +596,11 @@ class MegalodonForCausalLM(eqx.Module):
         # Gather log prob of correct token
         batch_idx = jnp.arange(B)[:, None]
         seq_idx = jnp.arange(L)[None, :]
-        target_log_probs = log_probs[batch_idx, seq_idx, shift_labels]
+        target_log_probs = log_probs[batch_idx, seq_idx, safe_labels]
 
-        # Apply mask if provided (shift mask to match labels)
-        if attention_mask is not None:
-            shift_mask = attention_mask[:, 1:]  # (B, L-1), True = valid
-            # Mask out invalid positions (set their contribution to 0)
-            target_log_probs = jnp.where(shift_mask, target_log_probs, 0.0)
-            # Mean over valid positions only
-            num_valid = shift_mask.sum()
-            # Avoid division by zero
-            num_valid = jnp.maximum(num_valid, 1)
-            return -target_log_probs.sum() / num_valid
-        else:
-            # Mean over all positions
-            return -target_log_probs.mean()
+        # Apply valid mask and compute mean over valid positions only
+        target_log_probs = jnp.where(valid_mask, target_log_probs, 0.0)
+        num_valid = valid_mask.sum()
+        # Avoid division by zero (return 0 loss if no valid positions)
+        num_valid = jnp.maximum(num_valid, 1)
+        return -target_log_probs.sum() / num_valid

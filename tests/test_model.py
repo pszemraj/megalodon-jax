@@ -1122,6 +1122,99 @@ class TestComputeLossMasking:
         # With all positions masked, loss should be 0 (sum of 0 / max(0,1) = 0)
         assert loss == 0.0, f"Fully masked loss should be 0, got {loss}"
 
+    def test_ignore_index_excludes_positions(self, random_seed):
+        """Test that labels with ignore_index are excluded from loss."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        labels = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        # Set some labels to ignore_index (-100)
+        labels_with_ignore = labels.at[:, -4:].set(-100)
+
+        # Should not raise (previously would fail on bounds check)
+        loss = model.compute_loss(input_ids, labels_with_ignore)
+        assert jnp.isfinite(loss), f"Loss should be finite, got {loss}"
+
+        # All labels ignored should return 0 loss
+        all_ignored = jnp.full_like(labels, -100)
+        loss_all_ignored = model.compute_loss(input_ids, all_ignored)
+        assert loss_all_ignored == 0.0, f"All ignored should be 0 loss, got {loss_all_ignored}"
+
+    def test_custom_ignore_index(self, random_seed):
+        """Test that custom ignore_index value works."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        labels = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        # Use -1 as ignore index instead of -100
+        labels_custom = labels.at[:, -4:].set(-1)
+        loss = model.compute_loss(input_ids, labels_custom, ignore_index=-1)
+        assert jnp.isfinite(loss), f"Loss should be finite with custom ignore_index"
+
+    def test_bounds_check_only_on_valid_labels(self, random_seed):
+        """Test that bounds check only applies to non-ignored labels."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        labels = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        # Out of bounds label at ignored position should NOT raise
+        labels_ignored_oob = labels.at[0, 5].set(-100)  # This is fine
+        loss = model.compute_loss(input_ids, labels_ignored_oob)
+        assert jnp.isfinite(loss)
+
+        # Out of bounds label at valid position SHOULD raise
+        labels_valid_oob = labels.at[0, 5].set(999)
+        with pytest.raises(Exception):  # eqx.error_if raises various exception types
+            model.compute_loss(input_ids, labels_valid_oob)
+
 
 class TestUntiedHeadInit:
     """Tests for untied LM head initialization."""
