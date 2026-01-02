@@ -288,6 +288,16 @@ class MegalodonModel(eqx.Module):
         Returns:
             Tuple of (hidden_states, updated_cache).
         """
+        B, L = input_ids.shape
+
+        # Handle empty inputs gracefully (B=0 or L=0)
+        if B == 0 or L == 0:
+            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=jnp.float32)
+            empty_cache = (
+                ModelCache(tuple([None] * len(self.layers)), None) if return_cache else None
+            )
+            return empty_hidden, empty_cache
+
         # Embedding with optional scaling
         # eqx.nn.Embedding takes scalar indices, so vmap over batch and sequence
         x = jax.vmap(jax.vmap(self.embed))(input_ids) * self.scale
@@ -297,6 +307,23 @@ class MegalodonModel(eqx.Module):
         # Use dtype-matched zero to avoid upcasting bf16 to float32
         pad_mask = input_ids == self.config.pad_token_id
         x = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=x.dtype), x)
+
+        # Validate cache + padding constraint
+        # Caching with padding is unsupported because:
+        # 1. ComplexEMA has no mask support - padded positions contaminate hidden state
+        # 2. Cache validity tracking is per-token, not remembered across steps
+        # This matches PyTorch's assumption that caching is for autoregressive decode only
+        if return_cache and attention_mask is not None:
+            # Check if any position is masked (False = padding)
+            # Use eqx.error_if for traced-value-safe conditional errors
+            has_padding = ~jnp.all(attention_mask)
+            x = eqx.error_if(
+                x,  # Value to pass through (and attach error to)
+                has_padding,
+                "Cannot build cache with padding in attention_mask. "
+                "Caching is only supported for autoregressive generation without padding. "
+                "Use return_cache=False for padded prefill or ensure attention_mask is all True.",
+            )
 
         # Parse cache with validation
         if cache is not None:
@@ -405,7 +432,8 @@ class MegalodonForCausalLM(eqx.Module):
         self.model = MegalodonModel(config, key=k1)
 
         # Determine output size and whether to tie weights
-        lm_out = config.vocab_size if config.output_size in (-1, None) else config.output_size
+        # output_size=-1 means "use vocab_size" (tied weights)
+        lm_out = config.vocab_size if config.output_size == -1 else config.output_size
         self.tied = lm_out == config.vocab_size
 
         if self.tied:
@@ -497,6 +525,11 @@ class MegalodonForCausalLM(eqx.Module):
         # Shift for causal LM: predict next token
         shift_logits = logits[:, :-1, :]  # (B, L-1, V)
         shift_labels = labels[:, 1:]  # (B, L-1)
+
+        # Guard against empty sequences (seq=0 or seq=1 after shift)
+        # jnp.mean() on empty array returns NaN, which would poison training
+        if shift_labels.shape[1] == 0:
+            return jnp.array(0.0)
 
         # Cross-entropy loss
         log_probs = jax.nn.log_softmax(shift_logits, axis=-1)

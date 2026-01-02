@@ -1156,3 +1156,210 @@ class TestUntiedHeadInit:
             f"Untied LM head variance {lm_head_var} is too small. "
             "Gaussian init should use std=1.0, not 1/sqrt(output_size)."
         )
+
+
+class TestEdgeCases:
+    """Tests for edge cases and boundary conditions."""
+
+    def test_compute_loss_empty_sequence_seq0(self, random_seed):
+        """Test compute_loss returns 0.0 for empty sequences (seq=0)."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Empty sequence (seq=0)
+        input_ids = jnp.zeros((2, 0), dtype=jnp.int32)
+        labels = jnp.zeros((2, 0), dtype=jnp.int32)
+
+        loss = model.compute_loss(input_ids, labels)
+
+        # Should return 0.0, not NaN
+        assert loss == 0.0, f"Empty sequence loss should be 0.0, got {loss}"
+        assert not jnp.isnan(loss), "Empty sequence loss should not be NaN"
+
+    def test_compute_loss_single_token_seq1(self, random_seed):
+        """Test compute_loss returns 0.0 for single-token sequences (seq=1).
+
+        After shifting, a single-token sequence becomes empty (no predictions to make).
+        """
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Single token sequence (seq=1) - after shift, becomes empty
+        input_ids = jnp.ones((2, 1), dtype=jnp.int32)
+        labels = jnp.ones((2, 1), dtype=jnp.int32)
+
+        loss = model.compute_loss(input_ids, labels)
+
+        # Should return 0.0, not NaN
+        assert loss == 0.0, f"Single-token sequence loss should be 0.0, got {loss}"
+        assert not jnp.isnan(loss), "Single-token sequence loss should not be NaN"
+
+    def test_cache_with_padding_raises_error(self, random_seed):
+        """Test that building cache with padded attention_mask raises an error.
+
+        Caching with padding is unsupported because ComplexEMA doesn't handle masks,
+        leading to hidden state contamination from padded positions.
+        """
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        batch, seq = 2, 16
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        # Mask with some padding (last 4 positions are False)
+        attention_mask = jnp.concatenate(
+            [jnp.ones((batch, seq - 4), dtype=bool), jnp.zeros((batch, 4), dtype=bool)],
+            axis=1,
+        )
+
+        # Should raise when return_cache=True with padding
+        with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
+            model(input_ids, attention_mask=attention_mask, return_cache=True)
+
+    def test_cache_without_padding_succeeds(self, random_seed):
+        """Test that building cache without padding works correctly."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        batch, seq = 2, 16
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+        # All-True mask (no padding) should work
+        attention_mask = jnp.ones((batch, seq), dtype=bool)
+
+        # Should succeed with all-True mask
+        logits, cache = model(input_ids, attention_mask=attention_mask, return_cache=True)
+
+        assert logits.shape == (batch, seq, config.vocab_size)
+        assert cache is not None
+
+    def test_no_mask_with_cache_succeeds(self, random_seed):
+        """Test that building cache without any mask works correctly."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        batch, seq = 2, 16
+        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        # No mask at all should work
+        logits, cache = model(input_ids, attention_mask=None, return_cache=True)
+
+        assert logits.shape == (batch, seq, config.vocab_size)
+        assert cache is not None
+
+    def test_empty_batch_handling(self, random_seed):
+        """Test that empty batch (B=0) is handled gracefully."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=2,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Empty batch (B=0)
+        input_ids = jnp.zeros((0, 16), dtype=jnp.int32)
+
+        logits, cache = model(input_ids, return_cache=True)
+
+        assert logits.shape == (0, 16, config.vocab_size)
+        assert cache is not None
+        assert len(cache.layer_caches) == config.num_layers
+
+    def test_empty_sequence_handling(self, random_seed):
+        """Test that empty sequence (L=0) is handled gracefully."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=2,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Empty sequence (L=0)
+        input_ids = jnp.zeros((2, 0), dtype=jnp.int32)
+
+        logits, cache = model(input_ids, return_cache=True)
+
+        assert logits.shape == (2, 0, config.vocab_size)
+        assert cache is not None
+        assert len(cache.layer_caches) == config.num_layers
