@@ -445,9 +445,7 @@ class MegalodonForCausalLM(eqx.Module):
             config: Model configuration.
             key: PRNG key for initialization.
         """
-        k1, k2, k3 = jax.random.split(key, 3)
         self.config = config
-        self.model = MegalodonModel(config, key=k1)
 
         # Determine output size and whether to tie weights
         # output_size=-1 means "use vocab_size" (tied weights)
@@ -455,15 +453,21 @@ class MegalodonForCausalLM(eqx.Module):
         self.tied = lm_out == config.vocab_size
 
         if self.tied:
+            # Tied weights: only need key for model
+            self.model = MegalodonModel(config, key=key)
             self.lm_head = None
         else:
-            lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k2)
+            # Untied weights: split keys for model, lm_head, and reinit
+            k_model, k_head, k_head_reinit = jax.random.split(key, 3)
+            self.model = MegalodonModel(config, key=k_model)
+
+            lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k_head)
             # Apply init_mode to untied lm_head
             # For gaussian init, use dim=None to get std=1.0 (matches PyTorch/other Linear layers)
             if config.init_mode != "none":
                 linear_dim = None if config.init_mode == "gaussian" else lm_out
                 init_fn = get_initializer(config.init_mode, dim=linear_dim)
-                new_weight = init_fn(k3, lm_head.weight.shape, lm_head.weight.dtype)
+                new_weight = init_fn(k_head_reinit, lm_head.weight.shape, lm_head.weight.dtype)
                 lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
             self.lm_head = lm_head
 
@@ -521,10 +525,18 @@ class MegalodonForCausalLM(eqx.Module):
         Computes cross-entropy loss for next-token prediction.
         Labels are automatically shifted: position i predicts position i+1.
 
+        Note: Unlike the PyTorch reference implementation, we correctly exclude
+        masked/padding positions from the loss computation. This is industry
+        standard practice (see HuggingFace Transformers' ignore_index=-100) and
+        prevents gradient noise from padding tokens. The PyTorch reference uses
+        plain F.cross_entropy without ignore_index, which includes padding in
+        the loss - this is likely an oversight we intentionally do not replicate.
+
         Args:
             input_ids: Input token IDs of shape (batch, seq).
             labels: Target token IDs of shape (batch, seq).
-            attention_mask: Optional mask (True = valid token).
+            attention_mask: Optional mask (True = valid token). Masked positions
+                are excluded from the loss to prevent gradient noise from padding.
             deterministic: If True, skip dropout.
             key: PRNG key for dropout.
 
