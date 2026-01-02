@@ -298,7 +298,8 @@ class ComplexEMA(eqx.Module):
         # (h[t] = q*h[t-1] when x[t]=0), but no new information is added.
         if mask is not None:
             # mask: (batch, seq) -> (batch, 1, seq) for broadcasting with x: (batch, dim, seq)
-            x = jnp.where(mask[:, None, :], x, 0.0)
+            # Use dtype-matched zero to preserve bf16
+            x = jnp.where(mask[:, None, :], x, jnp.zeros((), dtype=x.dtype))
 
         # Cast omega to fp32 for residual computation (matches PyTorch reference)
         omega_f32 = self.omega.astype(jnp.float32)

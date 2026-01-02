@@ -832,7 +832,8 @@ class MegalodonAttention(eqx.Module):
         mx = self.rmsnorm(y_cema)
         if not deterministic and self.hidden_dropout > 0.0 and k2 is not None:
             keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, mx.shape)
-            mx = jnp.where(keep, mx / (1.0 - self.hidden_dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=mx.dtype)
+            mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
 
         # Shared Z projection for Q/K
         z = jax.vmap(jax.vmap(self.wz))(mx)  # (B, L, z_dim)
@@ -845,8 +846,9 @@ class MegalodonAttention(eqx.Module):
 
         # Affine transform to Q and K
         # gamma, beta: (2, z_dim) -> (2, H, Dh)
-        gamma_heads = self.gamma.reshape(2, H, Dh)
-        beta_heads = self.beta.reshape(2, H, Dh)
+        # Cast to z.dtype to preserve bf16 in mixed-precision
+        gamma_heads = self.gamma.reshape(2, H, Dh).astype(z.dtype)
+        beta_heads = self.beta.reshape(2, H, Dh).astype(z.dtype)
         scale = (gamma_heads + 1.0) / math.sqrt(Dh)
 
         # Broadcast and apply: z_normed is (B, L, H, Dh)
@@ -881,7 +883,8 @@ class MegalodonAttention(eqx.Module):
         # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
         if not deterministic and self.hidden_dropout > 0.0 and k3 is not None:
             keep = jax.random.bernoulli(k3, 1.0 - self.hidden_dropout, gated.shape)
-            gated = jnp.where(keep, gated / (1.0 - self.hidden_dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=gated.dtype)
+            gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
 
         # Output projections
         h = jax.vmap(jax.vmap(self.wh1))(mx) + jax.vmap(jax.vmap(self.wh2))(gated)
@@ -889,7 +892,8 @@ class MegalodonAttention(eqx.Module):
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k4 is not None:
             keep = jax.random.bernoulli(k4, 1.0 - self.dropout, h.shape)
-            h = jnp.where(keep, h / (1.0 - self.dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=h.dtype)
+            h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
 
         # Residual
         y = h + x
@@ -1091,7 +1095,8 @@ class NormalizedFFN(eqx.Module):
                 k1 = k2 = None
             if k1 is not None:
                 keep = jax.random.bernoulli(k1, 1.0 - self.hidden_dropout, h.shape)
-                h = jnp.where(keep, h / (1.0 - self.hidden_dropout), 0.0)
+                inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=h.dtype)
+                h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
         else:
             k2 = key
 
@@ -1101,11 +1106,12 @@ class NormalizedFFN(eqx.Module):
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k2 is not None:
             keep = jax.random.bernoulli(k2, 1.0 - self.dropout, out.shape)
-            out = jnp.where(keep, out / (1.0 - self.dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=out.dtype)
+            out = jnp.where(keep, out * inv_keep, jnp.zeros((), dtype=out.dtype))
 
-        # Apply residual rescaling if enabled
+        # Apply residual rescaling if enabled (cast to preserve bf16)
         if self.alpha is not None:
-            out = self.alpha * out
+            out = out * jnp.asarray(self.alpha, dtype=out.dtype)
 
         return residual + out
 
