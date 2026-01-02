@@ -282,19 +282,20 @@ class ComplexEMA(eqx.Module):
             h_init: Optional initial EMA state for streaming inference.
             return_state: Whether to return the final complex state.
             mask: Optional boolean mask of shape (batch, seq) where True marks
-                valid tokens. Masked positions (False) are zeroed before EMA
-                processing to prevent contamination of the hidden state.
+                valid tokens. Masked positions (False) have their input zeroed
+                to prevent new information from entering the hidden state.
+                Output at masked positions will reflect decayed prior state.
 
         Returns:
             Tuple of (output, state) where state is None unless return_state=True
-            or h_init was provided. Masked positions in output will be zero.
+            or h_init was provided.
         """
         # Store input dtype for output cast
         input_dtype = x.dtype
 
-        # Zero masked positions to prevent EMA state contamination from padding
-        # This is applied at input level since EMA is a linear operation:
-        # EMA(0) = 0, so masked positions don't contribute to state or output
+        # Zero masked positions to prevent new information from padding entering state.
+        # Note: Masked positions still produce output based on decayed prior state
+        # (h[t] = q*h[t-1] when x[t]=0), but no new information is added.
         if mask is not None:
             # mask: (batch, seq) -> (batch, 1, seq) for broadcasting with x: (batch, dim, seq)
             x = jnp.where(mask[:, None, :], x, 0.0)
