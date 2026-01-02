@@ -900,7 +900,9 @@ class MegalodonAttention(eqx.Module):
                 attn=new_attn_cache,
                 norm=new_norm_state,
                 ema=EMAState(h=h_last) if h_last is not None else None,
-                position=new_position if new_position is not None else jnp.array(0),
+                position=new_position
+                if new_position is not None
+                else jnp.array(0, dtype=jnp.int32),
             )
         else:
             new_cache = None
