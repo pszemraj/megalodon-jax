@@ -1363,3 +1363,182 @@ class TestEdgeCases:
         assert logits.shape == (2, 0, config.vocab_size)
         assert cache is not None
         assert len(cache.layer_caches) == config.num_layers
+
+    def test_vocab_bounds_input_ids_raises(self, random_seed):
+        """Test that out-of-bounds input_ids raises an error."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # input_ids with value >= vocab_size
+        bad_input_ids = jnp.array([[1, 2, 300, 4]])  # 300 >= 256
+
+        with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
+            model(bad_input_ids, return_cache=False)
+
+    def test_vocab_bounds_labels_raises(self, random_seed):
+        """Test that out-of-bounds labels in compute_loss raises an error."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jnp.array([[1, 2, 3, 4]])
+        bad_labels = jnp.array([[2, 300, 4, 5]])  # 300 >= 256
+
+        with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
+            model.compute_loss(input_ids, bad_labels)
+
+    def test_loss_dtype_matches_model_bf16(self, random_seed):
+        """Test that empty sequence loss returns correct dtype when model is bf16."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Cast model to bf16
+        def to_bf16(x):
+            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(jnp.bfloat16)
+            return x
+
+        model_bf16 = jax.tree.map(to_bf16, model)
+
+        # Single token sequence (becomes empty after shift)
+        input_ids = jnp.array([[1]])
+        labels = jnp.array([[2]])
+
+        loss = model_bf16.compute_loss(input_ids, labels)
+
+        # Loss should be bf16 (matching logits dtype), not float32
+        assert loss.dtype == jnp.bfloat16, f"Expected bfloat16, got {loss.dtype}"
+        assert loss == 0.0
+
+
+class TestComplexEMAMask:
+    """Tests for ComplexEMA mask handling."""
+
+    def test_mask_prevents_state_contamination(self, random_seed):
+        """Test that masked positions don't contaminate EMA hidden state.
+
+        When masked positions have large values, masking them out should prevent
+        those values from affecting the final hidden state. Without masking, the
+        large values would propagate through the EMA and cause a very different
+        final state.
+        """
+        from megalodon_jax.layers import ComplexEMA
+
+        dim, ndim = 32, 4
+        batch, seq = 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        ema = ComplexEMA(dim, ndim, key=key)
+
+        # Input with large values at masked positions
+        x_clean = jnp.ones((batch, dim, seq))
+        x_contaminated = x_clean.at[:, :, 8:].set(1e6)  # Last 8 positions have huge values
+
+        # Mask: first 8 valid, last 8 masked
+        mask = jnp.concatenate(
+            [jnp.ones((batch, 8), dtype=bool), jnp.zeros((batch, 8), dtype=bool)],
+            axis=1,
+        )
+
+        # With mask on contaminated input
+        _, h_masked_contaminated = ema(x_contaminated, mask=mask, return_state=True)
+
+        # Without mask on clean input (same as if contaminated values were zeros)
+        x_zeroed = x_clean.at[:, :, 8:].set(0.0)
+        _, h_clean_zeroed = ema(x_zeroed, mask=None, return_state=True)
+
+        # Hidden states should match - mask effectively zeros those positions
+        np.testing.assert_allclose(
+            np.array(h_masked_contaminated),
+            np.array(h_clean_zeroed),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Masking should produce same state as zeroing those positions",
+        )
+
+        # Also verify: without mask, contamination would cause very different state
+        _, h_unmasked_contaminated = ema(x_contaminated, mask=None, return_state=True)
+        assert not np.allclose(np.array(h_masked_contaminated), np.array(h_unmasked_contaminated)), (
+            "Without mask, contamination should cause different hidden state"
+        )
+
+    def test_mask_zeros_contribution_from_masked_positions(self, random_seed):
+        """Test that masked positions contribute zero to EMA state.
+
+        The EMA output at masked positions is NOT zero (due to causal convolution),
+        but the CONTRIBUTION from masked positions to the state should be zero.
+        """
+        from megalodon_jax.layers import ComplexEMA
+
+        dim, ndim = 16, 4
+        batch, seq = 1, 8
+
+        key = jax.random.PRNGKey(random_seed)
+        ema = ComplexEMA(dim, ndim, key=key)
+
+        # Random input
+        x = jax.random.normal(key, (batch, dim, seq))
+
+        # Mask middle positions
+        mask = jnp.array([[True, True, False, False, False, True, True, True]])
+
+        # With mask
+        y_masked, h_masked = ema(x, mask=mask, return_state=True)
+
+        # Same as zeroing those positions
+        x_zeroed = x.at[:, :, 2:5].set(0.0)
+        y_zeroed, h_zeroed = ema(x_zeroed, mask=None, return_state=True)
+
+        # Outputs and states should match
+        np.testing.assert_allclose(
+            np.array(y_masked),
+            np.array(y_zeroed),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Masking should produce same output as zeroing those positions",
+        )
+        np.testing.assert_allclose(
+            np.array(h_masked),
+            np.array(h_zeroed),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Masking should produce same state as zeroing those positions",
+        )
