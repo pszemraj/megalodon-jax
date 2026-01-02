@@ -17,7 +17,7 @@ import math
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Complex, Float, PRNGKeyArray
+from jaxtyping import Array, Bool, Complex, Float, PRNGKeyArray
 
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
@@ -270,6 +270,7 @@ class ComplexEMA(eqx.Module):
         x: Float[Array, "batch dim seq"],
         h_init: Complex[Array, "batch dim ndim"] | None = None,
         return_state: bool = False,
+        mask: Bool[Array, "batch seq"] | None = None,
     ) -> tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]:
         """Apply EMA and optionally return final state.
 
@@ -280,13 +281,23 @@ class ComplexEMA(eqx.Module):
             x: Input tensor of shape (batch, dim, seq).
             h_init: Optional initial EMA state for streaming inference.
             return_state: Whether to return the final complex state.
+            mask: Optional boolean mask of shape (batch, seq) where True marks
+                valid tokens. Masked positions (False) are zeroed before EMA
+                processing to prevent contamination of the hidden state.
 
         Returns:
             Tuple of (output, state) where state is None unless return_state=True
-            or h_init was provided.
+            or h_init was provided. Masked positions in output will be zero.
         """
         # Store input dtype for output cast
         input_dtype = x.dtype
+
+        # Zero masked positions to prevent EMA state contamination from padding
+        # This is applied at input level since EMA is a linear operation:
+        # EMA(0) = 0, so masked positions don't contribute to state or output
+        if mask is not None:
+            # mask: (batch, seq) -> (batch, 1, seq) for broadcasting with x: (batch, dim, seq)
+            x = jnp.where(mask[:, None, :], x, 0.0)
 
         # Cast omega to fp32 for residual computation (matches PyTorch reference)
         omega_f32 = self.omega.astype(jnp.float32)

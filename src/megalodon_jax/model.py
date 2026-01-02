@@ -221,38 +221,45 @@ class MegalodonModel(eqx.Module):
             config: Model configuration.
             key: PRNG key for initialization.
         """
-        # Split keys: layers + embed + embed_init + layer_init
-        keys = jax.random.split(key, config.num_layers + 4)
-
         self.config = config
         self.scale = float(jnp.sqrt(config.model_dim)) if config.scale_emb else 1.0
         self.use_checkpoint = config.use_checkpoint
+
+        # Split keys explicitly for each purpose (clearer allocation)
+        # - k_embed: initial embedding weights
+        # - k_embed_reinit: embedding reinitialization (if init_mode != "none")
+        # - k_layer_reinit: layer reinitialization (if init_mode != "none")
+        # - layer_keys: one key per MegalodonBlock
+        k_embed, k_embed_reinit, k_layer_reinit, k_layers = jax.random.split(key, 4)
+        layer_keys = jax.random.split(k_layers, config.num_layers)
 
         # Initialize embedding
         embed = eqx.nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_size=config.model_dim,
-            key=keys[0],
+            key=k_embed,
         )
 
         # Apply init_mode to embedding weights
         if config.init_mode != "none":
             init_fn = get_initializer(config.init_mode, dim=config.model_dim)
-            new_embed_weight = init_fn(keys[-2], embed.weight.shape, embed.weight.dtype)
+            new_embed_weight = init_fn(k_embed_reinit, embed.weight.shape, embed.weight.dtype)
             embed = eqx.tree_at(lambda e: e.weight, embed, new_embed_weight)
         self.embed = embed
 
         # Initialize layers
-        layers = tuple(MegalodonBlock(config, i, key=keys[i + 1]) for i in range(config.num_layers))
+        layers = tuple(
+            MegalodonBlock(config, i, key=layer_keys[i]) for i in range(config.num_layers)
+        )
 
         # Apply init_mode to all Linear layers in blocks
         if config.init_mode != "none":
-            layer_init_keys = jax.random.split(keys[-1], len(layers))
+            layer_reinit_keys = jax.random.split(k_layer_reinit, len(layers))
             # Match PyTorch: gaussian Linear init uses std=1.0 (dim=None).
             linear_dim = None if config.init_mode == "gaussian" else config.model_dim
             layers = tuple(
                 reinit_linear_weights(layer, config.init_mode, k, dim=linear_dim)
-                for layer, k in zip(layers, layer_init_keys)
+                for layer, k in zip(layers, layer_reinit_keys)
             )
         self.layers = layers
 
@@ -298,6 +305,16 @@ class MegalodonModel(eqx.Module):
             )
             return empty_hidden, empty_cache
 
+        # Validate token bounds - prevents silent incorrect embeddings from OOB indices
+        # Note: Uses eqx.error_if for JIT-safe traced-value errors
+        vocab_size = self.config.vocab_size
+        has_invalid_tokens = jnp.any((input_ids < 0) | (input_ids >= vocab_size))
+        input_ids = eqx.error_if(
+            input_ids,
+            has_invalid_tokens,
+            f"input_ids contain out-of-bounds values. Valid range: [0, {vocab_size})",
+        )
+
         # Embedding with optional scaling
         # eqx.nn.Embedding takes scalar indices, so vmap over batch and sequence
         x = jax.vmap(jax.vmap(self.embed))(input_ids) * self.scale
@@ -310,9 +327,10 @@ class MegalodonModel(eqx.Module):
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
-        # 1. ComplexEMA has no mask support - padded positions contaminate hidden state
-        # 2. Cache validity tracking is per-token, not remembered across steps
+        # 1. Cache validity tracking is per-token, not remembered across steps
+        # 2. Subsequent decode would attend to K/V entries for padded positions
         # This matches PyTorch's assumption that caching is for autoregressive decode only
+        # Note: ComplexEMA now has mask support, but cache semantics remain the issue
         if return_cache and attention_mask is not None:
             # Check if any position is masked (False = padding)
             # Use eqx.error_if for traced-value-safe conditional errors
@@ -529,7 +547,16 @@ class MegalodonForCausalLM(eqx.Module):
         # Guard against empty sequences (seq=0 or seq=1 after shift)
         # jnp.mean() on empty array returns NaN, which would poison training
         if shift_labels.shape[1] == 0:
-            return jnp.array(0.0)
+            return jnp.zeros((), dtype=shift_logits.dtype)  # Match model dtype
+
+        # Validate label bounds - prevents silent wrong gradients from JAX index wrapping
+        vocab_size = shift_logits.shape[-1]
+        has_invalid_labels = jnp.any((shift_labels < 0) | (shift_labels >= vocab_size))
+        shift_labels = eqx.error_if(
+            shift_labels,
+            has_invalid_labels,
+            f"labels contain out-of-bounds values. Valid range: [0, {vocab_size})",
+        )
 
         # Cross-entropy loss
         log_probs = jax.nn.log_softmax(shift_logits, axis=-1)

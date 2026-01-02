@@ -816,11 +816,13 @@ class MegalodonAttention(eqx.Module):
         x_tn, new_norm_state = self.timenorm(x, state=norm_state, mask=mask)
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
+        # Pass mask to prevent EMA state contamination from padded positions
         need_ema_state = return_cache or ema_state is not None
         y_cema, h_last = self.cema(
             x_tn.transpose(0, 2, 1),  # (B, D, L)
             h_init=ema_state,
             return_state=need_ema_state,
+            mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
