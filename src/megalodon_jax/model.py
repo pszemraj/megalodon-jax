@@ -48,6 +48,22 @@ def _register_pytree(cls: type[T]) -> type[T]:
     return cls
 
 
+@eqx.filter_checkpoint
+def _checkpointed_layer(
+    layer: "MegalodonBlock",
+    x: Float[Array, "batch seq dim"],
+    mask: Bool[Array, "batch seq"] | None,
+    key: PRNGKeyArray | None,
+) -> Float[Array, "batch seq dim"]:
+    """Execute layer without caching for gradient checkpointing.
+
+    This function is defined at module level (not inside the loop) to avoid
+    recreating the decorated function on each iteration.
+    """
+    out, _ = layer(x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key)
+    return out
+
+
 @_register_pytree
 @dataclass
 class ModelCache:
@@ -371,20 +387,7 @@ class MegalodonModel(eqx.Module):
         for layer, layer_cache, layer_key in zip(self.layers, layer_caches, keys):
             if use_ckpt:
                 # Checkpointed path: disable cache during training
-                @eqx.filter_checkpoint
-                def run_layer(
-                    layer: MegalodonBlock,
-                    x: Float[Array, "batch seq dim"],
-                    mask: Bool[Array, "batch seq"] | None,
-                    key: PRNGKeyArray | None,
-                ) -> Float[Array, "batch seq dim"]:
-                    """Execute layer without caching for gradient checkpointing."""
-                    out, _ = layer(
-                        x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key
-                    )
-                    return out
-
-                x = run_layer(layer, x, attention_mask, layer_key)
+                x = _checkpointed_layer(layer, x, attention_mask, layer_key)
                 new_caches.append(None)
             else:
                 # Standard path with optional caching

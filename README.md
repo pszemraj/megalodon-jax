@@ -106,6 +106,10 @@ src/megalodon_jax/
 - BFloat16 compatible via JAX autocast
 - **Never use float16** (EMA/FFT overflow)
 
+## Performance
+
+- **Sequence length padding**: JAX recompiles for each unique input shape. Pad sequences to consistent lengths (e.g., powers of 2) during training to avoid excessive recompilation.
+
 ## Current Status
 
 **Phase 4 Complete**:

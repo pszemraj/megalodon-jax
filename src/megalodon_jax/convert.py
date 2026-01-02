@@ -27,6 +27,30 @@ def _to_jax(tensor: Any) -> Array:
     return jnp.array(tensor)
 
 
+def _validate_shape(
+    loaded: Array,
+    expected: tuple[int, ...],
+    name: str,
+) -> None:
+    """Validate loaded weight shape matches expected shape.
+
+    Args:
+        loaded: Array loaded from checkpoint.
+        expected: Expected shape based on model config.
+        name: Parameter name for error message.
+
+    Raises:
+        ValueError: If shapes don't match.
+    """
+    if loaded.shape != expected:
+        raise ValueError(
+            f"Shape mismatch for '{name}':\n"
+            f"  Checkpoint: {loaded.shape}\n"
+            f"  Expected:   {expected}\n"
+            f"Check that config matches the checkpoint."
+        )
+
+
 def load_weights_from_torch(
     model: MegalodonForCausalLM,
     state_dict: StateDict,
@@ -67,15 +91,25 @@ def load_weights_from_torch(
         """Check if key exists in state_dict."""
         return key in state_dict
 
-    # Embedding
+    # Embedding - validate shape before loading
+    embed_weight = get_weight("model.embed.weight")
+    expected_embed = (model.config.vocab_size, model.config.model_dim)
+    _validate_shape(embed_weight, expected_embed, "model.embed.weight")
     model = eqx.tree_at(
         lambda m: m.model.embed.weight,
         model,
-        get_weight("model.embed.weight"),
+        embed_weight,
     )
 
-    # Layers
+    # Validate layer count before loading layers
     num_layers = len(model.model.layers)
+    ckpt_layers = sum(1 for k in state_dict if k.startswith("model.layers.") and ".cema.alpha" in k)
+    if ckpt_layers != num_layers:
+        raise ValueError(
+            f"Layer count mismatch: checkpoint has {ckpt_layers} layers, "
+            f"config expects {num_layers} layers"
+        )
+
     for i in range(num_layers):
         prefix = f"model.layers.{i}"
 
@@ -96,11 +130,16 @@ def load_weights_from_torch(
                 get_weight(f"{attn_prefix}.timenorm.bias"),
             )
 
-        # ComplexEMA
+        # ComplexEMA - validate shapes on first layer
+        alpha_weight = get_weight(f"{attn_prefix}.cema.alpha")
+        if i == 0:
+            cfg = model.config
+            expected_alpha = (cfg.model_dim, cfg.cema_ndim, 1)
+            _validate_shape(alpha_weight, expected_alpha, f"{attn_prefix}.cema.alpha")
         model = eqx.tree_at(
             lambda m, idx=i: m.model.layers[idx].attn.cema.alpha,
             model,
-            get_weight(f"{attn_prefix}.cema.alpha"),
+            alpha_weight,
         )
         model = eqx.tree_at(
             lambda m, idx=i: m.model.layers[idx].attn.cema.delta,
@@ -122,10 +161,13 @@ def load_weights_from_torch(
             model,
             get_weight(f"{attn_prefix}.cema.gamma_imag"),
         )
+        omega_weight = get_weight(f"{attn_prefix}.cema.omega")
+        if i == 0:
+            _validate_shape(omega_weight, (cfg.model_dim,), f"{attn_prefix}.cema.omega")
         model = eqx.tree_at(
             lambda m, idx=i: m.model.layers[idx].attn.cema.omega,
             model,
-            get_weight(f"{attn_prefix}.cema.omega"),
+            omega_weight,
         )
 
         # RMSNorm
@@ -136,12 +178,16 @@ def load_weights_from_torch(
                 get_weight(f"{attn_prefix}.rmsnorm.gamma"),
             )
 
-        # Linear projections
+        # Linear projections - validate wz shape on first layer
         for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
+            proj_weight = get_weight(f"{attn_prefix}.{proj_name}.weight")
+            if i == 0 and proj_name == "wz":
+                expected_wz = (cfg.z_dim, cfg.model_dim)
+                _validate_shape(proj_weight, expected_wz, f"{attn_prefix}.wz.weight")
             model = eqx.tree_at(
                 lambda m, idx=i, pn=proj_name: getattr(m.model.layers[idx].attn, pn).weight,
                 model,
-                get_weight(f"{attn_prefix}.{proj_name}.weight"),
+                proj_weight,
             )
             if has_key(f"{attn_prefix}.{proj_name}.bias"):
                 model = eqx.tree_at(
@@ -187,12 +233,16 @@ def load_weights_from_torch(
                 get_weight(f"{ffn_prefix}.norm.bias"),
             )
 
-        # FC layers
+        # FC layers - validate fc1 shape on first layer
         for fc_name in ["fc1", "fc2"]:
+            fc_weight = get_weight(f"{ffn_prefix}.{fc_name}.weight")
+            if i == 0 and fc_name == "fc1":
+                expected_fc1 = (cfg.ffn_hidden_dim, cfg.model_dim)
+                _validate_shape(fc_weight, expected_fc1, f"{ffn_prefix}.fc1.weight")
             model = eqx.tree_at(
                 lambda m, idx=i, fn=fc_name: getattr(m.model.layers[idx].ffn, fn).weight,
                 model,
-                get_weight(f"{ffn_prefix}.{fc_name}.weight"),
+                fc_weight,
             )
             if has_key(f"{ffn_prefix}.{fc_name}.bias"):
                 model = eqx.tree_at(
@@ -231,10 +281,16 @@ def load_weights_from_torch(
 
     # lm_head.weight - load only if untied (model.lm_head is not None)
     if not model.tied and model.lm_head is not None and has_key("lm_head.weight"):
+        lm_head_weight = get_weight("lm_head.weight")
+        lm_out = (
+            model.config.vocab_size if model.config.output_size == -1 else model.config.output_size
+        )
+        expected_lm_head = (lm_out, model.config.model_dim)
+        _validate_shape(lm_head_weight, expected_lm_head, "lm_head.weight")
         model = eqx.tree_at(
             lambda m: m.lm_head.weight,
             model,
-            get_weight("lm_head.weight"),
+            lm_head_weight,
         )
 
     return model
