@@ -58,10 +58,11 @@ class RMSNorm(eqx.Module):
         Returns:
             Normalized tensor with same shape as input.
         """
-        # Compute RMS: sqrt(mean(x^2) + eps)
-        rms = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.eps)
-        # Normalize
-        x_normed = x / rms
+        # Compute RMS in fp32 to avoid bf16 overflow on x**2
+        # (bf16 max ~65504, so values > ~256 would overflow when squared)
+        x_f32 = x.astype(jnp.float32)
+        rms = jnp.sqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
+        x_normed = (x_f32 / rms).astype(x.dtype)
         # Apply scale if affine
         if self.affine and self.gamma is not None:
             return x_normed * (self.gamma + 1.0)
