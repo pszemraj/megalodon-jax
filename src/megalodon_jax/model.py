@@ -334,7 +334,10 @@ class MegalodonModel(eqx.Module):
 
         # Embedding with optional scaling
         # eqx.nn.Embedding takes scalar indices, so vmap over batch and sequence
-        x = jax.vmap(jax.vmap(self.embed))(input_ids) * self.scale
+        # Cast scale to embedding dtype to preserve bf16/mixed-precision execution
+        x = jax.vmap(jax.vmap(self.embed))(input_ids)
+        if self.scale != 1.0:
+            x = x * jnp.asarray(self.scale, dtype=x.dtype)
 
         # Zero-mask pad tokens (matches PyTorch padding_idx behavior)
         # This ensures pad tokens have zero embeddings and receive no gradient updates
