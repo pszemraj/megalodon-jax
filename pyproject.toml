@@ -32,8 +32,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/pszemraj/megalodon-hf"
-Repository = "https://github.com/pszemraj/megalodon-hf"
+Homepage = "https://github.com/pszemraj/megalodon-jax"
+Repository = "https://github.com/pszemraj/megalodon-jax"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "torch>=2.0", "optax", "ruff>=0.5"]
