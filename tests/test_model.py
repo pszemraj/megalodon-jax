@@ -1364,6 +1364,42 @@ class TestEdgeCases:
         assert cache is not None
         assert len(cache.layer_caches) == config.num_layers
 
+    def test_empty_input_dtype_matches_model(self, random_seed):
+        """Empty input should return output with same dtype as model (not hardcoded float32)."""
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        # Cast model to bf16
+        def to_bf16(x):
+            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(jnp.bfloat16)
+            return x
+
+        model_bf16 = jax.tree.map(to_bf16, model)
+
+        # Empty batch (B=0)
+        empty_batch = jnp.zeros((0, 16), dtype=jnp.int32)
+        logits_b0, _ = model_bf16(empty_batch, return_cache=False)
+        assert logits_b0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_b0.dtype}"
+
+        # Empty sequence (L=0)
+        empty_seq = jnp.zeros((2, 0), dtype=jnp.int32)
+        logits_l0, _ = model_bf16(empty_seq, return_cache=False)
+        assert logits_l0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_l0.dtype}"
+
     def test_vocab_bounds_input_ids_raises(self, random_seed):
         """Test that out-of-bounds input_ids raises an error."""
         config = MegalodonConfig(

@@ -298,8 +298,9 @@ class MegalodonModel(eqx.Module):
         B, L = input_ids.shape
 
         # Handle empty inputs gracefully (B=0 or L=0)
+        # Use embed dtype to match model's native dtype (e.g., bf16 if autocast applied)
         if B == 0 or L == 0:
-            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=jnp.float32)
+            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.embed.weight.dtype)
             empty_cache = (
                 ModelCache(tuple([None] * len(self.layers)), None) if return_cache else None
             )
