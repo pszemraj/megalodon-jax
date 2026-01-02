@@ -1542,3 +1542,65 @@ class TestComplexEMAMask:
             atol=1e-5,
             err_msg="Masking should produce same state as zeroing those positions",
         )
+
+
+class TestAttentionMasking:
+    """Tests for attention masking edge cases."""
+
+    def test_fully_masked_query_outputs_zeros(self):
+        """Fully masked queries (all keys invalid) should output zeros, not value averages.
+
+        Regression test for bug where using finfo.min instead of -inf caused
+        softmax to produce uniform distribution instead of NaN, so fully masked
+        queries returned an average of values rather than zeros.
+        """
+        from megalodon_jax.layers.attention import attention_single_chunk
+
+        B, L_q, L_kv, H, Dh, Dv = 2, 4, 8, 2, 16, 32
+        key = jax.random.PRNGKey(42)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        q = jax.random.normal(k1, (B, L_q, H, Dh))
+        k = jax.random.normal(k2, (B, L_kv, H, Dh))
+        v = jax.random.normal(k3, (B, L_kv, H, Dv))
+
+        # Fully masked: all keys invalid for batch 0, some valid for batch 1
+        kv_mask = jnp.array([
+            [False] * L_kv,  # Batch 0: all masked
+            [True] * 4 + [False] * 4,  # Batch 1: first 4 valid
+        ])
+
+        out = attention_single_chunk(q, k, v, kv_mask=kv_mask, causal=False)
+
+        # Batch 0 should be all zeros (no valid keys to attend to)
+        np.testing.assert_allclose(
+            np.array(out[0]),
+            np.zeros((L_q, H, Dv)),
+            atol=1e-6,
+            err_msg="Fully masked queries should output zeros, not value averages",
+        )
+
+        # Batch 1 should be non-zero (has valid keys)
+        assert jnp.any(out[1] != 0), "Partially masked batch should have non-zero output"
+
+    def test_first_position_causal_mask_outputs_valid(self):
+        """First position in causal attention should attend to itself only."""
+        from megalodon_jax.layers.attention import attention_single_chunk
+
+        B, L, H, Dh, Dv = 1, 4, 1, 8, 8
+        key = jax.random.PRNGKey(0)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        q = jax.random.normal(k1, (B, L, H, Dh))
+        k = jax.random.normal(k2, (B, L, H, Dh))
+        v = jax.random.normal(k3, (B, L, H, Dv))
+
+        out = attention_single_chunk(q, k, v, causal=True)
+
+        # First position attends only to first key, so output should be v[0]
+        np.testing.assert_allclose(
+            np.array(out[0, 0]),
+            np.array(v[0, 0]),
+            rtol=1e-5,
+            err_msg="First causal position should output first value exactly",
+        )

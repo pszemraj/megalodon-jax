@@ -76,10 +76,12 @@ def attention_single_chunk(
     scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32))
 
     # Build attention mask
+    # Use -inf so softmax(all masked) = NaN, triggering the NaN guard below
+    neg_inf = -jnp.inf
     if causal and L_q == L_kv:
         # Standard causal mask for self-attention
         causal_mask = jnp.tril(jnp.ones((L_q, L_kv), dtype=jnp.bool_))
-        scores = jnp.where(causal_mask, scores, jnp.finfo(jnp.float32).min)
+        scores = jnp.where(causal_mask, scores, neg_inf)
     elif causal and L_q < L_kv:
         # Cross-attention with cache: each query attends to all prior keys
         # Query at position i can attend to keys [0, L_kv - L_q + i + 1)
@@ -88,13 +90,13 @@ def attention_single_chunk(
         # Key position must be <= query position + offset
         offset = L_kv - L_q
         causal_mask = k_pos <= (q_pos + offset)  # (L_q, L_kv)
-        scores = jnp.where(causal_mask, scores, jnp.finfo(jnp.float32).min)
+        scores = jnp.where(causal_mask, scores, neg_inf)
 
     # Apply key/value padding mask if provided
     if kv_mask is not None:
         # kv_mask: (B, L_kv) with True for valid positions
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
-        scores = jnp.where(kv_mask_expanded, scores, jnp.finfo(jnp.float32).min)
+        scores = jnp.where(kv_mask_expanded, scores, neg_inf)
 
     # Softmax with NaN guard for fully-masked queries
     # If all keys are masked for a query, softmax(all -inf) = NaN
