@@ -64,6 +64,15 @@ def _checkpointed_layer(
     return out
 
 
+def _stop_if_array(x: Any) -> Any:
+    """Apply stop_gradient only to arrays, passing through non-arrays unchanged.
+
+    This is needed because cache pytrees may contain None leaves (e.g., when
+    checkpointing is active), and jax.lax.stop_gradient only accepts arrays.
+    """
+    return jax.lax.stop_gradient(x) if eqx.is_array(x) else x
+
+
 @_register_pytree
 @dataclass
 class ModelCache:
@@ -428,7 +437,7 @@ class MegalodonModel(eqx.Module):
                 layer_caches=tuple(new_caches),
                 final_norm=final_norm_state,
             )
-            out_cache = jax.tree.map(jax.lax.stop_gradient, out_cache)
+            out_cache = jax.tree.map(_stop_if_array, out_cache)
         else:
             out_cache = None
 
