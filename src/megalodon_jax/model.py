@@ -363,16 +363,18 @@ class MegalodonModel(eqx.Module):
         # - Once cached, subsequent tokens would attend to padded positions
         # - ComplexEMA and TimestepNorm have mask support for prefill, but
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
-        if return_cache and attention_mask is not None:
+        # Guard both cache input AND output - streaming path is used in either case
+        uses_streaming = return_cache or cache is not None
+        if uses_streaming and attention_mask is not None:
             # Check if any position is masked (False = padding)
             # Use eqx.error_if for traced-value-safe conditional errors
             has_padding = ~jnp.all(attention_mask)
             x = eqx.error_if(
                 x,  # Value to pass through (and attach error to)
                 has_padding,
-                "Cannot build cache with padding in attention_mask. "
+                "Cannot use cache with padding in attention_mask. "
                 "Caching is only supported for autoregressive generation without padding. "
-                "Use return_cache=False for padded prefill or ensure attention_mask is all True.",
+                "Use cache=None and return_cache=False for padded prefill.",
             )
 
         # Parse cache with validation
