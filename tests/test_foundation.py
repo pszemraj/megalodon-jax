@@ -265,15 +265,19 @@ class TestRotaryEmbeddingParity:
 class TestCacheTypes:
     """Tests for cache/state type definitions."""
 
-    def test_attention_cache_properties(self):
-        """Test AttentionCache properties."""
+    def test_attention_cache_structure(self):
+        """Test AttentionCache fields and structure."""
         k = jnp.zeros((2, 16, 4, 64))
         v = jnp.zeros((2, 16, 4, 128))
         count = jnp.array(16, dtype=jnp.int32)
 
         cache = AttentionCache(k=k, v=v, count=count)
-        assert cache.length == 16
-        assert cache.start_index == 0
+        # Check field values
+        assert cache.k.shape == (2, 16, 4, 64)
+        assert cache.v.shape == (2, 16, 4, 128)
+        assert cache.count == 16
+        # Buffer capacity available via shape (not properties - see types.py docstring)
+        assert cache.k.shape[1] == 16
 
     def test_layer_cache_default_position(self):
         """Test LayerCache has JAX scalar position by default."""
