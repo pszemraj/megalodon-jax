@@ -419,21 +419,6 @@ class ChunkedAttention(eqx.Module):
         # - Masked tokens in the current chunk are excluded from attention in that chunk,
         #   but their keys are still cached for future chunks.
 
-        pad_to_chunk = max(0, self.chunk_size - L)
-        if pad_to_chunk > 0:
-            q_full = jnp.pad(q, ((0, 0), (0, pad_to_chunk), (0, 0), (0, 0)))
-            k_full = jnp.pad(k, ((0, 0), (0, pad_to_chunk), (0, 0), (0, 0)))
-            v_full = jnp.pad(v, ((0, 0), (0, pad_to_chunk), (0, 0), (0, 0)))
-            if mask is not None:
-                mask_full = jnp.pad(mask, ((0, 0), (0, pad_to_chunk)), constant_values=False)
-            else:
-                mask_full = None
-        else:
-            q_full = q
-            k_full = k
-            v_full = v
-            mask_full = mask
-
         # Initialize or extract fixed-size cache buffers (left-aligned)
         if cache is None:
             cache_k = jnp.zeros((B, cache_size, H, self.head_dim), dtype=q.dtype)
@@ -452,11 +437,8 @@ class ChunkedAttention(eqx.Module):
                 cache_k = cache.k[:, -cache_size:]
                 cache_v = cache.v[:, -cache_size:]
 
-        buffer_len = q_full.shape[1]
-        out_buffer = jnp.zeros((B, buffer_len, H, Dv), dtype=v.dtype)
         has_input_mask = mask is not None
         cache_indices = jnp.arange(cache_size)
-        full_chunk_mask = jnp.ones((B, self.chunk_size), dtype=jnp.bool_)
 
         def current_valid_len(cur_pos: Int[Array, ""]) -> Int[Array, ""]:
             if faithful_chunk_local:
@@ -495,6 +477,86 @@ class ChunkedAttention(eqx.Module):
                 return new_k, new_v, write_pos, new_valid_len
 
             return jax.lax.cond(valid_len < cache_size, append_at_end, roll_and_append, None)
+
+        if L < self.chunk_size:
+            # Small-L fast path: avoid padding to chunk_size and trace only token updates.
+            out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
+
+            def token_body(
+                i: Int[Array, ""],
+                state: tuple[
+                    Float[Array, "batch seq heads value_dim"],
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                    Int[Array, ""],
+                    PRNGKeyArray | None,
+                ],
+            ) -> tuple[
+                Float[Array, "batch seq heads value_dim"],
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                PRNGKeyArray | None,
+            ]:
+                out_step, c_k_step, c_v_step, pos_step, rng_step = state
+
+                q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
+                k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
+                v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
+
+                q_rot, k_rot = self.rotary(q_i, k_i, pos_step)
+
+                valid_len = current_valid_len(pos_step)
+                c_k_step, c_v_step, write_pos, valid_len_new = append_token(
+                    c_k_step, c_v_step, k_rot, v_i, valid_len
+                )
+                cache_mask = cache_mask_for(valid_len_new)
+                if has_input_mask:
+                    mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
+                    write_slot = cache_indices == write_pos
+                    current_invalid = ~mask_i[:, None] & write_slot[None, :]
+                    kv_mask = cache_mask & ~current_invalid
+                else:
+                    kv_mask = cache_mask
+
+                if rng_step is not None:
+                    rng_step, step_rng = jax.random.split(rng_step)
+                else:
+                    step_rng = None
+
+                out_i = attention_single_chunk(
+                    q_rot,
+                    c_k_step,
+                    c_v_step,
+                    kv_mask=kv_mask,
+                    causal=False,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+                out_step = jax.lax.dynamic_update_slice(out_step, out_i, (0, i, 0, 0))
+                return out_step, c_k_step, c_v_step, pos_step + 1, rng_step
+
+            init_state = (out_buffer, cache_k, cache_v, position, key)
+            out_buffer, final_k, final_v, final_pos, _ = jax.lax.fori_loop(
+                0, L, token_body, init_state
+            )
+
+            new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
+            if not return_cache:
+                new_cache = None
+
+            return out_buffer, new_cache, final_pos
+
+        q_full = q
+        k_full = k
+        v_full = v
+        mask_full = mask
+
+        buffer_len = q_full.shape[1]
+        out_buffer = jnp.zeros((B, buffer_len, H, Dv), dtype=v.dtype)
+        full_chunk_mask = jnp.ones((B, self.chunk_size), dtype=jnp.bool_)
 
         if cache_size < self.chunk_size:
 

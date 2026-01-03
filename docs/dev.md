@@ -18,7 +18,7 @@ Pure JAX/Equinox reimplementation of Megalodon. No CUDA kernels—all paths are 
 - **FFT EMA path**: O(L log L), used during training (no cache)
 - **Sequential EMA path**: O(L), maintains complex hidden state for streaming
 - **Chunked attention**: Block-diagonal within chunks, no cross-chunk attention edges
-- **Streaming prefill**: Chunk-wise attention in faithful chunk-local mode (token fallback only for partial chunk)
+- **Streaming prefill**: Chunk-wise attention in faithful chunk-local mode; sub-chunk calls use token updates without padding
 
 ## Known Gaps
 
@@ -36,7 +36,7 @@ When `return_cache=True`, CEMA uses `jax.lax.scan` over timesteps. This is corre
 
 ## Optional Experiments
 
-- **Scan-loop token fallback:** The streaming token fallback could be rewritten as a `lax.scan` with strict masking to avoid cache writes on padded tokens. This is optional and should be validated with streaming/parity tests because it can introduce small numerical drift.
+- **Scan-loop token fallback:** The streaming token fallback could be rewritten as a `lax.scan` with strict masking. This is optional and should be validated with streaming/parity tests because it can introduce small numerical drift.
 
 ## Numerical Stability
 
