@@ -116,9 +116,7 @@ class TestRMSNormParity:
         y_jax = jax_norm(x_jax)
 
         # Compare
-        np.testing.assert_allclose(
-            np.array(y_jax), y_torch.detach().numpy(), rtol=1e-5, atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-5, atol=1e-5)
 
     def test_gamma_initialization(self):
         """Test that gamma is initialized to zeros."""
@@ -201,9 +199,7 @@ class TestRotaryEmbeddingParity:
 
         for start_index in [0, 10, 100, 1000]:
             q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=start_index)
-            q_rot_jax, k_rot_jax = jax_rope(
-                q_jax, k_jax, jnp.array(start_index, dtype=jnp.int32)
-            )
+            q_rot_jax, k_rot_jax = jax_rope(q_jax, k_jax, jnp.array(start_index, dtype=jnp.int32))
 
             # Tolerance scales with position due to exp() implementation differences
             # between JAX (XLA) and PyTorch. These are within float32 precision bounds.

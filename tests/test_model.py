@@ -827,8 +827,7 @@ class TestFix2PadTokenMasking:
         hidden, _ = model_bf16(input_ids, return_cache=False)
 
         assert hidden.dtype == jnp.bfloat16, (
-            f"Expected bf16 output, got {hidden.dtype}. "
-            "Pad masking may be upcasting to float32."
+            f"Expected bf16 output, got {hidden.dtype}. Pad masking may be upcasting to float32."
         )
 
 
@@ -1033,15 +1032,11 @@ class TestFix6InitMode:
         key = jax.random.PRNGKey(random_seed)
 
         # Create models with different init modes
-        model_he = MegalodonForCausalLM(
-            MegalodonConfig(**base_config, init_mode="he"), key=key
-        )
+        model_he = MegalodonForCausalLM(MegalodonConfig(**base_config, init_mode="he"), key=key)
         model_xavier = MegalodonForCausalLM(
             MegalodonConfig(**base_config, init_mode="xavier"), key=key
         )
-        model_bert = MegalodonForCausalLM(
-            MegalodonConfig(**base_config, init_mode="bert"), key=key
-        )
+        model_bert = MegalodonForCausalLM(MegalodonConfig(**base_config, init_mode="bert"), key=key)
 
         # BERT init has stddev=0.02, which should have much smaller variance than He
         bert_var = jnp.var(model_bert.model.embed.weight)
@@ -1625,9 +1620,9 @@ class TestComplexEMAMask:
 
         # Also verify: without mask, contamination would cause very different state
         _, h_unmasked_contaminated = ema(x_contaminated, mask=None, return_state=True)
-        assert not np.allclose(np.array(h_masked_contaminated), np.array(h_unmasked_contaminated)), (
-            "Without mask, contamination should cause different hidden state"
-        )
+        assert not np.allclose(
+            np.array(h_masked_contaminated), np.array(h_unmasked_contaminated)
+        ), "Without mask, contamination should cause different hidden state"
 
     def test_mask_zeros_contribution_from_masked_positions(self, random_seed):
         """Test that masked positions contribute zero to EMA state.
@@ -1694,10 +1689,12 @@ class TestAttentionMasking:
         v = jax.random.normal(k3, (B, L_kv, H, Dv))
 
         # Fully masked: all keys invalid for batch 0, some valid for batch 1
-        kv_mask = jnp.array([
-            [False] * L_kv,  # Batch 0: all masked
-            [True] * 4 + [False] * 4,  # Batch 1: first 4 valid
-        ])
+        kv_mask = jnp.array(
+            [
+                [False] * L_kv,  # Batch 0: all masked
+                [True] * 4 + [False] * 4,  # Batch 1: first 4 valid
+            ]
+        )
 
         out = attention_single_chunk(q, k, v, kv_mask=kv_mask, causal=False)
 

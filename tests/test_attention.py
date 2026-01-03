@@ -726,9 +726,7 @@ class TestStreamingEquivalence:
                 f"Cache buffer should be fixed size {chunk_size}, got {cache.k.shape[1]}"
             )
             # The count tracks absolute position
-            assert cache.count == i + 1, (
-                f"Cache count should be {i + 1}, got {cache.count}"
-            )
+            assert cache.count == i + 1, f"Cache count should be {i + 1}, got {cache.count}"
 
     def test_cache_resize_on_input(self, random_seed):
         """Test that incoming caches are resized to fixed buffer size."""
@@ -862,9 +860,7 @@ class TestParity:
         cache = AttentionCache(k=init_k_rot, v=init_v, count=jnp.array(2, dtype=jnp.int32))
 
         # Process multi-token call that spans boundary
-        out_multi, cache_multi, pos_multi = attn(
-            q, k, v, cache=cache, return_cache=True
-        )
+        out_multi, cache_multi, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
 
         # Now compare with token-by-token processing
         streaming_outputs = []
@@ -873,9 +869,7 @@ class TestParity:
             q_i = q[:, i : i + 1]
             k_i = k[:, i : i + 1]
             v_i = v[:, i : i + 1]
-            out_i, cache_stream, _ = attn(
-                q_i, k_i, v_i, cache=cache_stream, return_cache=True
-            )
+            out_i, cache_stream, _ = attn(q_i, k_i, v_i, cache=cache_stream, return_cache=True)
             streaming_outputs.append(out_i)
 
         out_streaming = jnp.concatenate(streaming_outputs, axis=1)
@@ -1018,44 +1012,20 @@ class TestMegalodonAttentionParity:
         )
 
         # Projections (both PyTorch and Equinox use (out_features, in_features) layout)
-        jax_attn = eqx.tree_at(
-            lambda m: m.wz.weight, jax_attn, to_jax(torch_attn.wz.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wz.bias, jax_attn, to_jax(torch_attn.wz.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wv.weight, jax_attn, to_jax(torch_attn.wv.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wv.bias, jax_attn, to_jax(torch_attn.wv.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wr.weight, jax_attn, to_jax(torch_attn.wr.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wr.bias, jax_attn, to_jax(torch_attn.wr.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh1.weight, jax_attn, to_jax(torch_attn.wh1.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh1.bias, jax_attn, to_jax(torch_attn.wh1.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh2.weight, jax_attn, to_jax(torch_attn.wh2.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh2.bias, jax_attn, to_jax(torch_attn.wh2.bias)
-        )
+        jax_attn = eqx.tree_at(lambda m: m.wz.weight, jax_attn, to_jax(torch_attn.wz.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wz.bias, jax_attn, to_jax(torch_attn.wz.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wv.weight, jax_attn, to_jax(torch_attn.wv.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wv.bias, jax_attn, to_jax(torch_attn.wv.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wr.weight, jax_attn, to_jax(torch_attn.wr.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wr.bias, jax_attn, to_jax(torch_attn.wr.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wh1.weight, jax_attn, to_jax(torch_attn.wh1.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wh1.bias, jax_attn, to_jax(torch_attn.wh1.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wh2.weight, jax_attn, to_jax(torch_attn.wh2.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wh2.bias, jax_attn, to_jax(torch_attn.wh2.bias))
 
         # Q/K affine parameters
-        jax_attn = eqx.tree_at(
-            lambda m: m.gamma, jax_attn, to_jax(torch_attn.gamma)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.beta, jax_attn, to_jax(torch_attn.beta)
-        )
+        jax_attn = eqx.tree_at(lambda m: m.gamma, jax_attn, to_jax(torch_attn.gamma))
+        jax_attn = eqx.tree_at(lambda m: m.beta, jax_attn, to_jax(torch_attn.beta))
 
         # Inner attention rotary (copy from CPU tensor)
         jax_attn = eqx.tree_at(
