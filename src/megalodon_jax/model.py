@@ -642,7 +642,11 @@ class MegalodonForCausalLM(eqx.Module):
         target_log_probs = jnp.where(
             valid_mask, target_log_probs, jnp.zeros((), dtype=target_log_probs.dtype)
         )
-        num_valid = valid_mask.sum()
+
+        # Compute loss in float32 for numerical stability (standard practice for
+        # mixed-precision training - avoids dtype promotion issues from int/float division)
+        target_f32 = target_log_probs.astype(jnp.float32)
+        num_valid = valid_mask.sum().astype(jnp.float32)
         # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, 1)
-        return -target_log_probs.sum() / num_valid
+        num_valid = jnp.maximum(num_valid, 1.0)
+        return -target_f32.sum() / num_valid
