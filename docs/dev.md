@@ -80,7 +80,7 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 166 tests covering:
 - Parity with PyTorch reference (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
-- Streaming equivalence: single-token loop matches batch processing
+- Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
 - JIT stability: no retracing on repeated calls with same shapes
 - GPU/CPU coverage via pytest fixtures
 
