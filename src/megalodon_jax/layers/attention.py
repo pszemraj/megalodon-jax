@@ -34,6 +34,16 @@ from megalodon_jax.utils import reinit_linear_weights
 # -----------------------------------------------------------------------------
 
 
+def _linear_3d(
+    linear: eqx.nn.Linear, x: Float[Array, "batch seq in_dim"]
+) -> Float[Array, "batch seq out_dim"]:
+    """Apply an Equinox Linear over a (batch, seq, dim) tensor."""
+    y = jnp.matmul(x, linear.weight.T)
+    if linear.bias is not None:
+        y = y + linear.bias
+    return y
+
+
 def attention_single_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch kv_seq heads head_dim"],
@@ -995,7 +1005,7 @@ class MegalodonAttention(eqx.Module):
             mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
 
         # Shared Z projection for Q/K
-        z = jax.vmap(jax.vmap(self.wz))(mx)  # (B, L, z_dim)
+        z = _linear_3d(self.wz, mx)  # (B, L, z_dim)
         z = z.reshape(B, L, H, Dh)
 
         # Per-head RMS normalization (in fp32 for stability)
@@ -1015,11 +1025,11 @@ class MegalodonAttention(eqx.Module):
         k = z_normed * scale[1] + beta_heads[1]
 
         # Value projection with SiLU
-        v = jax.nn.silu(jax.vmap(jax.vmap(self.wv))(x_tn))  # (B, L, value_dim)
+        v = jax.nn.silu(_linear_3d(self.wv, x_tn))  # (B, L, value_dim)
         v = v.reshape(B, L, H, Dv)
 
         # Gate projection with SiLU
-        r = jax.nn.silu(jax.vmap(jax.vmap(self.wr))(mx))  # (B, L, value_dim)
+        r = jax.nn.silu(_linear_3d(self.wr, mx))  # (B, L, value_dim)
 
         # Inner attention
         out, new_attn_cache, new_position = self.inner(
@@ -1046,7 +1056,7 @@ class MegalodonAttention(eqx.Module):
             gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
 
         # Output projections
-        h = jax.vmap(jax.vmap(self.wh1))(mx) + jax.vmap(jax.vmap(self.wh2))(gated)
+        h = _linear_3d(self.wh1, mx) + _linear_3d(self.wh2, gated)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k4 is not None:
@@ -1242,9 +1252,9 @@ class NormalizedFFN(eqx.Module):
 
         # Hidden layer with activation
         if self.swiglu:
-            h = jax.nn.silu(jax.vmap(jax.vmap(self.fc1))(h)) * jax.vmap(jax.vmap(self.fc3))(h)
+            h = jax.nn.silu(_linear_3d(self.fc1, h)) * _linear_3d(self.fc3, h)
         else:
-            h = jax.nn.silu(jax.vmap(jax.vmap(self.fc1))(h))
+            h = jax.nn.silu(_linear_3d(self.fc1, h))
 
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
@@ -1260,7 +1270,7 @@ class NormalizedFFN(eqx.Module):
             k2 = key
 
         # Output projection
-        out = jax.vmap(jax.vmap(self.fc2))(h)
+        out = _linear_3d(self.fc2, h)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k2 is not None:
