@@ -63,22 +63,18 @@ def _register_pytree(cls: type[T]) -> type[T]:
 class AttentionCache:
     """Cache for streaming attention.
 
-    Stores key/value tensors and a count of tokens processed.
+    Stores key/value tensors in fixed-capacity buffers with masked validity.
+    Use `count` for the total tokens processed (absolute position after last token).
+    Buffer capacity is `k.shape[1]`; valid entries are masked internally.
+
+    Note: Unlike the PyTorch reference, this cache does not expose length/start_index
+    properties because they would be misleading. In JAX, caches use fixed-size buffers
+    with internal validity masking, so buffer capacity != valid cached length.
     """
 
     k: Float[Array, "batch seq heads head_dim"]
     v: Float[Array, "batch seq heads value_head_dim"]
     count: Int[Array, ""]  # JAX scalar - total tokens seen
-
-    @property
-    def length(self) -> int:
-        """Number of cached timesteps."""
-        return self.k.shape[1]
-
-    @property
-    def start_index(self) -> Int[Array, ""]:
-        """Absolute position of first cached token."""
-        return self.count - self.k.shape[1]
 
 
 @_register_pytree
