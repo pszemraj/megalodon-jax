@@ -322,6 +322,18 @@ class MegalodonModel(eqx.Module):
             )
             return empty_hidden, empty_cache
 
+        # Validate PRNG key for dropout - prevent silent no-op when training
+        if not deterministic and key is None:
+            if (
+                self.config.dropout > 0.0
+                or self.config.attention_dropout > 0.0
+                or self.config.hidden_dropout > 0.0
+            ):
+                raise ValueError(
+                    "PRNG key required when deterministic=False and dropout is enabled. "
+                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+                )
+
         # Validate token bounds - prevents silent incorrect embeddings from OOB indices
         # Note: Uses eqx.error_if for JIT-safe traced-value errors
         vocab_size = self.config.vocab_size
@@ -347,10 +359,10 @@ class MegalodonModel(eqx.Module):
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
-        # 1. Cache validity tracking is per-token, not remembered across steps
-        # 2. Subsequent decode would attend to K/V entries for padded positions
-        # This matches PyTorch's assumption that caching is for autoregressive decode only
-        # Note: ComplexEMA now has mask support, but cache semantics remain the issue
+        # - Attention cache stores K/V entries but not per-position validity flags
+        # - Once cached, subsequent tokens would attend to padded positions
+        # - ComplexEMA and TimestepNorm have mask support for prefill, but
+        #   cache semantics assume autoregressive decode (no mid-sequence padding)
         if return_cache and attention_mask is not None:
             # Check if any position is masked (False = padding)
             # Use eqx.error_if for traced-value-safe conditional errors
@@ -407,12 +419,14 @@ class MegalodonModel(eqx.Module):
         # Final TimestepNorm
         x, final_norm_state = self.norm(x, state=final_norm_state, mask=attention_mask)
 
-        # Build output cache
+        # Build output cache with stop_gradient to prevent accidental backprop
+        # through cache history when cache is fed back under jax.grad
         if return_cache:
             out_cache = ModelCache(
                 layer_caches=tuple(new_caches),
                 final_norm=final_norm_state,
             )
+            out_cache = jax.tree.map(jax.lax.stop_gradient, out_cache)
         else:
             out_cache = None
 
@@ -551,6 +565,18 @@ class MegalodonForCausalLM(eqx.Module):
         Returns:
             Scalar cross-entropy loss.
         """
+        # Validate PRNG key for dropout - prevent silent no-op when training
+        if not deterministic and key is None:
+            if (
+                self.config.dropout > 0.0
+                or self.config.attention_dropout > 0.0
+                or self.config.hidden_dropout > 0.0
+            ):
+                raise ValueError(
+                    "PRNG key required when deterministic=False and dropout is enabled. "
+                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+                )
+
         logits, _ = self(
             input_ids,
             attention_mask=attention_mask,
