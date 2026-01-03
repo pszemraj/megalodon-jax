@@ -34,6 +34,10 @@ The paper's chunk-parallel axis requires multi-device coordination and sharded K
 
 When `return_cache=True`, CEMA uses `jax.lax.scan` over timesteps. This is correct but ~10-100x slower than the FFT path. The reference uses fused CUDA kernels to return last-state cheaply.
 
+## Optional Experiments
+
+- **Scan-loop token fallback:** The streaming token fallback could be rewritten as a `lax.scan` with strict masking to avoid cache writes on padded tokens. This is optional and should be validated with streaming/parity tests because it can introduce small numerical drift.
+
 ## Numerical Stability
 
 ### TimestepNorm — Kahan Summation Analysis
