@@ -392,83 +392,6 @@ class ChunkedAttention(eqx.Module):
             self.max_cache_len == self.chunk_size
         )
 
-        if cache is None and return_cache and faithful_chunk_local and L > 0:
-            # Fast prefill path: chunked attention in bulk + cache from the last chunk.
-            pad_len = (self.chunk_size - L % self.chunk_size) % self.chunk_size
-            if pad_len > 0:
-                q_pad = jnp.pad(q, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
-                k_pad = jnp.pad(k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
-                v_pad = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
-                mask_pad = None
-                if mask is not None:
-                    mask_pad = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
-            else:
-                q_pad = q
-                k_pad = k
-                v_pad = v
-                mask_pad = mask
-
-            L_padded = q_pad.shape[1]
-            num_chunks = L_padded // self.chunk_size
-
-            q_rot, k_rot = self.rotary(q_pad, k_pad, position)
-
-            q_chunked = q_rot.reshape(B * num_chunks, self.chunk_size, H, self.head_dim)
-            k_chunked = k_rot.reshape(B * num_chunks, self.chunk_size, H, self.head_dim)
-            v_chunked = v_pad.reshape(B * num_chunks, self.chunk_size, H, Dv)
-            mask_chunked = None
-            if mask_pad is not None:
-                mask_chunked = mask_pad.reshape(B * num_chunks, self.chunk_size)
-
-            if key is not None and (not deterministic) and self.attention_dropout > 0.0:
-                keys = jax.random.split(key, B * num_chunks)
-                if mask_chunked is not None:
-                    out_chunked = jax.vmap(
-                        lambda q, k, v, m, key: attention_single_chunk(
-                            q[None],
-                            k[None],
-                            v[None],
-                            kv_mask=m[None],
-                            causal=True,
-                            dropout_rate=self.attention_dropout,
-                            deterministic=deterministic,
-                            key=key,
-                        )[0]
-                    )(q_chunked, k_chunked, v_chunked, mask_chunked, keys)
-                else:
-                    out_chunked = jax.vmap(
-                        lambda q, k, v, key: attention_single_chunk(
-                            q[None],
-                            k[None],
-                            v[None],
-                            causal=True,
-                            dropout_rate=self.attention_dropout,
-                            deterministic=deterministic,
-                            key=key,
-                        )[0]
-                    )(q_chunked, k_chunked, v_chunked, keys)
-            else:
-                out_chunked = attention_single_chunk(
-                    q_chunked,
-                    k_chunked,
-                    v_chunked,
-                    kv_mask=mask_chunked,
-                    causal=True,
-                    dropout_rate=self.attention_dropout,
-                    deterministic=deterministic,
-                    key=key,
-                )
-
-            out = out_chunked.reshape(B, L_padded, H, Dv)
-            if pad_len > 0:
-                out = out[:, :L, :, :]
-
-            k_last = k_rot.reshape(B, num_chunks, self.chunk_size, H, self.head_dim)[:, -1]
-            v_last = v_pad.reshape(B, num_chunks, self.chunk_size, H, Dv)[:, -1]
-            new_pos = position + jnp.asarray(L, dtype=jnp.int32)
-            new_cache = AttentionCache(k=k_last, v=v_last, count=new_pos)
-            return out, new_cache, new_pos
-
         # Streaming path: chunk-wise processing with fixed-size cache.
         # Full chunks use a single attention matmul; partial chunks fall back
         # to token-wise updates to avoid dynamic slice sizes.
@@ -637,8 +560,11 @@ class ChunkedAttention(eqx.Module):
 
             valid_len = current_valid_len(cur_pos)
             cache_mask = cache_mask_for(valid_len)
+            mask_blk = None
             if has_input_mask:
                 mask_blk = jax.lax.dynamic_slice(mask_full, (0, offset), (B, self.chunk_size))
+
+            if mask_blk is not None:
                 kv_mask = jnp.concatenate([cache_mask, mask_blk], axis=1)
             else:
                 kv_mask = jnp.concatenate([cache_mask, full_chunk_mask], axis=1)
@@ -651,16 +577,34 @@ class ChunkedAttention(eqx.Module):
             else:
                 step_rng = None
 
-            out_blk = attention_single_chunk(
-                q_rot,
-                k_cat,
-                v_cat,
-                kv_mask=kv_mask,
-                causal=True,
-                dropout_rate=self.attention_dropout,
-                deterministic=deterministic,
-                key=step_rng,
-            )
+            def attend_with_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
+                return attention_single_chunk(
+                    q_rot,
+                    k_cat,
+                    v_cat,
+                    kv_mask=kv_mask,
+                    causal=True,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+            def attend_no_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
+                return attention_single_chunk(
+                    q_rot,
+                    k_rot,
+                    v_blk,
+                    kv_mask=mask_blk if mask_blk is not None else None,
+                    causal=True,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+            if faithful_chunk_local:
+                out_blk = jax.lax.cond(valid_len > 0, attend_with_cache, attend_no_cache, None)
+            else:
+                out_blk = attend_with_cache(None)
 
             out_buf = jax.lax.dynamic_update_slice(out_buf, out_blk, (0, offset, 0, 0))
 
