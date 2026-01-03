@@ -183,91 +183,21 @@ def attention_multi_chunk(
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
 
-    # Compute chunk start indices for RoPE
-    # Chunk i starts at position start_index + i * chunk_size
-    chunk_offsets = jnp.arange(num_chunks) * chunk_size  # (num_chunks,)
-
-    # Reshape to (B, num_chunks, chunk_size, H, D) for per-chunk RoPE
-    q_bc = q.reshape(B, num_chunks, chunk_size, H, Dh)
-    k_bc = k.reshape(B, num_chunks, chunk_size, H, Dh)
-
-    def rope_one_batch(
-        q_b: Float[Array, "num_chunks chunk_size heads head_dim"],
-        k_b: Float[Array, "num_chunks chunk_size heads head_dim"],
-    ) -> tuple[
-        Float[Array, "num_chunks chunk_size heads head_dim"],
-        Float[Array, "num_chunks chunk_size heads head_dim"],
-    ]:
-        """Apply RoPE to all chunks in a single batch element."""
-
-        def rope_one_chunk(
-            qk_offset: tuple[
-                Float[Array, "chunk_size heads head_dim"],
-                Float[Array, "chunk_size heads head_dim"],
-                Int[Array, ""],
-            ],
-        ) -> tuple[
-            Float[Array, "chunk_size heads head_dim"],
-            Float[Array, "chunk_size heads head_dim"],
-        ]:
-            """Apply RoPE to a single chunk with its position offset."""
-            q_c, k_c, offset = qk_offset
-            q_r, k_r = rotary(q_c[None, ...], k_c[None, ...], start_index + offset)
-            return q_r[0], k_r[0]
-
-        q_rot_chunks, k_rot_chunks = jax.lax.map(rope_one_chunk, (q_b, k_b, chunk_offsets))
-        return q_rot_chunks, k_rot_chunks
-
-    # vmap over batch
-    q_rot_bc, k_rot_bc = jax.vmap(rope_one_batch)(q_bc, k_bc)
-    # Shape: (B, num_chunks, chunk_size, H, D)
-
-    # Reshape for batched attention
-    q_rot = q_rot_bc.reshape(B * num_chunks, chunk_size, H, Dh)
-    k_rot = k_rot_bc.reshape(B * num_chunks, chunk_size, H, Dh)
+    # Apply RoPE once with absolute positions, then reshape into chunks.
+    q_rot_full, k_rot_full = rotary(q, k, start_index)
+    q_rot = q_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
+    k_rot = k_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     v_chunked = v.reshape(B, num_chunks, chunk_size, H, Dv).reshape(
         B * num_chunks, chunk_size, H, Dv
     )
 
-    # Handle mask
     mask_chunked = None
     if mask is not None:
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
 
-    # Split key for dropout if needed
-    if not deterministic and key is not None:
+    if key is not None and (not deterministic) and dropout_rate > 0.0:
         keys = jax.random.split(key, B * num_chunks)
-    else:
-        keys = None
-
-    # Attention per chunk (all in parallel via batch dimension)
-    # Note: attn_one_chunk is defined but replaced by inline vmap lambdas below.
-    # Keeping for documentation of the intended signature.
-    def attn_one_chunk(
-        inputs: tuple[
-            Float[Array, "chunk_size heads head_dim"],  # q
-            Float[Array, "chunk_size heads head_dim"],  # k
-            Float[Array, "chunk_size heads value_dim"],  # v
-            Bool[Array, "chunk_size"] | None,  # mask
-            PRNGKeyArray | None,  # key
-        ],
-    ) -> Float[Array, "chunk_size heads value_dim"]:
-        """Compute attention for a single chunk (used in vmap below)."""
-        q_c, k_c, v_c, m_c, key_c = inputs
-        return attention_single_chunk(
-            q_c[None, ...],
-            k_c[None, ...],
-            v_c[None, ...],
-            kv_mask=m_c[None, ...] if m_c is not None else None,
-            causal=True,
-            dropout_rate=dropout_rate,
-            deterministic=deterministic,
-            key=key_c,
-        )[0]
-
-    # Use vmap for cleaner parallel execution
-    if mask_chunked is not None:
-        if keys is not None:
+        if mask_chunked is not None:
             out_chunked = jax.vmap(
                 lambda q, k, v, m, key: attention_single_chunk(
                     q[None],
@@ -281,19 +211,6 @@ def attention_multi_chunk(
             )(q_rot, k_rot, v_chunked, mask_chunked, keys)
         else:
             out_chunked = jax.vmap(
-                lambda q, k, v, m: attention_single_chunk(
-                    q[None],
-                    k[None],
-                    v[None],
-                    kv_mask=m[None],
-                    dropout_rate=dropout_rate,
-                    deterministic=True,
-                    key=None,
-                )[0]
-            )(q_rot, k_rot, v_chunked, mask_chunked)
-    else:
-        if keys is not None:
-            out_chunked = jax.vmap(
                 lambda q, k, v, key: attention_single_chunk(
                     q[None],
                     k[None],
@@ -303,12 +220,16 @@ def attention_multi_chunk(
                     key=key,
                 )[0]
             )(q_rot, k_rot, v_chunked, keys)
-        else:
-            out_chunked = jax.vmap(
-                lambda q, k, v: attention_single_chunk(
-                    q[None], k[None], v[None], dropout_rate=dropout_rate
-                )[0]
-            )(q_rot, k_rot, v_chunked)
+    else:
+        out_chunked = attention_single_chunk(
+            q_rot,
+            k_rot,
+            v_chunked,
+            kv_mask=mask_chunked,
+            dropout_rate=dropout_rate,
+            deterministic=deterministic,
+            key=key,
+        )
 
     # Reshape back: (B * num_chunks, chunk_size, H, Dv) -> (B, L_padded, H, Dv)
     out = out_chunked.reshape(B, L_padded, H, Dv)
@@ -463,6 +384,91 @@ class ChunkedAttention(eqx.Module):
             )
             return out, None, position + L
 
+        Dv = v.shape[-1]
+        cache_size = self.max_cache_len
+
+        # Determine cache reset behavior (matching PyTorch faithful_chunk_local)
+        faithful_chunk_local = (not self.cache_unbounded) and (
+            self.max_cache_len == self.chunk_size
+        )
+
+        if cache is None and return_cache and faithful_chunk_local and L > 0:
+            # Fast prefill path: chunked attention in bulk + cache from the last chunk.
+            pad_len = (self.chunk_size - L % self.chunk_size) % self.chunk_size
+            if pad_len > 0:
+                q_pad = jnp.pad(q, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+                k_pad = jnp.pad(k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+                v_pad = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
+                mask_pad = None
+                if mask is not None:
+                    mask_pad = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
+            else:
+                q_pad = q
+                k_pad = k
+                v_pad = v
+                mask_pad = mask
+
+            L_padded = q_pad.shape[1]
+            num_chunks = L_padded // self.chunk_size
+
+            q_rot, k_rot = self.rotary(q_pad, k_pad, position)
+
+            q_chunked = q_rot.reshape(B * num_chunks, self.chunk_size, H, self.head_dim)
+            k_chunked = k_rot.reshape(B * num_chunks, self.chunk_size, H, self.head_dim)
+            v_chunked = v_pad.reshape(B * num_chunks, self.chunk_size, H, Dv)
+            mask_chunked = None
+            if mask_pad is not None:
+                mask_chunked = mask_pad.reshape(B * num_chunks, self.chunk_size)
+
+            if key is not None and (not deterministic) and self.attention_dropout > 0.0:
+                keys = jax.random.split(key, B * num_chunks)
+                if mask_chunked is not None:
+                    out_chunked = jax.vmap(
+                        lambda q, k, v, m, key: attention_single_chunk(
+                            q[None],
+                            k[None],
+                            v[None],
+                            kv_mask=m[None],
+                            causal=True,
+                            dropout_rate=self.attention_dropout,
+                            deterministic=deterministic,
+                            key=key,
+                        )[0]
+                    )(q_chunked, k_chunked, v_chunked, mask_chunked, keys)
+                else:
+                    out_chunked = jax.vmap(
+                        lambda q, k, v, key: attention_single_chunk(
+                            q[None],
+                            k[None],
+                            v[None],
+                            causal=True,
+                            dropout_rate=self.attention_dropout,
+                            deterministic=deterministic,
+                            key=key,
+                        )[0]
+                    )(q_chunked, k_chunked, v_chunked, keys)
+            else:
+                out_chunked = attention_single_chunk(
+                    q_chunked,
+                    k_chunked,
+                    v_chunked,
+                    kv_mask=mask_chunked,
+                    causal=True,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=key,
+                )
+
+            out = out_chunked.reshape(B, L_padded, H, Dv)
+            if pad_len > 0:
+                out = out[:, :L, :, :]
+
+            k_last = k_rot.reshape(B, num_chunks, self.chunk_size, H, self.head_dim)[:, -1]
+            v_last = v_pad.reshape(B, num_chunks, self.chunk_size, H, Dv)[:, -1]
+            new_pos = position + jnp.asarray(L, dtype=jnp.int32)
+            new_cache = AttentionCache(k=k_last, v=v_last, count=new_pos)
+            return out, new_cache, new_pos
+
         # Streaming path: chunk-wise processing with fixed-size cache.
         # Full chunks use a single attention matmul; partial chunks fall back
         # to token-wise updates to avoid dynamic slice sizes.
@@ -480,13 +486,20 @@ class ChunkedAttention(eqx.Module):
         # - Masked tokens in the current chunk are excluded from attention in that chunk,
         #   but their keys are still cached for future chunks.
 
-        Dv = v.shape[-1]
-        cache_size = self.max_cache_len
-
-        # Determine cache reset behavior (matching PyTorch faithful_chunk_local)
-        faithful_chunk_local = (not self.cache_unbounded) and (
-            self.max_cache_len == self.chunk_size
-        )
+        pad_to_chunk = max(0, self.chunk_size - L)
+        if pad_to_chunk > 0:
+            q_full = jnp.pad(q, ((0, 0), (0, pad_to_chunk), (0, 0), (0, 0)))
+            k_full = jnp.pad(k, ((0, 0), (0, pad_to_chunk), (0, 0), (0, 0)))
+            v_full = jnp.pad(v, ((0, 0), (0, pad_to_chunk), (0, 0), (0, 0)))
+            if mask is not None:
+                mask_full = jnp.pad(mask, ((0, 0), (0, pad_to_chunk)), constant_values=False)
+            else:
+                mask_full = None
+        else:
+            q_full = q
+            k_full = k
+            v_full = v
+            mask_full = mask
 
         # Initialize or extract fixed-size cache buffers (left-aligned)
         if cache is None:
@@ -506,7 +519,8 @@ class ChunkedAttention(eqx.Module):
                 cache_k = cache.k[:, -cache_size:]
                 cache_v = cache.v[:, -cache_size:]
 
-        out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
+        buffer_len = q_full.shape[1]
+        out_buffer = jnp.zeros((B, buffer_len, H, Dv), dtype=v.dtype)
         has_input_mask = mask is not None
         cache_indices = jnp.arange(cache_size)
         full_chunk_mask = jnp.ones((B, self.chunk_size), dtype=jnp.bool_)
@@ -612,19 +626,19 @@ class ChunkedAttention(eqx.Module):
             PRNGKeyArray | None,
         ]:
             q_blk = jax.lax.dynamic_slice(
-                q, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
+                q_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
             )
             k_blk = jax.lax.dynamic_slice(
-                k, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
+                k_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
             )
-            v_blk = jax.lax.dynamic_slice(v, (0, offset, 0, 0), (B, self.chunk_size, H, Dv))
+            v_blk = jax.lax.dynamic_slice(v_full, (0, offset, 0, 0), (B, self.chunk_size, H, Dv))
 
             q_rot, k_rot = self.rotary(q_blk, k_blk, cur_pos)
 
             valid_len = current_valid_len(cur_pos)
             cache_mask = cache_mask_for(valid_len)
             if has_input_mask:
-                mask_blk = jax.lax.dynamic_slice(mask, (0, offset), (B, self.chunk_size))
+                mask_blk = jax.lax.dynamic_slice(mask_full, (0, offset), (B, self.chunk_size))
                 kv_mask = jnp.concatenate([cache_mask, mask_blk], axis=1)
             else:
                 kv_mask = jnp.concatenate([cache_mask, full_chunk_mask], axis=1)
@@ -689,9 +703,9 @@ class ChunkedAttention(eqx.Module):
                 out_step, c_k_step, c_v_step, pos_step, rng_step = state
                 idx = offset + i
 
-                q_i = jax.lax.dynamic_slice(q, (0, idx, 0, 0), (B, 1, H, self.head_dim))
-                k_i = jax.lax.dynamic_slice(k, (0, idx, 0, 0), (B, 1, H, self.head_dim))
-                v_i = jax.lax.dynamic_slice(v, (0, idx, 0, 0), (B, 1, H, Dv))
+                q_i = jax.lax.dynamic_slice(q_full, (0, idx, 0, 0), (B, 1, H, self.head_dim))
+                k_i = jax.lax.dynamic_slice(k_full, (0, idx, 0, 0), (B, 1, H, self.head_dim))
+                v_i = jax.lax.dynamic_slice(v_full, (0, idx, 0, 0), (B, 1, H, Dv))
 
                 q_rot, k_rot = self.rotary(q_i, k_i, pos_step)
 
@@ -701,7 +715,7 @@ class ChunkedAttention(eqx.Module):
                 )
                 cache_mask = cache_mask_for(valid_len_new)
                 if has_input_mask:
-                    mask_i = jax.lax.dynamic_slice(mask, (0, idx), (B, 1))[:, 0]
+                    mask_i = jax.lax.dynamic_slice(mask_full, (0, idx), (B, 1))[:, 0]
                     write_slot = cache_indices == write_pos
                     current_invalid = ~mask_i[:, None] & write_slot[None, :]
                     kv_mask = cache_mask & ~current_invalid
@@ -823,6 +837,9 @@ class ChunkedAttention(eqx.Module):
         _, out_buffer, final_k, final_v, final_pos, _ = jax.lax.while_loop(
             loop_cond, loop_body, init_state
         )
+
+        if buffer_len > L:
+            out_buffer = out_buffer[:, :L, :, :]
 
         new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
         if not return_cache:

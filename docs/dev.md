@@ -18,6 +18,7 @@ Pure JAX/Equinox reimplementation of Megalodon. No CUDA kernels—all paths are 
 - **FFT EMA path**: O(L log L), used during training (no cache)
 - **Sequential EMA path**: O(L), maintains complex hidden state for streaming
 - **Chunked attention**: Block-diagonal within chunks, no cross-chunk attention edges
+- **Streaming prefill**: Chunk-wise attention in faithful chunk-local mode (token fallback only for partial chunk)
 
 ## Known Gaps
 
