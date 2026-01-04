@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 Peter Szemraj.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,7 +34,7 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -90,7 +89,7 @@ class MegalodonDefaults:
     cema_ndim: int = 16
     chunk_size: int = 2048
     # ``None`` is interpreted as "auto" and defaults to ``chunk_size`` in MegalodonConfig.
-    max_cache_len: Optional[int] = None
+    max_cache_len: int | None = None
     cache_unbounded: bool = False
     norm_num_groups: int = 32
     dropout: float = 0.0
@@ -100,12 +99,12 @@ class MegalodonDefaults:
     rescale_nffn: bool = False
     scale_emb: bool = False
     share_emb: bool = False
-    efficient_attn: Optional[str] = None
+    efficient_attn: str | None = None
     norm_affine: bool = True
     norm_eps: float = 1e-5
     init_mode: InitMode = "he"
     max_positions: int = 1_000_000
-    rope_base: Optional[float] = None
+    rope_base: float | None = None
     output_size: int = -1
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -165,7 +164,7 @@ class MegalodonConfig(PretrainedConfig):
         ffn_hidden_dim: int = MegalodonDefaults.ffn_hidden_dim,
         cema_ndim: int = MegalodonDefaults.cema_ndim,
         chunk_size: int = MegalodonDefaults.chunk_size,
-        max_cache_len: Optional[int] = MegalodonDefaults.max_cache_len,
+        max_cache_len: int | None = MegalodonDefaults.max_cache_len,
         cache_unbounded: bool = MegalodonDefaults.cache_unbounded,
         norm_num_groups: int = MegalodonDefaults.norm_num_groups,
         dropout: float = MegalodonDefaults.dropout,
@@ -175,12 +174,12 @@ class MegalodonConfig(PretrainedConfig):
         rescale_nffn: bool = MegalodonDefaults.rescale_nffn,
         scale_emb: bool = MegalodonDefaults.scale_emb,
         share_emb: bool = MegalodonDefaults.share_emb,
-        efficient_attn: Optional[str] = MegalodonDefaults.efficient_attn,
+        efficient_attn: str | None = MegalodonDefaults.efficient_attn,
         norm_affine: bool = MegalodonDefaults.norm_affine,
         norm_eps: float = MegalodonDefaults.norm_eps,
         init_mode: InitMode = MegalodonDefaults.init_mode,
         max_positions: int = MegalodonDefaults.max_positions,
-        rope_base: Optional[float] = MegalodonDefaults.rope_base,
+        rope_base: float | None = MegalodonDefaults.rope_base,
         output_size: int = MegalodonDefaults.output_size,
         pad_token_id: int = MegalodonDefaults.pad_token_id,
         bos_token_id: int = MegalodonDefaults.bos_token_id,
@@ -282,11 +281,7 @@ class MegalodonConfig(PretrainedConfig):
         self.chunk_size = chunk_size
         self.cache_unbounded = bool(cache_unbounded)
         self.max_cache_len = (
-            None
-            if self.cache_unbounded
-            else chunk_size
-            if max_cache_len is None
-            else max_cache_len
+            None if self.cache_unbounded else chunk_size if max_cache_len is None else max_cache_len
         )
         self.max_positions = max_positions
         self.rope_base = rope_base
@@ -338,21 +333,15 @@ class MegalodonConfig(PretrainedConfig):
         if self.value_dim <= 0:
             raise ValueError(f"`value_dim` must be positive, got {self.value_dim}.")
         if self.ffn_hidden_dim <= 0:
-            raise ValueError(
-                f"`ffn_hidden_dim` must be positive, got {self.ffn_hidden_dim}."
-            )
+            raise ValueError(f"`ffn_hidden_dim` must be positive, got {self.ffn_hidden_dim}.")
         if self.cema_ndim <= 0:
             raise ValueError(f"`cema_ndim` must be positive, got {self.cema_ndim}.")
         if self.chunk_size <= 0:
             raise ValueError(f"`chunk_size` must be positive, got {self.chunk_size}.")
         if self.max_positions <= 0:
-            raise ValueError(
-                f"`max_positions` must be positive, got {self.max_positions}."
-            )
+            raise ValueError(f"`max_positions` must be positive, got {self.max_positions}.")
         if self.rope_base is not None and self.rope_base <= 0:
-            raise ValueError(
-                f"`rope_base` must be positive when provided, got {self.rope_base}."
-            )
+            raise ValueError(f"`rope_base` must be positive when provided, got {self.rope_base}.")
 
         # Divisibility checks
         if self.z_dim % self.num_heads != 0:
@@ -382,7 +371,7 @@ class MegalodonConfig(PretrainedConfig):
                 raise ValueError(f"`{name}` must be in [0, 1], got {value}.")
 
     @staticmethod
-    def from_7b_setup() -> "MegalodonConfig":
+    def from_7b_setup() -> MegalodonConfig:
         """Return a configuration mirroring the 7B setup from the paper.
 
         Uses the paper's larger rotary base (100k) for extended context support.
