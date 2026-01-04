@@ -205,41 +205,15 @@ def attention_multi_chunk(
     if mask is not None:
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
 
-    if key is not None and (not deterministic) and dropout_rate > 0.0:
-        keys = jax.random.split(key, B * num_chunks)
-        if mask_chunked is not None:
-            out_chunked = jax.vmap(
-                lambda q, k, v, m, key: attention_single_chunk(
-                    q[None],
-                    k[None],
-                    v[None],
-                    kv_mask=m[None],
-                    dropout_rate=dropout_rate,
-                    deterministic=deterministic,
-                    key=key,
-                )[0]
-            )(q_rot, k_rot, v_chunked, mask_chunked, keys)
-        else:
-            out_chunked = jax.vmap(
-                lambda q, k, v, key: attention_single_chunk(
-                    q[None],
-                    k[None],
-                    v[None],
-                    dropout_rate=dropout_rate,
-                    deterministic=deterministic,
-                    key=key,
-                )[0]
-            )(q_rot, k_rot, v_chunked, keys)
-    else:
-        out_chunked = attention_single_chunk(
-            q_rot,
-            k_rot,
-            v_chunked,
-            kv_mask=mask_chunked,
-            dropout_rate=dropout_rate,
-            deterministic=deterministic,
-            key=key,
-        )
+    out_chunked = attention_single_chunk(
+        q_rot,
+        k_rot,
+        v_chunked,
+        kv_mask=mask_chunked,
+        dropout_rate=dropout_rate,
+        deterministic=deterministic,
+        key=key,
+    )
 
     # Reshape back: (B * num_chunks, chunk_size, H, Dv) -> (B, L_padded, H, Dv)
     out = out_chunked.reshape(B, L_padded, H, Dv)

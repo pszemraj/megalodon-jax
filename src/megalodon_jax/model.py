@@ -300,7 +300,7 @@ class MegalodonModel(eqx.Module):
         input_ids: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
         cache: ModelCache | None = None,
-        return_cache: bool = True,
+        return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], ModelCache | None]:
@@ -310,10 +310,9 @@ class MegalodonModel(eqx.Module):
             input_ids: Token IDs of shape (batch, seq).
             attention_mask: Optional mask (True = valid token).
             cache: Optional ModelCache from previous forward.
-            return_cache: Whether to return updated cache. Defaults to True for
-                inference convenience. For training, use compute_loss() which
-                sets return_cache=False, or enable use_checkpoint in config
-                which forces cache=None during training.
+            return_cache: Whether to return updated cache. Defaults to False to
+                avoid the streaming path during training. For streaming inference,
+                set return_cache=True.
             deterministic: If True, skip dropout.
             key: PRNG key for dropout.
 
@@ -330,6 +329,9 @@ class MegalodonModel(eqx.Module):
                 ModelCache(tuple([None] * len(self.layers)), None) if return_cache else None
             )
             return empty_hidden, empty_cache
+
+        # Disable streaming cache updates during training (matches PyTorch behavior).
+        layer_return_cache = return_cache and deterministic
 
         # Validate PRNG key for dropout - prevent silent no-op when training
         if not deterministic and key is None:
@@ -373,7 +375,7 @@ class MegalodonModel(eqx.Module):
         # - ComplexEMA and TimestepNorm have mask support for prefill, but
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
         # Guard both cache input AND output - streaming path is used in either case
-        uses_streaming = return_cache or cache is not None
+        uses_streaming = layer_return_cache or cache is not None
         if uses_streaming and attention_mask is not None:
             # Check if any position is masked (False = padding)
             # Use eqx.error_if for traced-value-safe conditional errors
@@ -421,7 +423,7 @@ class MegalodonModel(eqx.Module):
                     x,
                     cache=layer_cache,
                     mask=attention_mask,
-                    return_cache=return_cache,
+                    return_cache=layer_return_cache,
                     deterministic=deterministic,
                     key=layer_key,
                 )
@@ -508,7 +510,7 @@ class MegalodonForCausalLM(eqx.Module):
         input_ids: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
         cache: ModelCache | None = None,
-        return_cache: bool = True,
+        return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
     ) -> tuple[Float[Array, "batch seq vocab"], ModelCache | None]:
@@ -518,7 +520,8 @@ class MegalodonForCausalLM(eqx.Module):
             input_ids: Token IDs of shape (batch, seq).
             attention_mask: Optional mask (True = valid token).
             cache: Optional ModelCache from previous forward.
-            return_cache: Whether to return updated cache.
+            return_cache: Whether to return updated cache. Defaults to False; set
+                True for streaming inference.
             deterministic: If True, skip dropout.
             key: PRNG key for dropout.
 
