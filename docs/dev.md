@@ -60,6 +60,7 @@ When `return_cache=True`, CEMA uses `jax.lax.scan` over timesteps. This is corre
 ### EMA Eigenvalue Stability
 
 Stable by construction:
+
 - `|q| = 1 - sigmoid(alpha) * sigmoid(delta)` with phase from `theta`
 - `gamma` scaled by `sqrt(1/ndim)`
 - Complex coefficients forced to complex64 regardless of parameter dtype
@@ -75,6 +76,7 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 ## Weight Conversion
 
 `convert.py` provides `load_weights_from_torch()` for PyTorch checkpoint loading with:
+
 - Shape validation on critical weights (embed, cema.alpha, wz, fc1, lm_head)
 - Layer count validation before loading
 - Clear error messages for config/checkpoint mismatch
@@ -86,6 +88,7 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 ## Testing
 
 166 tests covering:
+
 - Parity with PyTorch reference (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
 - JIT stability: no retracing on repeated calls with same shapes

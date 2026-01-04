@@ -113,6 +113,7 @@ src/megalodon_jax/
 ## Current Status
 
 **Phase 4 Complete**:
+
 - All core components implemented
 - Parity with PyTorch reference validated
 - Weight conversion utilities ready
