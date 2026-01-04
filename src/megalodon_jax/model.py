@@ -538,7 +538,7 @@ class MegalodonForCausalLM(eqx.Module):
             key: PRNG key for dropout.
 
         Returns:
-            Scalar cross-entropy loss.
+            Scalar cross-entropy loss with dtype matching the model logits.
         """
         # Validate PRNG key for dropout - prevent silent no-op when training
         if not deterministic and key is None:
@@ -607,10 +607,14 @@ class MegalodonForCausalLM(eqx.Module):
             valid_mask, target_log_probs, jnp.zeros((), dtype=target_log_probs.dtype)
         )
 
-        # Compute loss in float32 for numerical stability (standard practice for
-        # mixed-precision training - avoids dtype promotion issues from int/float division)
-        target_f32 = target_log_probs.astype(jnp.float32)
-        num_valid = valid_mask.sum().astype(jnp.float32)
+        # Accumulate in float32 (or higher) for numerical stability, then cast back
+        # to the model dtype so mixed-precision pipelines preserve bf16 end-to-end.
+        loss_dtype = shift_logits.dtype
+        compute_dtype = jnp.promote_types(loss_dtype, jnp.float32)
+
+        target_log_probs = target_log_probs.astype(compute_dtype)
+        num_valid = valid_mask.sum().astype(compute_dtype)
         # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, 1.0)
-        return -target_f32.sum() / num_valid
+        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=compute_dtype))
+        loss = -target_log_probs.sum() / num_valid
+        return loss.astype(loss_dtype)
