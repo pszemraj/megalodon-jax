@@ -72,19 +72,41 @@ def init_cache(
 
 
 def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
-    """Trim KV cache entries to the most recent ``max_len`` tokens."""
+    """Trim KV cache entries to the most recent ``max_len`` tokens.
+
+    The cache is stored as a ring buffer; trimming preserves absolute positions
+    by reindexing into a smaller ring when needed.
+    """
 
     def trim_layer(layer_cache: LayerCache | None) -> LayerCache | None:
         if layer_cache is None or layer_cache.attn is None:
             return layer_cache
         attn = layer_cache.attn
-        if attn.k.shape[1] <= max_len:
+        cache_size = attn.k.shape[1]
+        if cache_size <= max_len:
             return layer_cache
-        trimmed = AttentionCache(
-            k=attn.k[:, -max_len:],
-            v=attn.v[:, -max_len:],
-            count=attn.count,
-        )
+        valid_len = jnp.minimum(attn.count, cache_size)
+        keep_len = jnp.minimum(valid_len, max_len)
+        idx = jnp.arange(max_len, dtype=jnp.int32)
+        keep_mask = idx < keep_len
+        start_pos = attn.count - keep_len
+        old_idx = jnp.mod(start_pos + idx, cache_size)
+        new_idx = jnp.mod(start_pos + idx, max_len)
+
+        k_keep = jnp.take(attn.k, old_idx, axis=1)
+        v_keep = jnp.take(attn.v, old_idx, axis=1)
+        mask = keep_mask[None, :, None, None]
+        k_keep = jnp.where(mask, k_keep, jnp.zeros((), dtype=attn.k.dtype))
+        v_keep = jnp.where(mask, v_keep, jnp.zeros((), dtype=attn.v.dtype))
+
+        B, _, H, Dh = attn.k.shape
+        _, _, _, Dv = attn.v.shape
+        new_k = jnp.zeros((B, max_len, H, Dh), dtype=attn.k.dtype)
+        new_v = jnp.zeros((B, max_len, H, Dv), dtype=attn.v.dtype)
+        new_k = new_k.at[:, new_idx].set(k_keep)
+        new_v = new_v.at[:, new_idx].set(v_keep)
+
+        trimmed = AttentionCache(k=new_k, v=new_v, count=attn.count)
         return LayerCache(
             attn=trimmed,
             norm=layer_cache.norm,
@@ -163,22 +185,27 @@ def _apply_top_k(
 ) -> Float[Array, "batch vocab"]:
     if top_k is None or top_k <= 0:
         return logits
-    k = min(top_k, logits.shape[-1])
-    # Threshold: k-th largest value per batch
-    thresh = jnp.sort(logits, axis=-1)[:, -k][:, None]
-    masked = jnp.where(logits < thresh, -jnp.inf, logits)
-    return masked
+    k = int(min(top_k, logits.shape[-1]))
+    values, _ = jax.lax.top_k(logits, k)
+    thresh = values[:, -1][:, None]
+    return jnp.where(logits < thresh, -jnp.inf, logits)
 
 
 def _apply_top_p(
-    logits: Float[Array, "batch vocab"], top_p: float | None
+    logits: Float[Array, "batch vocab"],
+    top_p: float | None,
+    *,
+    top_k: int | None = None,
 ) -> Float[Array, "batch vocab"]:
     if top_p is None or top_p >= 1.0:
         return logits
 
-    # Sort descending
-    sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
-    sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
+    if top_k is not None and top_k > 0:
+        k = int(min(top_k, logits.shape[-1]))
+        sorted_logits, sorted_indices = jax.lax.top_k(logits, k)
+    else:
+        sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
+        sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
 
     sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
     cumulative = jnp.cumsum(sorted_probs, axis=-1)
@@ -188,6 +215,12 @@ def _apply_top_p(
     sorted_mask = jnp.concatenate(
         [jnp.zeros_like(sorted_mask[:, :1]), sorted_mask[:, :-1]], axis=-1
     )
+
+    if top_k is not None and top_k > 0:
+        masked_logits = jnp.where(sorted_mask, -jnp.inf, sorted_logits)
+        out = jnp.full_like(logits, -jnp.inf)
+        batch_idx = jnp.arange(logits.shape[0])[:, None]
+        return out.at[batch_idx, sorted_indices].set(masked_logits)
 
     # Map back to original order
     scatter_order = jnp.argsort(sorted_indices, axis=-1)
@@ -211,8 +244,10 @@ def sample_token(
     if temperature != 1.0:
         work = work / temperature
 
-    work = _apply_top_k(work, top_k)
-    work = _apply_top_p(work, top_p)
+    if top_p is not None and top_p < 1.0:
+        work = _apply_top_p(work, top_p, top_k=top_k)
+    else:
+        work = _apply_top_k(work, top_k)
 
     # Softmax in float32, guard against all -inf after filtering
     probs = jax.nn.softmax(work, axis=-1)

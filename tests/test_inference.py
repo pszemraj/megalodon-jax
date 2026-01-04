@@ -105,6 +105,50 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
+    def test_trim_cache_preserves_ring_order(self):
+        cache_size = 6
+        max_len = 4
+        batch = 1
+        heads = 1
+        head_dim = 1
+        value_dim = 1
+
+        k = jnp.zeros((batch, cache_size, heads, head_dim), dtype=jnp.float32)
+        v = jnp.zeros((batch, cache_size, heads, value_dim), dtype=jnp.float32)
+        for token in range(4, 10):
+            idx = token % cache_size
+            k = k.at[:, idx, 0, 0].set(float(token))
+            v = v.at[:, idx, 0, 0].set(float(token))
+
+        attn_cache = AttentionCache(
+            k=k,
+            v=v,
+            count=jnp.array(10, dtype=jnp.int32),
+        )
+        layer_cache = LayerCache(
+            attn=attn_cache,
+            norm=None,
+            ema=None,
+            position=jnp.array(0, dtype=jnp.int32),
+        )
+        cache = ModelCache(layer_caches=(layer_cache,), final_norm=None)
+
+        trimmed = trim_cache(cache, max_len)
+        trimmed_attn = trimmed.layer_caches[0].attn
+        assert trimmed_attn is not None
+        assert trimmed_attn.k.shape == (batch, max_len, heads, head_dim)
+        assert trimmed_attn.count == attn_cache.count
+
+        expected_k = jnp.zeros((batch, max_len, heads, head_dim), dtype=jnp.float32)
+        expected_v = jnp.zeros((batch, max_len, heads, value_dim), dtype=jnp.float32)
+        for token in range(6, 10):
+            idx = token % max_len
+            expected_k = expected_k.at[:, idx, 0, 0].set(float(token))
+            expected_v = expected_v.at[:, idx, 0, 0].set(float(token))
+
+        np.testing.assert_allclose(np.array(trimmed_attn.k), np.array(expected_k))
+        np.testing.assert_allclose(np.array(trimmed_attn.v), np.array(expected_v))
+
 
 class TestSamplingAndGeneration:
     """Sampling primitives and generation loop."""

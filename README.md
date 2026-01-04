@@ -112,19 +112,18 @@ src/megalodon_jax/
 
 ## Current Status
 
-**Phase 4 Complete**:
+**Phase 5 Complete**:
 
-- All core components implemented
-- Parity with PyTorch reference validated
-- Weight conversion utilities ready
-
-**Phase 5 (TODO)**: `generate()` loop for text generation
+- Core components + streaming cache utilities
+- Sampling + `generate()` loop for text generation
+- PyTorch ↔ JAX conversion (SafeTensors via PyTorch state dicts)
 
 ## Limitations
 
 - Pure JAX implementation (no fused CUDA kernels)
 - Sequential CEMA path is slower than FFT; training uses FFT automatically
 - No 4D chunk parallelism (out of scope for single-device)
+- CEMA zeros masked positions before recurrence to avoid padding contamination (differs from PyTorch)
 
 ## Testing
 
