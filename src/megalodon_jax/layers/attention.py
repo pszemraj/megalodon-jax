@@ -83,7 +83,13 @@ def attention_single_chunk(
 
     # Compute attention scores: (B, H, L_q, L_kv)
     # NO scaling by 1/sqrt(d_k) - this is normalized attention
-    scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32))
+    # Keep inputs in native dtype but accumulate in float32 for stability/perf.
+    scores = jnp.einsum(
+        "bqhd,bkhd->bhqk",
+        q,
+        k,
+        preferred_element_type=jnp.float32,
+    )
 
     # Build attention mask
     # Use -inf so softmax(all masked) = NaN, triggering the NaN guard below
@@ -123,7 +129,12 @@ def attention_single_chunk(
         attn_weights = attn_weights * keep_mask.astype(attn_weights.dtype) * inv_keep
 
     # Apply to values: (B, H, L_q, Dv) -> (B, L_q, H, Dv)
-    out = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v.astype(jnp.float32))
+    out = jnp.einsum(
+        "bhqk,bkhd->bqhd",
+        attn_weights,
+        v,
+        preferred_element_type=jnp.float32,
+    )
 
     return out.astype(q.dtype)
 
