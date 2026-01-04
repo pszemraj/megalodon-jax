@@ -415,11 +415,13 @@ class ChunkedAttention(eqx.Module):
         cache_indices = jnp.arange(cache_size)
 
         def current_valid_len(cur_pos: Int[Array, ""]) -> Int[Array, ""]:
+            """Return the valid cache length at the current position."""
             if faithful_chunk_local:
                 return jnp.minimum(cur_pos % self.chunk_size, cache_size)
             return jnp.minimum(cur_pos, cache_size)
 
         def cache_mask_for(valid_len: Int[Array, ""]) -> Bool[Array, "batch cache_size"]:
+            """Build a broadcasted cache validity mask."""
             mask_vec = cache_indices < valid_len
             return jnp.broadcast_to(mask_vec, (B, cache_size))
 
@@ -435,13 +437,31 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             Int[Array, ""],
         ]:
-            def append_at_end(_: None):
+            """Append a single token to the cache, rolling if full."""
+
+            def append_at_end(
+                _: None,
+            ) -> tuple[
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                Int[Array, ""],
+            ]:
+                """Append token at the next free cache slot."""
                 write_pos = valid_len
                 new_k = jax.lax.dynamic_update_slice(c_k, k_tok, (0, write_pos, 0, 0))
                 new_v = jax.lax.dynamic_update_slice(c_v, v_tok, (0, write_pos, 0, 0))
                 return new_k, new_v, write_pos, valid_len + 1
 
-            def roll_and_append(_: None):
+            def roll_and_append(
+                _: None,
+            ) -> tuple[
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                Int[Array, ""],
+            ]:
+                """Roll the cache window and append token at the tail."""
                 rolled_k = jnp.roll(c_k, shift=-1, axis=1)
                 rolled_v = jnp.roll(c_v, shift=-1, axis=1)
                 write_pos = jnp.array(cache_size - 1, dtype=jnp.int32)
@@ -472,6 +492,7 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
+                """Process one token in the small-L streaming path."""
                 out_step, c_k_step, c_v_step, pos_step, rng_step = state
 
                 q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
@@ -544,6 +565,7 @@ class ChunkedAttention(eqx.Module):
                 Float[Array, "batch cache_size heads head_dim"],
                 Float[Array, "batch cache_size heads value_dim"],
             ]:
+                """Append a full chunk, keeping only the most recent cache_size tokens."""
                 del valid_len
                 k_keep = k_blk[:, -cache_size:]
                 v_keep = v_blk[:, -cache_size:]
@@ -561,15 +583,28 @@ class ChunkedAttention(eqx.Module):
                 Float[Array, "batch cache_size heads head_dim"],
                 Float[Array, "batch cache_size heads value_dim"],
             ]:
+                """Append a full chunk to the cache with rolling when needed."""
                 total_len = valid_len + self.chunk_size
 
-                def append_tail(_: None):
+                def append_tail(
+                    _: None,
+                ) -> tuple[
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                ]:
+                    """Append a full chunk at the current cache tail."""
                     start = valid_len
                     new_k = jax.lax.dynamic_update_slice(c_k, k_blk, (0, start, 0, 0))
                     new_v = jax.lax.dynamic_update_slice(c_v, v_blk, (0, start, 0, 0))
                     return new_k, new_v
 
-                def roll_and_append(_: None):
+                def roll_and_append(
+                    _: None,
+                ) -> tuple[
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                ]:
+                    """Roll the cache window and append a full chunk at the tail."""
                     drop = total_len - cache_size
                     rolled_k = jnp.roll(c_k, shift=-drop, axis=1)
                     rolled_v = jnp.roll(c_v, shift=-drop, axis=1)
@@ -594,6 +629,7 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             PRNGKeyArray | None,
         ]:
+            """Process a full chunk with cache and update the streaming state."""
             q_blk = jax.lax.dynamic_slice(
                 q_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
             )
@@ -624,6 +660,7 @@ class ChunkedAttention(eqx.Module):
                 step_rng = None
 
             def attend_with_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
+                """Attend with cache concatenated to the current chunk."""
                 return attention_single_chunk(
                     q_rot,
                     k_cat,
@@ -636,6 +673,7 @@ class ChunkedAttention(eqx.Module):
                 )
 
             def attend_no_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
+                """Attend within the current chunk only."""
                 return attention_single_chunk(
                     q_rot,
                     k_rot,
@@ -674,6 +712,8 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             PRNGKeyArray | None,
         ]:
+            """Process a partial chunk token-by-token."""
+
             def token_body(
                 i: Int[Array, ""],
                 state: tuple[
@@ -690,6 +730,7 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
+                """Process one token in a partial chunk."""
                 out_step, c_k_step, c_v_step, pos_step, rng_step = state
                 idx = offset + i
 
@@ -740,6 +781,7 @@ class ChunkedAttention(eqx.Module):
         def loop_cond(
             state: tuple[Int[Array, ""], Array, Array, Array, Int[Array, ""], PRNGKeyArray | None],
         ) -> Bool[Array, ""]:
+            """Continue streaming loop while offset is within sequence length."""
             offset = state[0]
             return offset < L
 
@@ -760,6 +802,7 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             PRNGKeyArray | None,
         ]:
+            """Streaming loop body that dispatches full vs partial chunk processing."""
             offset, out_buf, c_k, c_v, cur_pos, rng = state
             remaining = L - offset
             if faithful_chunk_local:
@@ -788,6 +831,7 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
+                """Branch for processing a full chunk."""
                 offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
                 out_b, k_b, v_b, pos_b, rng_b = process_full_chunk(
                     offset_b, out_b, k_b, v_b, pos_b, rng_b
@@ -812,6 +856,7 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
+                """Branch for processing a partial chunk."""
                 offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
                 out_b, k_b, v_b, pos_b, rng_b = process_partial_chunk(
                     offset_b, chunk_len, out_b, k_b, v_b, pos_b, rng_b
