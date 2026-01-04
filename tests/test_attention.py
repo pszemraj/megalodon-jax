@@ -98,6 +98,22 @@ class TestAttentionPrimitives:
         # Verify output is not NaN and has reasonable magnitude
         assert not jnp.any(jnp.isnan(out))
 
+    def test_single_chunk_preserves_bf16_dtype(self, random_seed):
+        """Test that attention_single_chunk preserves bf16 dtype (no forced fp32)."""
+        batch, seq, heads, head_dim, value_dim = 1, 4, 2, 16, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim), dtype=jnp.bfloat16)
+
+        out = attention_single_chunk(q, k, v)
+
+        assert out.dtype == jnp.bfloat16
+        assert not jnp.any(jnp.isnan(out))
+
     def test_multi_chunk_shapes(self, random_seed):
         """Test that attention_multi_chunk produces correct output shapes."""
         batch, seq, heads, head_dim, value_dim = 2, 64, 4, 32, 64
@@ -210,6 +226,35 @@ class TestChunkedAttention:
         assert cache.count == 8
         # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
         assert cache.k.shape[1] == chunk_size
+
+    def test_streaming_small_l_preserves_dtype_and_cache_count(self, random_seed):
+        """Small-L streaming should keep dtype and track cache count without padding."""
+        batch, heads, head_dim, value_dim = 1, 2, 16, 16
+        chunk_size = 8
+        seq = 3  # L < chunk_size to hit the token-wise path
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        q = jax.random.normal(k2, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(k3, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        v = jax.random.normal(k4, (batch, seq, heads, value_dim), dtype=jnp.bfloat16)
+
+        out, cache, position = attn(q, k, v, return_cache=True)
+
+        assert out.shape == (batch, seq, heads, value_dim)
+        assert out.dtype == jnp.bfloat16
+        assert cache is not None
+        assert cache.count == seq  # should only advance by actual tokens
+        assert position == seq
 
 
 # -----------------------------------------------------------------------------

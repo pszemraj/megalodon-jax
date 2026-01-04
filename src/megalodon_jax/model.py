@@ -457,10 +457,9 @@ class MegalodonForCausalLM(eqx.Module):
 
             lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k_head)
             # Apply init_mode to untied lm_head
-            # For gaussian init, use dim=None to get std=1.0 (matches PyTorch/other Linear layers)
+            # For gaussian init, match PyTorch reference: std = 1/sqrt(output_dim)
             if config.init_mode != "none":
-                linear_dim = None if config.init_mode == "gaussian" else lm_out
-                init_fn = get_initializer(config.init_mode, dim=linear_dim)
+                init_fn = get_initializer(config.init_mode, dim=lm_out)
                 new_weight = init_fn(k_head_reinit, lm_head.weight.shape, lm_head.weight.dtype)
                 lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
             self.lm_head = lm_head

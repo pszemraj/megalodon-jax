@@ -1214,8 +1214,8 @@ class TestComputeLossMasking:
 class TestUntiedHeadInit:
     """Tests for untied LM head initialization."""
 
-    def test_untied_head_gaussian_uses_unit_scale(self, random_seed):
-        """Test that untied LM head with gaussian init uses std=1.0 (not 1/sqrt(output_size))."""
+    def test_untied_head_gaussian_uses_output_dim_scale(self, random_seed):
+        """Test that untied LM head with gaussian init uses std=1/sqrt(output_size)."""
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1234,15 +1234,19 @@ class TestUntiedHeadInit:
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
 
-        # The bug was: std = 1/sqrt(1024) = 0.03125, variance ~= 0.001
-        # Fixed: std = 1.0, variance ~= 0.6-0.9 (truncated normal)
+        # Expect variance near 1/output_size (std = 1/sqrt(output_size)).
         lm_head_var = jnp.var(model.lm_head.weight)
+        expected_var = 1.0 / config.output_size
 
-        # Should have variance > 0.2 (truncated normal with std=1.0)
-        # If buggy, would have variance ~0.001
-        assert lm_head_var > 0.2, (
-            f"Untied LM head variance {lm_head_var} is too small. "
-            "Gaussian init should use std=1.0, not 1/sqrt(output_size)."
+        np.testing.assert_allclose(
+            np.array(lm_head_var),
+            expected_var,
+            rtol=0.25,
+            atol=5e-4,
+            err_msg=(
+                f"Untied LM head variance {lm_head_var} deviates from expected "
+                f"{expected_var} (std=1/sqrt(output_size))."
+            ),
         )
 
 
