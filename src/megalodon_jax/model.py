@@ -325,9 +325,15 @@ class MegalodonModel(eqx.Module):
         # Use embed dtype to match model's native dtype (e.g., bf16 if autocast applied)
         if B == 0 or L == 0:
             empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.embed.weight.dtype)
-            empty_cache = (
-                ModelCache(tuple([None] * len(self.layers)), None) if return_cache else None
-            )
+            if return_cache:
+                # Preserve any existing streaming state when input is empty.
+                empty_cache = (
+                    cache
+                    if cache is not None
+                    else ModelCache(tuple([None] * len(self.layers)), None)
+                )
+            else:
+                empty_cache = None
             return empty_hidden, empty_cache
 
         # Disable streaming cache updates during training (matches PyTorch behavior).
