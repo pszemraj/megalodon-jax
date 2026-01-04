@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from megalodon_jax import (
     MegalodonConfig,
@@ -188,6 +189,20 @@ class TestSamplingAndGeneration:
         np.testing.assert_array_equal(np.array(out1), np.array(out2))
         assert jnp.all(out1 >= 0)
         assert jnp.all(out1 < config.vocab_size)
+
+    def test_generate_zero_new_tokens_raises(self):
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="max_new_tokens"):
+            generate(
+                model,
+                prompt,
+                max_new_tokens=0,
+                key=jax.random.PRNGKey(0),
+                temperature=0.0,
+            )
 
 
 class TestConversion:

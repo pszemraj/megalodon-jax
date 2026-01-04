@@ -288,10 +288,10 @@ def generate(
 
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
-
-    # Early exit
     if max_new_tokens == 0:
-        return prompt_ids, cache
+        raise ValueError(
+            "max_new_tokens must be > 0 to generate; Transformers treats this as an invalid length."
+        )
 
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
