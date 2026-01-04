@@ -98,6 +98,22 @@ class TestAttentionPrimitives:
         # Verify output is not NaN and has reasonable magnitude
         assert not jnp.any(jnp.isnan(out))
 
+    def test_single_chunk_preserves_bf16_dtype(self, random_seed):
+        """Test that attention_single_chunk preserves bf16 dtype (no forced fp32)."""
+        batch, seq, heads, head_dim, value_dim = 1, 4, 2, 16, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim), dtype=jnp.bfloat16)
+
+        out = attention_single_chunk(q, k, v)
+
+        assert out.dtype == jnp.bfloat16
+        assert not jnp.any(jnp.isnan(out))
+
     def test_multi_chunk_shapes(self, random_seed):
         """Test that attention_multi_chunk produces correct output shapes."""
         batch, seq, heads, head_dim, value_dim = 2, 64, 4, 32, 64
@@ -210,6 +226,35 @@ class TestChunkedAttention:
         assert cache.count == 8
         # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
         assert cache.k.shape[1] == chunk_size
+
+    def test_streaming_small_l_preserves_dtype_and_cache_count(self, random_seed):
+        """Small-L streaming should keep dtype and track cache count without padding."""
+        batch, heads, head_dim, value_dim = 1, 2, 16, 16
+        chunk_size = 8
+        seq = 3  # L < chunk_size to hit the token-wise path
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+
+        q = jax.random.normal(k2, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        k = jax.random.normal(k3, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
+        v = jax.random.normal(k4, (batch, seq, heads, value_dim), dtype=jnp.bfloat16)
+
+        out, cache, position = attn(q, k, v, return_cache=True)
+
+        assert out.shape == (batch, seq, heads, value_dim)
+        assert out.dtype == jnp.bfloat16
+        assert cache is not None
+        assert cache.count == seq  # should only advance by actual tokens
+        assert position == seq
 
 
 # -----------------------------------------------------------------------------
@@ -726,9 +771,7 @@ class TestStreamingEquivalence:
                 f"Cache buffer should be fixed size {chunk_size}, got {cache.k.shape[1]}"
             )
             # The count tracks absolute position
-            assert cache.count == i + 1, (
-                f"Cache count should be {i + 1}, got {cache.count}"
-            )
+            assert cache.count == i + 1, f"Cache count should be {i + 1}, got {cache.count}"
 
     def test_cache_resize_on_input(self, random_seed):
         """Test that incoming caches are resized to fixed buffer size."""
@@ -862,9 +905,7 @@ class TestParity:
         cache = AttentionCache(k=init_k_rot, v=init_v, count=jnp.array(2, dtype=jnp.int32))
 
         # Process multi-token call that spans boundary
-        out_multi, cache_multi, pos_multi = attn(
-            q, k, v, cache=cache, return_cache=True
-        )
+        out_multi, cache_multi, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
 
         # Now compare with token-by-token processing
         streaming_outputs = []
@@ -873,9 +914,7 @@ class TestParity:
             q_i = q[:, i : i + 1]
             k_i = k[:, i : i + 1]
             v_i = v[:, i : i + 1]
-            out_i, cache_stream, _ = attn(
-                q_i, k_i, v_i, cache=cache_stream, return_cache=True
-            )
+            out_i, cache_stream, _ = attn(q_i, k_i, v_i, cache=cache_stream, return_cache=True)
             streaming_outputs.append(out_i)
 
         out_streaming = jnp.concatenate(streaming_outputs, axis=1)
@@ -1018,44 +1057,20 @@ class TestMegalodonAttentionParity:
         )
 
         # Projections (both PyTorch and Equinox use (out_features, in_features) layout)
-        jax_attn = eqx.tree_at(
-            lambda m: m.wz.weight, jax_attn, to_jax(torch_attn.wz.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wz.bias, jax_attn, to_jax(torch_attn.wz.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wv.weight, jax_attn, to_jax(torch_attn.wv.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wv.bias, jax_attn, to_jax(torch_attn.wv.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wr.weight, jax_attn, to_jax(torch_attn.wr.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wr.bias, jax_attn, to_jax(torch_attn.wr.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh1.weight, jax_attn, to_jax(torch_attn.wh1.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh1.bias, jax_attn, to_jax(torch_attn.wh1.bias)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh2.weight, jax_attn, to_jax(torch_attn.wh2.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.wh2.bias, jax_attn, to_jax(torch_attn.wh2.bias)
-        )
+        jax_attn = eqx.tree_at(lambda m: m.wz.weight, jax_attn, to_jax(torch_attn.wz.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wz.bias, jax_attn, to_jax(torch_attn.wz.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wv.weight, jax_attn, to_jax(torch_attn.wv.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wv.bias, jax_attn, to_jax(torch_attn.wv.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wr.weight, jax_attn, to_jax(torch_attn.wr.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wr.bias, jax_attn, to_jax(torch_attn.wr.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wh1.weight, jax_attn, to_jax(torch_attn.wh1.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wh1.bias, jax_attn, to_jax(torch_attn.wh1.bias))
+        jax_attn = eqx.tree_at(lambda m: m.wh2.weight, jax_attn, to_jax(torch_attn.wh2.weight))
+        jax_attn = eqx.tree_at(lambda m: m.wh2.bias, jax_attn, to_jax(torch_attn.wh2.bias))
 
         # Q/K affine parameters
-        jax_attn = eqx.tree_at(
-            lambda m: m.gamma, jax_attn, to_jax(torch_attn.gamma)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.beta, jax_attn, to_jax(torch_attn.beta)
-        )
+        jax_attn = eqx.tree_at(lambda m: m.gamma, jax_attn, to_jax(torch_attn.gamma))
+        jax_attn = eqx.tree_at(lambda m: m.beta, jax_attn, to_jax(torch_attn.beta))
 
         # Inner attention rotary (copy from CPU tensor)
         jax_attn = eqx.tree_at(

@@ -63,22 +63,18 @@ def _register_pytree(cls: type[T]) -> type[T]:
 class AttentionCache:
     """Cache for streaming attention.
 
-    Stores key/value tensors and a count of tokens processed.
+    Stores key/value tensors in fixed-capacity buffers with masked validity.
+    Use `count` for the total tokens processed (absolute position after last token).
+    Buffer capacity is `k.shape[1]`; valid entries are masked internally.
+
+    Note: Unlike the PyTorch reference, this cache does not expose length/start_index
+    properties because they would be misleading. In JAX, caches use fixed-size buffers
+    with internal validity masking, so buffer capacity != valid cached length.
     """
 
     k: Float[Array, "batch seq heads head_dim"]
     v: Float[Array, "batch seq heads value_head_dim"]
     count: Int[Array, ""]  # JAX scalar - total tokens seen
-
-    @property
-    def length(self) -> int:
-        """Number of cached timesteps."""
-        return self.k.shape[1]
-
-    @property
-    def start_index(self) -> Int[Array, ""]:
-        """Absolute position of first cached token."""
-        return self.count - self.k.shape[1]
 
 
 @_register_pytree
@@ -125,3 +121,19 @@ class LayerCache:
     norm: NormState | None = None
     ema: EMAState | None = None
     position: Int[Array, ""] = field(default_factory=_default_position)
+
+
+@_register_pytree
+@dataclass
+class ModelCache:
+    """Full model cache: layer caches + final norm state.
+
+    This cache structure holds all streaming state for the model:
+    - One LayerCache per decoder layer (attention, norm, EMA state)
+    - One NormState for the final TimestepNorm
+
+    Note: layer_caches must be a tuple (not list) for JAX pytree compatibility.
+    """
+
+    layer_caches: tuple[LayerCache | None, ...]
+    final_norm: NormState | None = None

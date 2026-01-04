@@ -64,7 +64,9 @@ def get_initializer(
             std = 1.0
         else:
             std = 1.0 / jnp.sqrt(dim)
-        return jax.nn.initializers.truncated_normal(stddev=std, lower=-3 * std, upper=3 * std)
+        # Bounds are in standard-normal units (before scaling by stddev).
+        # Final output range: lower*stddev < x < upper*stddev = (-3*std, 3*std)
+        return jax.nn.initializers.truncated_normal(stddev=std, lower=-3.0, upper=3.0)
 
     raise ValueError(f"Unknown init mode: {mode}")
 

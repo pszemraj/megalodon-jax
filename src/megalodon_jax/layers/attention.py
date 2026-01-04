@@ -34,6 +34,16 @@ from megalodon_jax.utils import reinit_linear_weights
 # -----------------------------------------------------------------------------
 
 
+def _linear_3d(
+    linear: eqx.nn.Linear, x: Float[Array, "batch seq in_dim"]
+) -> Float[Array, "batch seq out_dim"]:
+    """Apply an Equinox Linear over a (batch, seq, dim) tensor."""
+    y = jnp.matmul(x, linear.weight.T)
+    if linear.bias is not None:
+        y = y + linear.bias
+    return y
+
+
 def attention_single_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch kv_seq heads head_dim"],
@@ -73,13 +83,21 @@ def attention_single_chunk(
 
     # Compute attention scores: (B, H, L_q, L_kv)
     # NO scaling by 1/sqrt(d_k) - this is normalized attention
-    scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32))
+    # Keep inputs in native dtype but accumulate in float32 for stability/perf.
+    scores = jnp.einsum(
+        "bqhd,bkhd->bhqk",
+        q,
+        k,
+        preferred_element_type=jnp.float32,
+    )
 
     # Build attention mask
+    # Use -inf so softmax(all masked) = NaN, triggering the NaN guard below
+    neg_inf = -jnp.inf
     if causal and L_q == L_kv:
         # Standard causal mask for self-attention
         causal_mask = jnp.tril(jnp.ones((L_q, L_kv), dtype=jnp.bool_))
-        scores = jnp.where(causal_mask, scores, jnp.finfo(jnp.float32).min)
+        scores = jnp.where(causal_mask, scores, neg_inf)
     elif causal and L_q < L_kv:
         # Cross-attention with cache: each query attends to all prior keys
         # Query at position i can attend to keys [0, L_kv - L_q + i + 1)
@@ -88,13 +106,13 @@ def attention_single_chunk(
         # Key position must be <= query position + offset
         offset = L_kv - L_q
         causal_mask = k_pos <= (q_pos + offset)  # (L_q, L_kv)
-        scores = jnp.where(causal_mask, scores, jnp.finfo(jnp.float32).min)
+        scores = jnp.where(causal_mask, scores, neg_inf)
 
     # Apply key/value padding mask if provided
     if kv_mask is not None:
         # kv_mask: (B, L_kv) with True for valid positions
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
-        scores = jnp.where(kv_mask_expanded, scores, jnp.finfo(jnp.float32).min)
+        scores = jnp.where(kv_mask_expanded, scores, neg_inf)
 
     # Softmax with NaN guard for fully-masked queries
     # If all keys are masked for a query, softmax(all -inf) = NaN
@@ -107,10 +125,16 @@ def attention_single_chunk(
         if key is None:
             raise ValueError("PRNG key required for dropout")
         keep_mask = jax.random.bernoulli(key, 1.0 - dropout_rate, attn_weights.shape)
-        attn_weights = jnp.where(keep_mask, attn_weights / (1.0 - dropout_rate), 0.0)
+        inv_keep = jnp.asarray(1.0 / (1.0 - dropout_rate), dtype=attn_weights.dtype)
+        attn_weights = attn_weights * keep_mask.astype(attn_weights.dtype) * inv_keep
 
     # Apply to values: (B, H, L_q, Dv) -> (B, L_q, H, Dv)
-    out = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v.astype(jnp.float32))
+    out = jnp.einsum(
+        "bhqk,bkhd->bqhd",
+        attn_weights,
+        v,
+        preferred_element_type=jnp.float32,
+    )
 
     return out.astype(q.dtype)
 
@@ -181,132 +205,27 @@ def attention_multi_chunk(
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
 
-    # Compute chunk start indices for RoPE
-    # Chunk i starts at position start_index + i * chunk_size
-    chunk_offsets = jnp.arange(num_chunks) * chunk_size  # (num_chunks,)
-
-    # Reshape to (B, num_chunks, chunk_size, H, D) for per-chunk RoPE
-    q_bc = q.reshape(B, num_chunks, chunk_size, H, Dh)
-    k_bc = k.reshape(B, num_chunks, chunk_size, H, Dh)
-
-    def rope_one_batch(
-        q_b: Float[Array, "num_chunks chunk_size heads head_dim"],
-        k_b: Float[Array, "num_chunks chunk_size heads head_dim"],
-    ) -> tuple[
-        Float[Array, "num_chunks chunk_size heads head_dim"],
-        Float[Array, "num_chunks chunk_size heads head_dim"],
-    ]:
-        """Apply RoPE to all chunks in a single batch element."""
-
-        def rope_one_chunk(
-            qk_offset: tuple[
-                Float[Array, "chunk_size heads head_dim"],
-                Float[Array, "chunk_size heads head_dim"],
-                Int[Array, ""],
-            ],
-        ) -> tuple[
-            Float[Array, "chunk_size heads head_dim"],
-            Float[Array, "chunk_size heads head_dim"],
-        ]:
-            """Apply RoPE to a single chunk with its position offset."""
-            q_c, k_c, offset = qk_offset
-            q_r, k_r = rotary(q_c[None, ...], k_c[None, ...], start_index + offset)
-            return q_r[0], k_r[0]
-
-        q_rot_chunks, k_rot_chunks = jax.lax.map(rope_one_chunk, (q_b, k_b, chunk_offsets))
-        return q_rot_chunks, k_rot_chunks
-
-    # vmap over batch
-    q_rot_bc, k_rot_bc = jax.vmap(rope_one_batch)(q_bc, k_bc)
-    # Shape: (B, num_chunks, chunk_size, H, D)
-
-    # Reshape for batched attention
-    q_rot = q_rot_bc.reshape(B * num_chunks, chunk_size, H, Dh)
-    k_rot = k_rot_bc.reshape(B * num_chunks, chunk_size, H, Dh)
+    # Apply RoPE once with absolute positions, then reshape into chunks.
+    q_rot_full, k_rot_full = rotary(q, k, start_index)
+    q_rot = q_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
+    k_rot = k_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     v_chunked = v.reshape(B, num_chunks, chunk_size, H, Dv).reshape(
         B * num_chunks, chunk_size, H, Dv
     )
 
-    # Handle mask
     mask_chunked = None
     if mask is not None:
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
 
-    # Split key for dropout if needed
-    if not deterministic and key is not None:
-        keys = jax.random.split(key, B * num_chunks)
-    else:
-        keys = None
-
-    # Attention per chunk (all in parallel via batch dimension)
-    # Note: attn_one_chunk is defined but replaced by inline vmap lambdas below.
-    # Keeping for documentation of the intended signature.
-    def attn_one_chunk(
-        inputs: tuple[
-            Float[Array, "chunk_size heads head_dim"],  # q
-            Float[Array, "chunk_size heads head_dim"],  # k
-            Float[Array, "chunk_size heads value_dim"],  # v
-            Bool[Array, "chunk_size"] | None,  # mask
-            PRNGKeyArray | None,  # key
-        ],
-    ) -> Float[Array, "chunk_size heads value_dim"]:
-        """Compute attention for a single chunk (used in vmap below)."""
-        q_c, k_c, v_c, m_c, key_c = inputs
-        return attention_single_chunk(
-            q_c[None, ...],
-            k_c[None, ...],
-            v_c[None, ...],
-            kv_mask=m_c[None, ...] if m_c is not None else None,
-            causal=True,
-            dropout_rate=dropout_rate,
-            deterministic=deterministic,
-            key=key_c,
-        )[0]
-
-    # Use vmap for cleaner parallel execution
-    if mask_chunked is not None:
-        if keys is not None:
-            out_chunked = jax.vmap(
-                lambda q, k, v, m, key: attention_single_chunk(
-                    q[None],
-                    k[None],
-                    v[None],
-                    kv_mask=m[None],
-                    dropout_rate=dropout_rate,
-                    deterministic=deterministic,
-                    key=key,
-                )[0]
-            )(q_rot, k_rot, v_chunked, mask_chunked, keys)
-        else:
-            out_chunked = jax.vmap(
-                lambda q, k, v, m: attention_single_chunk(
-                    q[None],
-                    k[None],
-                    v[None],
-                    kv_mask=m[None],
-                    dropout_rate=dropout_rate,
-                    deterministic=True,
-                    key=None,
-                )[0]
-            )(q_rot, k_rot, v_chunked, mask_chunked)
-    else:
-        if keys is not None:
-            out_chunked = jax.vmap(
-                lambda q, k, v, key: attention_single_chunk(
-                    q[None],
-                    k[None],
-                    v[None],
-                    dropout_rate=dropout_rate,
-                    deterministic=deterministic,
-                    key=key,
-                )[0]
-            )(q_rot, k_rot, v_chunked, keys)
-        else:
-            out_chunked = jax.vmap(
-                lambda q, k, v: attention_single_chunk(
-                    q[None], k[None], v[None], dropout_rate=dropout_rate
-                )[0]
-            )(q_rot, k_rot, v_chunked)
+    out_chunked = attention_single_chunk(
+        q_rot,
+        k_rot,
+        v_chunked,
+        kv_mask=mask_chunked,
+        dropout_rate=dropout_rate,
+        deterministic=deterministic,
+        key=key,
+    )
 
     # Reshape back: (B * num_chunks, chunk_size, H, Dv) -> (B, L_padded, H, Dv)
     out = out_chunked.reshape(B, L_padded, H, Dv)
@@ -336,11 +255,11 @@ class ChunkedAttention(eqx.Module):
            enforcing block-diagonal attention structure.
 
         2. cache_unbounded=False, max_cache_len>chunk_size:
-           Sliding window mode - no reset at chunk boundaries, uses a ring
-           buffer of max_cache_len entries. Cross-chunk context is preserved.
+           Sliding window mode - no reset at chunk boundaries, keeps a fixed-size
+           window of max_cache_len entries. Cross-chunk context is preserved.
 
         3. cache_unbounded=True:
-           No boundary resets, uses ring buffer of max_cache_len entries.
+           No boundary resets, keeps a fixed-size window of max_cache_len entries.
            Unlike PyTorch which allows truly unbounded growth, JAX requires
            a static buffer size for JIT compatibility.
 
@@ -461,169 +380,514 @@ class ChunkedAttention(eqx.Module):
             )
             return out, None, position + L
 
-        # Streaming path: JIT-compatible token-by-token processing with fixed-size cache.
-        # Uses lax.fori_loop with static trip count (compiles to efficient scan).
-        #
-        # Cache behavior is controlled by cache_unbounded and max_cache_len:
-        # - cache_unbounded=False, max_cache_len=chunk_size: "faithful_chunk_local" mode,
-        #   resets KV at chunk boundaries (block-diagonal attention)
-        # - cache_unbounded=False, max_cache_len>chunk_size: sliding window mode,
-        #   no reset, uses ring buffer with cache_size entries
-        # - cache_unbounded=True: no clamping, uses ring buffer with max_cache_len entries
-        #
-        # Buffer model: ring buffer with entries at [0, cache_size), mask tracks valid entries
-        #
-        # Mask semantics (matching PyTorch reference):
-        # - If mask[i] = False (padding), current query won't attend to current key
-        # - The key is still cached; future queries CAN attend to it
-        # - This matches PyTorch where cached tokens use prefix_mask = all-ones
-        # - Rationale: streaming is for autoregressive decode (no mid-sequence padding)
-        # - For padded prefill, use the training path which has full mask support
-
         Dv = v.shape[-1]
         cache_size = self.max_cache_len
 
         # Determine cache reset behavior (matching PyTorch faithful_chunk_local)
-        # Only reset at chunk boundaries when cache_limit == chunk_size exactly
         faithful_chunk_local = (not self.cache_unbounded) and (
             self.max_cache_len == self.chunk_size
         )
 
-        # Initialize or extract fixed-size cache buffers
+        # Streaming path: chunk-wise processing with fixed-size cache.
+        # Full chunks use a single attention matmul; partial chunks fall back
+        # to token-wise updates to avoid dynamic slice sizes.
+        #
+        # Cache behavior is controlled by cache_unbounded and max_cache_len:
+        # - cache_unbounded=False, max_cache_len=chunk_size: "faithful_chunk_local" mode,
+        #   resets KV at chunk boundaries (block-diagonal attention)
+        # - cache_unbounded=False, max_cache_len>chunk_size: sliding window mode
+        # - cache_unbounded=True: same as sliding window but no boundary resets
+        #
+        # Buffer model: left-aligned cache window with masked validity.
+        #
+        # Mask semantics:
+        # - Cached prefix keys are always valid for the current chunk.
+        # - Masked tokens in the current chunk are excluded from attention in that chunk,
+        #   but their keys are still cached for future chunks.
+
+        # Initialize or extract fixed-size cache buffers (left-aligned)
         if cache is None:
             cache_k = jnp.zeros((B, cache_size, H, self.head_dim), dtype=q.dtype)
             cache_v = jnp.zeros((B, cache_size, H, Dv), dtype=v.dtype)
-            write_idx = jnp.array(0, dtype=jnp.int32)
         else:
-            # Handle incoming cache - resize to fixed size if needed
             existing_len = cache.k.shape[1]
             if existing_len == cache_size:
                 cache_k = cache.k
                 cache_v = cache.v
             elif existing_len < cache_size:
-                # Pad at the end (entries are at positions 0..existing_len-1)
                 pad_len = cache_size - existing_len
                 cache_k = jnp.pad(cache.k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
                 cache_v = jnp.pad(cache.v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
             else:
-                # Trim to cache_size (keep first cache_size entries)
-                cache_k = cache.k[:, :cache_size]
-                cache_v = cache.v[:, :cache_size]
-            # Compute write_idx from position
-            if faithful_chunk_local:
-                # Chunk-local mode: w_idx resets at chunk boundaries
-                write_idx = position % self.chunk_size
-            else:
-                # Sliding window or unbounded: w_idx is total tokens written
-                write_idx = position
+                # Keep the most recent entries
+                cache_k = cache.k[:, -cache_size:]
+                cache_v = cache.v[:, -cache_size:]
 
-        # Pre-allocate output buffer
-        out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
-
-        # Pre-compute whether mask is provided for the body_fn closure
         has_input_mask = mask is not None
+        cache_indices = jnp.arange(cache_size)
 
-        def body_fn(
-            i: int,
-            state: tuple[
-                Float[Array, "batch seq heads value_dim"],  # out_buf
-                Float[Array, "batch cache_size heads head_dim"],  # c_k
-                Float[Array, "batch cache_size heads value_dim"],  # c_v
-                Int[Array, ""],  # w_idx
-                Int[Array, ""],  # cur_pos
-                PRNGKeyArray | None,  # rng
-            ],
+        def current_valid_len(cur_pos: Int[Array, ""]) -> Int[Array, ""]:
+            """Return the valid cache length at the current position."""
+            if faithful_chunk_local:
+                return jnp.minimum(cur_pos % self.chunk_size, cache_size)
+            return jnp.minimum(cur_pos, cache_size)
+
+        def cache_mask_for(valid_len: Int[Array, ""]) -> Bool[Array, "batch cache_size"]:
+            """Build a broadcasted cache validity mask."""
+            mask_vec = cache_indices < valid_len
+            return jnp.broadcast_to(mask_vec, (B, cache_size))
+
+        def append_token(
+            c_k: Float[Array, "batch cache_size heads head_dim"],
+            c_v: Float[Array, "batch cache_size heads value_dim"],
+            k_tok: Float[Array, "batch 1 heads head_dim"],
+            v_tok: Float[Array, "batch 1 heads value_dim"],
+            valid_len: Int[Array, ""],
+        ) -> tuple[
+            Float[Array, "batch cache_size heads head_dim"],
+            Float[Array, "batch cache_size heads value_dim"],
+            Int[Array, ""],
+            Int[Array, ""],
+        ]:
+            """Append a single token to the cache, rolling if full."""
+
+            def append_at_end(
+                _: None,
+            ) -> tuple[
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                Int[Array, ""],
+            ]:
+                """Append token at the next free cache slot."""
+                write_pos = valid_len
+                new_k = jax.lax.dynamic_update_slice(c_k, k_tok, (0, write_pos, 0, 0))
+                new_v = jax.lax.dynamic_update_slice(c_v, v_tok, (0, write_pos, 0, 0))
+                return new_k, new_v, write_pos, valid_len + 1
+
+            def roll_and_append(
+                _: None,
+            ) -> tuple[
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                Int[Array, ""],
+            ]:
+                """Roll the cache window and append token at the tail."""
+                rolled_k = jnp.roll(c_k, shift=-1, axis=1)
+                rolled_v = jnp.roll(c_v, shift=-1, axis=1)
+                write_pos = jnp.array(cache_size - 1, dtype=jnp.int32)
+                new_k = jax.lax.dynamic_update_slice(rolled_k, k_tok, (0, write_pos, 0, 0))
+                new_v = jax.lax.dynamic_update_slice(rolled_v, v_tok, (0, write_pos, 0, 0))
+                new_valid_len = jnp.array(cache_size, dtype=jnp.int32)
+                return new_k, new_v, write_pos, new_valid_len
+
+            return jax.lax.cond(valid_len < cache_size, append_at_end, roll_and_append, None)
+
+        if L < self.chunk_size:
+            # Small-L fast path: avoid padding to chunk_size and trace only token updates.
+            out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
+
+            def token_body(
+                i: Int[Array, ""],
+                state: tuple[
+                    Float[Array, "batch seq heads value_dim"],
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                    Int[Array, ""],
+                    PRNGKeyArray | None,
+                ],
+            ) -> tuple[
+                Float[Array, "batch seq heads value_dim"],
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                PRNGKeyArray | None,
+            ]:
+                """Process one token in the small-L streaming path."""
+                out_step, c_k_step, c_v_step, pos_step, rng_step = state
+
+                q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
+                k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
+                v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
+
+                q_rot, k_rot = self.rotary(q_i, k_i, pos_step)
+
+                valid_len = current_valid_len(pos_step)
+                c_k_step, c_v_step, write_pos, valid_len_new = append_token(
+                    c_k_step, c_v_step, k_rot, v_i, valid_len
+                )
+                cache_mask = cache_mask_for(valid_len_new)
+                if has_input_mask:
+                    mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
+                    write_slot = cache_indices == write_pos
+                    current_invalid = ~mask_i[:, None] & write_slot[None, :]
+                    kv_mask = cache_mask & ~current_invalid
+                else:
+                    kv_mask = cache_mask
+
+                if rng_step is not None:
+                    rng_step, step_rng = jax.random.split(rng_step)
+                else:
+                    step_rng = None
+
+                out_i = attention_single_chunk(
+                    q_rot,
+                    c_k_step,
+                    c_v_step,
+                    kv_mask=kv_mask,
+                    causal=False,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+                out_step = jax.lax.dynamic_update_slice(out_step, out_i, (0, i, 0, 0))
+                return out_step, c_k_step, c_v_step, pos_step + 1, rng_step
+
+            init_state = (out_buffer, cache_k, cache_v, position, key)
+            out_buffer, final_k, final_v, final_pos, _ = jax.lax.fori_loop(
+                0, L, token_body, init_state
+            )
+
+            new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
+            if not return_cache:
+                new_cache = None
+
+            return out_buffer, new_cache, final_pos
+
+        q_full = q
+        k_full = k
+        v_full = v
+        mask_full = mask
+
+        buffer_len = q_full.shape[1]
+        out_buffer = jnp.zeros((B, buffer_len, H, Dv), dtype=v.dtype)
+        full_chunk_mask = jnp.ones((B, self.chunk_size), dtype=jnp.bool_)
+
+        if cache_size < self.chunk_size:
+
+            def append_full_chunk(
+                c_k: Float[Array, "batch cache_size heads head_dim"],
+                c_v: Float[Array, "batch cache_size heads value_dim"],
+                k_blk: Float[Array, "batch chunk_size heads head_dim"],
+                v_blk: Float[Array, "batch chunk_size heads value_dim"],
+                valid_len: Int[Array, ""],
+            ) -> tuple[
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+            ]:
+                """Append a full chunk, keeping only the most recent cache_size tokens."""
+                del valid_len
+                k_keep = k_blk[:, -cache_size:]
+                v_keep = v_blk[:, -cache_size:]
+                return k_keep, v_keep
+
+        else:
+
+            def append_full_chunk(
+                c_k: Float[Array, "batch cache_size heads head_dim"],
+                c_v: Float[Array, "batch cache_size heads value_dim"],
+                k_blk: Float[Array, "batch chunk_size heads head_dim"],
+                v_blk: Float[Array, "batch chunk_size heads value_dim"],
+                valid_len: Int[Array, ""],
+            ) -> tuple[
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+            ]:
+                """Append a full chunk to the cache with rolling when needed."""
+                total_len = valid_len + self.chunk_size
+
+                def append_tail(
+                    _: None,
+                ) -> tuple[
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                ]:
+                    """Append a full chunk at the current cache tail."""
+                    start = valid_len
+                    new_k = jax.lax.dynamic_update_slice(c_k, k_blk, (0, start, 0, 0))
+                    new_v = jax.lax.dynamic_update_slice(c_v, v_blk, (0, start, 0, 0))
+                    return new_k, new_v
+
+                def roll_and_append(
+                    _: None,
+                ) -> tuple[
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                ]:
+                    """Roll the cache window and append a full chunk at the tail."""
+                    drop = total_len - cache_size
+                    rolled_k = jnp.roll(c_k, shift=-drop, axis=1)
+                    rolled_v = jnp.roll(c_v, shift=-drop, axis=1)
+                    start = cache_size - self.chunk_size
+                    new_k = jax.lax.dynamic_update_slice(rolled_k, k_blk, (0, start, 0, 0))
+                    new_v = jax.lax.dynamic_update_slice(rolled_v, v_blk, (0, start, 0, 0))
+                    return new_k, new_v
+
+                return jax.lax.cond(total_len <= cache_size, append_tail, roll_and_append, None)
+
+        def process_full_chunk(
+            offset: Int[Array, ""],
+            out_buf: Float[Array, "batch seq heads value_dim"],
+            c_k: Float[Array, "batch cache_size heads head_dim"],
+            c_v: Float[Array, "batch cache_size heads value_dim"],
+            cur_pos: Int[Array, ""],
+            rng: PRNGKeyArray | None,
         ) -> tuple[
             Float[Array, "batch seq heads value_dim"],
             Float[Array, "batch cache_size heads head_dim"],
             Float[Array, "batch cache_size heads value_dim"],
             Int[Array, ""],
-            Int[Array, ""],
             PRNGKeyArray | None,
         ]:
-            """Process token i with fixed-size cache.
+            """Process a full chunk with cache and update the streaming state."""
+            q_blk = jax.lax.dynamic_slice(
+                q_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
+            )
+            k_blk = jax.lax.dynamic_slice(
+                k_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
+            )
+            v_blk = jax.lax.dynamic_slice(v_full, (0, offset, 0, 0), (B, self.chunk_size, H, Dv))
 
-            Args:
-                i: Token index within the current sequence.
-                state: Tuple of (output_buffer, cache_k, cache_v, write_idx, position, rng).
+            q_rot, k_rot = self.rotary(q_blk, k_blk, cur_pos)
 
-            Returns:
-                Updated state tuple after processing token i.
-            """
-            out_buf, c_k, c_v, w_idx, cur_pos, rng = state
-
-            # Extract single token
-            q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
-            k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
-            v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
-
-            # Check chunk boundary - reset write index (only in faithful_chunk_local mode)
-            if faithful_chunk_local:
-                at_boundary = (cur_pos % self.chunk_size) == 0
-                w_idx = jax.lax.select(at_boundary, jnp.array(0, dtype=jnp.int32), w_idx)
-            # In sliding window or unbounded mode, w_idx keeps incrementing
-
-            # Apply RoPE
-            q_rot, k_rot = self.rotary(q_i, k_i, cur_pos)
-
-            # Write to cache using ring buffer (always use modulo for safety)
-            write_pos = w_idx % cache_size
-            c_k = jax.lax.dynamic_update_slice(c_k, k_rot, (0, write_pos, 0, 0))
-            c_v = jax.lax.dynamic_update_slice(c_v, v_i, (0, write_pos, 0, 0))
-            w_idx_new = w_idx + 1
-
-            # Build cache validity mask
-            # Positions [0, min(w_idx_new, cache_size)) contain valid entries
-            pos_indices = jnp.arange(cache_size)
-            valid_count = jnp.minimum(w_idx_new, cache_size)
-            cache_valid_mask = pos_indices[None, :] < valid_count  # (1, cache_size)
-            cache_valid_mask = jnp.broadcast_to(cache_valid_mask, (B, cache_size))
-
-            # Apply input mask if provided (matches PyTorch prefix_mask behavior)
-            # - Cached tokens: always valid (same as PyTorch prefix_mask = ones)
-            # - Current token: valid only if mask[i] = True
-            # This means: if current token is masked, current query won't attend to
-            # current key, but future queries will (key is still cached).
+            valid_len = current_valid_len(cur_pos)
+            cache_mask = cache_mask_for(valid_len)
+            mask_blk = None
             if has_input_mask:
-                # Extract current token's mask value: (B,)
-                mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
-                # Mark current write slot as invalid if current token is masked
-                write_slot_mask = pos_indices == write_pos  # (cache_size,)
-                current_invalid = ~mask_i[:, None] & write_slot_mask[None, :]  # (B, cache_size)
-                kv_mask = cache_valid_mask & ~current_invalid
-            else:
-                kv_mask = cache_valid_mask
+                mask_blk = jax.lax.dynamic_slice(mask_full, (0, offset), (B, self.chunk_size))
 
-            # Split RNG for this iteration
+            if mask_blk is not None:
+                kv_mask = jnp.concatenate([cache_mask, mask_blk], axis=1)
+            else:
+                kv_mask = jnp.concatenate([cache_mask, full_chunk_mask], axis=1)
+
+            k_cat = jnp.concatenate([c_k, k_rot], axis=1)
+            v_cat = jnp.concatenate([c_v, v_blk], axis=1)
+
             if rng is not None:
                 rng, step_rng = jax.random.split(rng)
             else:
                 step_rng = None
 
-            # Compute attention over fixed-size cache with validity mask
-            out_i = attention_single_chunk(
-                q_rot,
-                c_k,
-                c_v,
-                kv_mask=kv_mask,
-                causal=False,  # validity handled by mask
-                dropout_rate=self.attention_dropout,
-                deterministic=deterministic,
-                key=step_rng,
+            def attend_with_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
+                """Attend with cache concatenated to the current chunk."""
+                return attention_single_chunk(
+                    q_rot,
+                    k_cat,
+                    v_cat,
+                    kv_mask=kv_mask,
+                    causal=True,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+            def attend_no_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
+                """Attend within the current chunk only."""
+                return attention_single_chunk(
+                    q_rot,
+                    k_rot,
+                    v_blk,
+                    kv_mask=mask_blk if mask_blk is not None else None,
+                    causal=True,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+            if faithful_chunk_local:
+                out_blk = jax.lax.cond(valid_len > 0, attend_with_cache, attend_no_cache, None)
+            else:
+                out_blk = attend_with_cache(None)
+
+            out_buf = jax.lax.dynamic_update_slice(out_buf, out_blk, (0, offset, 0, 0))
+
+            c_k, c_v = append_full_chunk(c_k, c_v, k_rot, v_blk, valid_len)
+            cur_pos = cur_pos + self.chunk_size
+
+            return out_buf, c_k, c_v, cur_pos, rng
+
+        def process_partial_chunk(
+            offset: Int[Array, ""],
+            chunk_len: Int[Array, ""],
+            out_buf: Float[Array, "batch seq heads value_dim"],
+            c_k: Float[Array, "batch cache_size heads head_dim"],
+            c_v: Float[Array, "batch cache_size heads value_dim"],
+            cur_pos: Int[Array, ""],
+            rng: PRNGKeyArray | None,
+        ) -> tuple[
+            Float[Array, "batch seq heads value_dim"],
+            Float[Array, "batch cache_size heads head_dim"],
+            Float[Array, "batch cache_size heads value_dim"],
+            Int[Array, ""],
+            PRNGKeyArray | None,
+        ]:
+            """Process a partial chunk token-by-token."""
+
+            def token_body(
+                i: Int[Array, ""],
+                state: tuple[
+                    Float[Array, "batch seq heads value_dim"],
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                    Int[Array, ""],
+                    PRNGKeyArray | None,
+                ],
+            ) -> tuple[
+                Float[Array, "batch seq heads value_dim"],
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                PRNGKeyArray | None,
+            ]:
+                """Process one token in a partial chunk."""
+                out_step, c_k_step, c_v_step, pos_step, rng_step = state
+                idx = offset + i
+
+                q_i = jax.lax.dynamic_slice(q_full, (0, idx, 0, 0), (B, 1, H, self.head_dim))
+                k_i = jax.lax.dynamic_slice(k_full, (0, idx, 0, 0), (B, 1, H, self.head_dim))
+                v_i = jax.lax.dynamic_slice(v_full, (0, idx, 0, 0), (B, 1, H, Dv))
+
+                q_rot, k_rot = self.rotary(q_i, k_i, pos_step)
+
+                valid_len = current_valid_len(pos_step)
+                c_k_step, c_v_step, write_pos, valid_len_new = append_token(
+                    c_k_step, c_v_step, k_rot, v_i, valid_len
+                )
+                cache_mask = cache_mask_for(valid_len_new)
+                if has_input_mask:
+                    mask_i = jax.lax.dynamic_slice(mask_full, (0, idx), (B, 1))[:, 0]
+                    write_slot = cache_indices == write_pos
+                    current_invalid = ~mask_i[:, None] & write_slot[None, :]
+                    kv_mask = cache_mask & ~current_invalid
+                else:
+                    kv_mask = cache_mask
+
+                if rng_step is not None:
+                    rng_step, step_rng = jax.random.split(rng_step)
+                else:
+                    step_rng = None
+
+                out_i = attention_single_chunk(
+                    q_rot,
+                    c_k_step,
+                    c_v_step,
+                    kv_mask=kv_mask,
+                    causal=False,
+                    dropout_rate=self.attention_dropout,
+                    deterministic=deterministic,
+                    key=step_rng,
+                )
+
+                out_step = jax.lax.dynamic_update_slice(out_step, out_i, (0, idx, 0, 0))
+                return out_step, c_k_step, c_v_step, pos_step + 1, rng_step
+
+            init_state = (out_buf, c_k, c_v, cur_pos, rng)
+            out_buf, c_k, c_v, cur_pos, rng = jax.lax.fori_loop(
+                0, chunk_len, token_body, init_state
             )
+            return out_buf, c_k, c_v, cur_pos, rng
 
-            # Update output buffer
-            out_buf = jax.lax.dynamic_update_slice(out_buf, out_i, (0, i, 0, 0))
+        def loop_cond(
+            state: tuple[Int[Array, ""], Array, Array, Array, Int[Array, ""], PRNGKeyArray | None],
+        ) -> Bool[Array, ""]:
+            """Continue streaming loop while offset is within sequence length."""
+            offset = state[0]
+            return offset < L
 
-            return (out_buf, c_k, c_v, w_idx_new, cur_pos + 1, rng)
+        def loop_body(
+            state: tuple[
+                Int[Array, ""],
+                Float[Array, "batch seq heads value_dim"],
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                PRNGKeyArray | None,
+            ],
+        ) -> tuple[
+            Int[Array, ""],
+            Float[Array, "batch seq heads value_dim"],
+            Float[Array, "batch cache_size heads head_dim"],
+            Float[Array, "batch cache_size heads value_dim"],
+            Int[Array, ""],
+            PRNGKeyArray | None,
+        ]:
+            """Streaming loop body that dispatches full vs partial chunk processing."""
+            offset, out_buf, c_k, c_v, cur_pos, rng = state
+            remaining = L - offset
+            if faithful_chunk_local:
+                pos_in_chunk = cur_pos % self.chunk_size
+                chunk_len = jnp.minimum(
+                    remaining,
+                    jnp.where(pos_in_chunk == 0, self.chunk_size, self.chunk_size - pos_in_chunk),
+                )
+            else:
+                chunk_len = jnp.minimum(remaining, self.chunk_size)
 
-        # Run the loop
-        init_state = (out_buffer, cache_k, cache_v, write_idx, position, key)
-        out_buffer, final_k, final_v, final_w_idx, final_pos, _ = jax.lax.fori_loop(
-            0, L, body_fn, init_state
+            def full_branch(
+                branch_state: tuple[
+                    Int[Array, ""],
+                    Float[Array, "batch seq heads value_dim"],
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                    Int[Array, ""],
+                    PRNGKeyArray | None,
+                ],
+            ) -> tuple[
+                Int[Array, ""],
+                Float[Array, "batch seq heads value_dim"],
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                PRNGKeyArray | None,
+            ]:
+                """Branch for processing a full chunk."""
+                offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
+                out_b, k_b, v_b, pos_b, rng_b = process_full_chunk(
+                    offset_b, out_b, k_b, v_b, pos_b, rng_b
+                )
+                offset_b = offset_b + self.chunk_size
+                return offset_b, out_b, k_b, v_b, pos_b, rng_b
+
+            def partial_branch(
+                branch_state: tuple[
+                    Int[Array, ""],
+                    Float[Array, "batch seq heads value_dim"],
+                    Float[Array, "batch cache_size heads head_dim"],
+                    Float[Array, "batch cache_size heads value_dim"],
+                    Int[Array, ""],
+                    PRNGKeyArray | None,
+                ],
+            ) -> tuple[
+                Int[Array, ""],
+                Float[Array, "batch seq heads value_dim"],
+                Float[Array, "batch cache_size heads head_dim"],
+                Float[Array, "batch cache_size heads value_dim"],
+                Int[Array, ""],
+                PRNGKeyArray | None,
+            ]:
+                """Branch for processing a partial chunk."""
+                offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
+                out_b, k_b, v_b, pos_b, rng_b = process_partial_chunk(
+                    offset_b, chunk_len, out_b, k_b, v_b, pos_b, rng_b
+                )
+                offset_b = offset_b + chunk_len
+                return offset_b, out_b, k_b, v_b, pos_b, rng_b
+
+            do_full = chunk_len == self.chunk_size
+            return jax.lax.cond(do_full, full_branch, partial_branch, state)
+
+        init_offset = jnp.array(0, dtype=jnp.int32)
+        init_state = (init_offset, out_buffer, cache_k, cache_v, position, key)
+        _, out_buffer, final_k, final_v, final_pos, _ = jax.lax.while_loop(
+            loop_cond, loop_body, init_state
         )
 
-        # Build return cache with fixed-size buffers
+        if buffer_len > L:
+            out_buffer = out_buffer[:, :L, :, :]
+
         new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
         if not return_cache:
             new_cache = None
@@ -816,11 +1080,13 @@ class MegalodonAttention(eqx.Module):
         x_tn, new_norm_state = self.timenorm(x, state=norm_state, mask=mask)
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
+        # Pass mask to prevent EMA state contamination from padded positions
         need_ema_state = return_cache or ema_state is not None
         y_cema, h_last = self.cema(
             x_tn.transpose(0, 2, 1),  # (B, D, L)
             h_init=ema_state,
             return_state=need_ema_state,
+            mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
@@ -828,10 +1094,11 @@ class MegalodonAttention(eqx.Module):
         mx = self.rmsnorm(y_cema)
         if not deterministic and self.hidden_dropout > 0.0 and k2 is not None:
             keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, mx.shape)
-            mx = jnp.where(keep, mx / (1.0 - self.hidden_dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=mx.dtype)
+            mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
 
         # Shared Z projection for Q/K
-        z = jax.vmap(jax.vmap(self.wz))(mx)  # (B, L, z_dim)
+        z = _linear_3d(self.wz, mx)  # (B, L, z_dim)
         z = z.reshape(B, L, H, Dh)
 
         # Per-head RMS normalization (in fp32 for stability)
@@ -841,8 +1108,9 @@ class MegalodonAttention(eqx.Module):
 
         # Affine transform to Q and K
         # gamma, beta: (2, z_dim) -> (2, H, Dh)
-        gamma_heads = self.gamma.reshape(2, H, Dh)
-        beta_heads = self.beta.reshape(2, H, Dh)
+        # Cast to z.dtype to preserve bf16 in mixed-precision
+        gamma_heads = self.gamma.reshape(2, H, Dh).astype(z.dtype)
+        beta_heads = self.beta.reshape(2, H, Dh).astype(z.dtype)
         scale = (gamma_heads + 1.0) / math.sqrt(Dh)
 
         # Broadcast and apply: z_normed is (B, L, H, Dh)
@@ -850,11 +1118,11 @@ class MegalodonAttention(eqx.Module):
         k = z_normed * scale[1] + beta_heads[1]
 
         # Value projection with SiLU
-        v = jax.nn.silu(jax.vmap(jax.vmap(self.wv))(x_tn))  # (B, L, value_dim)
+        v = jax.nn.silu(_linear_3d(self.wv, x_tn))  # (B, L, value_dim)
         v = v.reshape(B, L, H, Dv)
 
         # Gate projection with SiLU
-        r = jax.nn.silu(jax.vmap(jax.vmap(self.wr))(mx))  # (B, L, value_dim)
+        r = jax.nn.silu(_linear_3d(self.wr, mx))  # (B, L, value_dim)
 
         # Inner attention
         out, new_attn_cache, new_position = self.inner(
@@ -877,15 +1145,17 @@ class MegalodonAttention(eqx.Module):
         # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
         if not deterministic and self.hidden_dropout > 0.0 and k3 is not None:
             keep = jax.random.bernoulli(k3, 1.0 - self.hidden_dropout, gated.shape)
-            gated = jnp.where(keep, gated / (1.0 - self.hidden_dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=gated.dtype)
+            gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
 
         # Output projections
-        h = jax.vmap(jax.vmap(self.wh1))(mx) + jax.vmap(jax.vmap(self.wh2))(gated)
+        h = _linear_3d(self.wh1, mx) + _linear_3d(self.wh2, gated)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k4 is not None:
             keep = jax.random.bernoulli(k4, 1.0 - self.dropout, h.shape)
-            h = jnp.where(keep, h / (1.0 - self.dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=h.dtype)
+            h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
 
         # Residual
         y = h + x
@@ -896,7 +1166,9 @@ class MegalodonAttention(eqx.Module):
                 attn=new_attn_cache,
                 norm=new_norm_state,
                 ema=EMAState(h=h_last) if h_last is not None else None,
-                position=new_position if new_position is not None else jnp.array(0),
+                position=new_position
+                if new_position is not None
+                else jnp.array(0, dtype=jnp.int32),
             )
         else:
             new_cache = None
@@ -1069,13 +1341,14 @@ class NormalizedFFN(eqx.Module):
         residual = x if residual_base is None else residual_base
 
         # Layer norm
+        # eqx.nn.LayerNorm expects per-example inputs, so vmap over batch/seq.
         h = jax.vmap(jax.vmap(self.norm))(x)
 
         # Hidden layer with activation
         if self.swiglu:
-            h = jax.nn.silu(jax.vmap(jax.vmap(self.fc1))(h)) * jax.vmap(jax.vmap(self.fc3))(h)
+            h = jax.nn.silu(_linear_3d(self.fc1, h)) * _linear_3d(self.fc3, h)
         else:
-            h = jax.nn.silu(jax.vmap(jax.vmap(self.fc1))(h))
+            h = jax.nn.silu(_linear_3d(self.fc1, h))
 
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
@@ -1085,21 +1358,23 @@ class NormalizedFFN(eqx.Module):
                 k1 = k2 = None
             if k1 is not None:
                 keep = jax.random.bernoulli(k1, 1.0 - self.hidden_dropout, h.shape)
-                h = jnp.where(keep, h / (1.0 - self.hidden_dropout), 0.0)
+                inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=h.dtype)
+                h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
         else:
             k2 = key
 
         # Output projection
-        out = jax.vmap(jax.vmap(self.fc2))(h)
+        out = _linear_3d(self.fc2, h)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k2 is not None:
             keep = jax.random.bernoulli(k2, 1.0 - self.dropout, out.shape)
-            out = jnp.where(keep, out / (1.0 - self.dropout), 0.0)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=out.dtype)
+            out = jnp.where(keep, out * inv_keep, jnp.zeros((), dtype=out.dtype))
 
-        # Apply residual rescaling if enabled
+        # Apply residual rescaling if enabled (cast to preserve bf16)
         if self.alpha is not None:
-            out = self.alpha * out
+            out = out * jnp.asarray(self.alpha, dtype=out.dtype)
 
         return residual + out
 

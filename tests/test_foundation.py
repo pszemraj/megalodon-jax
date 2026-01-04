@@ -116,9 +116,7 @@ class TestRMSNormParity:
         y_jax = jax_norm(x_jax)
 
         # Compare
-        np.testing.assert_allclose(
-            np.array(y_jax), y_torch.detach().numpy(), rtol=1e-5, atol=1e-5
-        )
+        np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-5, atol=1e-5)
 
     def test_gamma_initialization(self):
         """Test that gamma is initialized to zeros."""
@@ -201,9 +199,7 @@ class TestRotaryEmbeddingParity:
 
         for start_index in [0, 10, 100, 1000]:
             q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=start_index)
-            q_rot_jax, k_rot_jax = jax_rope(
-                q_jax, k_jax, jnp.array(start_index, dtype=jnp.int32)
-            )
+            q_rot_jax, k_rot_jax = jax_rope(q_jax, k_jax, jnp.array(start_index, dtype=jnp.int32))
 
             # Tolerance scales with position due to exp() implementation differences
             # between JAX (XLA) and PyTorch. These are within float32 precision bounds.
@@ -265,15 +261,19 @@ class TestRotaryEmbeddingParity:
 class TestCacheTypes:
     """Tests for cache/state type definitions."""
 
-    def test_attention_cache_properties(self):
-        """Test AttentionCache properties."""
+    def test_attention_cache_structure(self):
+        """Test AttentionCache fields and structure."""
         k = jnp.zeros((2, 16, 4, 64))
         v = jnp.zeros((2, 16, 4, 128))
         count = jnp.array(16, dtype=jnp.int32)
 
         cache = AttentionCache(k=k, v=v, count=count)
-        assert cache.length == 16
-        assert cache.start_index == 0
+        # Check field values
+        assert cache.k.shape == (2, 16, 4, 64)
+        assert cache.v.shape == (2, 16, 4, 128)
+        assert cache.count == 16
+        # Buffer capacity available via shape (not properties - see types.py docstring)
+        assert cache.k.shape[1] == 16
 
     def test_layer_cache_default_position(self):
         """Test LayerCache has JAX scalar position by default."""

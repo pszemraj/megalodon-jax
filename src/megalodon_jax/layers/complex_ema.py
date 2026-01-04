@@ -17,7 +17,7 @@ import math
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Complex, Float, PRNGKeyArray
+from jaxtyping import Array, Bool, Complex, Float, PRNGKeyArray
 
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
@@ -193,13 +193,16 @@ class ComplexEMA(eqx.Module):
             return (gp[:, :, None] * q_pows).sum(axis=1)  # (D, chunk) complex
 
         # Compute full kernel
-        kernel = jnp.concatenate(
-            [
-                compute_kernel_chunk(start, min(start + FFT_KERNEL_CHUNK, L))
-                for start in range(0, L, FFT_KERNEL_CHUNK)
-            ],
-            axis=-1,
-        )  # (D, L) complex
+        if L <= FFT_KERNEL_CHUNK:
+            kernel = compute_kernel_chunk(0, L)
+        else:
+            kernel = jnp.concatenate(
+                [
+                    compute_kernel_chunk(start, min(start + FFT_KERNEL_CHUNK, L))
+                    for start in range(0, L, FFT_KERNEL_CHUNK)
+                ],
+                axis=-1,
+            )  # (D, L) complex
 
         # FFT convolution using rfft for efficiency (x is real)
         fft_len = 1 << int(2 * L - 1).bit_length()
@@ -270,6 +273,7 @@ class ComplexEMA(eqx.Module):
         x: Float[Array, "batch dim seq"],
         h_init: Complex[Array, "batch dim ndim"] | None = None,
         return_state: bool = False,
+        mask: Bool[Array, "batch seq"] | None = None,
     ) -> tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]:
         """Apply EMA and optionally return final state.
 
@@ -280,6 +284,10 @@ class ComplexEMA(eqx.Module):
             x: Input tensor of shape (batch, dim, seq).
             h_init: Optional initial EMA state for streaming inference.
             return_state: Whether to return the final complex state.
+            mask: Optional boolean mask of shape (batch, seq) where True marks
+                valid tokens. Masked positions (False) have their input zeroed
+                to prevent new information from entering the hidden state.
+                Output at masked positions will reflect decayed prior state.
 
         Returns:
             Tuple of (output, state) where state is None unless return_state=True
@@ -287,6 +295,15 @@ class ComplexEMA(eqx.Module):
         """
         # Store input dtype for output cast
         input_dtype = x.dtype
+
+        # Zero masked positions to prevent new information from padding entering state.
+        # Note: Masked positions still produce output based on decayed prior state
+        # (h[t] = q*h[t-1] when x[t]=0), but no new information is added.
+        # Divergence: PyTorch reference does not apply this mask in CEMA.
+        if mask is not None:
+            # mask: (batch, seq) -> (batch, 1, seq) for broadcasting with x: (batch, dim, seq)
+            # Use dtype-matched zero to preserve bf16
+            x = jnp.where(mask[:, None, :], x, jnp.zeros((), dtype=x.dtype))
 
         # Cast omega to fp32 for residual computation (matches PyTorch reference)
         omega_f32 = self.omega.astype(jnp.float32)

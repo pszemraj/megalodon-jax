@@ -8,10 +8,51 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 # Allocate memory on-demand rather than reserving a fraction
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+
+# Cache GPU availability at module load
+_JAX_GPU_AVAILABLE = jax.default_backend() == "gpu"
+_TORCH_CUDA_AVAILABLE = torch.cuda.is_available()
+
+
+def pytest_sessionstart(session):
+    """Print device info at test session start."""
+    jax_device = jax.devices()[0]
+    jax_backend = jax.default_backend()
+    torch_device = "cuda" if _TORCH_CUDA_AVAILABLE else "cpu"
+
+    print(f"\n{'=' * 60}")
+    print("megalodon-jax test session")
+    print(f"  JAX backend: {jax_backend} ({jax_device})")
+    print(f"  PyTorch device: {torch_device}")
+    if _JAX_GPU_AVAILABLE:
+        print("  GPU tests: ENABLED")
+    else:
+        print("  GPU tests: DISABLED (running on CPU)")
+    print(f"{'=' * 60}\n")
+
+
+# Skip decorator for tests requiring GPU
+requires_gpu = pytest.mark.skipif(
+    not _JAX_GPU_AVAILABLE,
+    reason="Test requires GPU but none available",
+)
+
+
+@pytest.fixture(scope="session")
+def has_gpu():
+    """Session-scoped fixture indicating GPU availability."""
+    return _JAX_GPU_AVAILABLE
+
+
+@pytest.fixture(scope="session")
+def jax_device():
+    """Session-scoped fixture returning the primary JAX device."""
+    return jax.devices()[0]
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
