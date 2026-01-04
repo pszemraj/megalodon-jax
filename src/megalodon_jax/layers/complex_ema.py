@@ -299,6 +299,7 @@ class ComplexEMA(eqx.Module):
         # Zero masked positions to prevent new information from padding entering state.
         # Note: Masked positions still produce output based on decayed prior state
         # (h[t] = q*h[t-1] when x[t]=0), but no new information is added.
+        # Divergence: PyTorch reference does not apply this mask in CEMA.
         if mask is not None:
             # mask: (batch, seq) -> (batch, 1, seq) for broadcasting with x: (batch, dim, seq)
             # Use dtype-matched zero to preserve bf16
