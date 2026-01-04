@@ -6,9 +6,8 @@ from megalodon_jax.model import (
     MegalodonBlock,
     MegalodonForCausalLM,
     MegalodonModel,
-    ModelCache,
 )
-from megalodon_jax.types import AttentionCache, EMAState, LayerCache, NormState
+from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
 
 __all__ = [
     # Config

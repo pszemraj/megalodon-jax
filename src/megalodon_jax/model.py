@@ -6,8 +6,7 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
-from dataclasses import dataclass, fields
-from typing import Any, TypeVar
+from typing import Any
 
 import equinox as eqx
 import jax
@@ -16,36 +15,8 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
-from megalodon_jax.types import LayerCache, NormState
+from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_initializer, reinit_linear_weights
-
-T = TypeVar("T")
-
-
-def _register_pytree(cls: type[T]) -> type[T]:
-    """Register a dataclass as a JAX pytree node.
-
-    This decorator enables JAX transformations (jit, vmap, scan) to work with
-    the decorated dataclass by defining how to flatten and unflatten it.
-
-    Args:
-        cls: A dataclass type to register.
-
-    Returns:
-        The same class, now registered as a pytree node.
-    """
-
-    def flatten(obj: T) -> tuple[tuple[Any, ...], None]:
-        """Flatten dataclass to (children, aux_data)."""
-        children = tuple(getattr(obj, f.name) for f in fields(obj))
-        return children, None
-
-    def unflatten(aux_data: None, children: tuple[Any, ...]) -> T:
-        """Reconstruct dataclass from children."""
-        return cls(*children)
-
-    jax.tree_util.register_pytree_node(cls, flatten, unflatten)
-    return cls
 
 
 @eqx.filter_checkpoint
@@ -57,8 +28,8 @@ def _checkpointed_layer(
 ) -> Float[Array, "batch seq dim"]:
     """Execute layer without caching for gradient checkpointing.
 
-    This function is defined at module level (not inside the loop) to avoid
-    recreating the decorated function on each iteration.
+    This function is defined at module level so the checkpoint transform is
+    created once and reused inside the layer loop.
     """
     out, _ = layer(x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key)
     return out
@@ -71,22 +42,6 @@ def _stop_if_array(x: Any) -> Any:
     checkpointing is active), and jax.lax.stop_gradient only accepts arrays.
     """
     return jax.lax.stop_gradient(x) if eqx.is_array(x) else x
-
-
-@_register_pytree
-@dataclass
-class ModelCache:
-    """Full model cache: layer caches + final norm state.
-
-    This cache structure holds all streaming state for the model:
-    - One LayerCache per decoder layer (attention, norm, EMA state)
-    - One NormState for the final TimestepNorm
-
-    Note: layer_caches must be a tuple (not list) for JAX pytree compatibility.
-    """
-
-    layer_caches: tuple[LayerCache | None, ...]
-    final_norm: NormState | None = None
 
 
 # -----------------------------------------------------------------------------
@@ -361,10 +316,9 @@ class MegalodonModel(eqx.Module):
             f"input_ids contain out-of-bounds values. Valid range: [0, {vocab_size})",
         )
 
-        # Embedding with optional scaling
-        # eqx.nn.Embedding takes scalar indices, so vmap over batch and sequence
+        # Embedding with optional scaling (direct gather over vocab)
         # Cast scale to embedding dtype to preserve bf16/mixed-precision execution
-        x = jax.vmap(jax.vmap(self.embed))(input_ids)
+        x = self.embed.weight[input_ids]
         if self.scale != 1.0:
             x = x * jnp.asarray(self.scale, dtype=x.dtype)
 
@@ -548,8 +502,9 @@ class MegalodonForCausalLM(eqx.Module):
             logits = hidden @ self.model.embed.weight.T
         else:
             # Separate LM head
-            # eqx.nn.Linear takes single vectors, so vmap over batch and sequence
-            logits = jax.vmap(jax.vmap(self.lm_head))(hidden)
+            logits = jnp.matmul(hidden, self.lm_head.weight.T)
+            if self.lm_head.bias is not None:
+                logits = logits + self.lm_head.bias
 
         return logits, cache
 

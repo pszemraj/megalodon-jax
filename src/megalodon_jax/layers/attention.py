@@ -119,7 +119,8 @@ def attention_single_chunk(
         if key is None:
             raise ValueError("PRNG key required for dropout")
         keep_mask = jax.random.bernoulli(key, 1.0 - dropout_rate, attn_weights.shape)
-        attn_weights = jnp.where(keep_mask, attn_weights / (1.0 - dropout_rate), 0.0)
+        inv_keep = jnp.asarray(1.0 / (1.0 - dropout_rate), dtype=attn_weights.dtype)
+        attn_weights = attn_weights * keep_mask.astype(attn_weights.dtype) * inv_keep
 
     # Apply to values: (B, H, L_q, Dv) -> (B, L_q, H, Dv)
     out = jnp.einsum("bhqk,bkhd->bqhd", attn_weights, v.astype(jnp.float32))
@@ -1329,6 +1330,7 @@ class NormalizedFFN(eqx.Module):
         residual = x if residual_base is None else residual_base
 
         # Layer norm
+        # eqx.nn.LayerNorm expects per-example inputs, so vmap over batch/seq.
         h = jax.vmap(jax.vmap(self.norm))(x)
 
         # Hidden layer with activation

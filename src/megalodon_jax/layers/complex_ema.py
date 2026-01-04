@@ -193,13 +193,16 @@ class ComplexEMA(eqx.Module):
             return (gp[:, :, None] * q_pows).sum(axis=1)  # (D, chunk) complex
 
         # Compute full kernel
-        kernel = jnp.concatenate(
-            [
-                compute_kernel_chunk(start, min(start + FFT_KERNEL_CHUNK, L))
-                for start in range(0, L, FFT_KERNEL_CHUNK)
-            ],
-            axis=-1,
-        )  # (D, L) complex
+        if L <= FFT_KERNEL_CHUNK:
+            kernel = compute_kernel_chunk(0, L)
+        else:
+            kernel = jnp.concatenate(
+                [
+                    compute_kernel_chunk(start, min(start + FFT_KERNEL_CHUNK, L))
+                    for start in range(0, L, FFT_KERNEL_CHUNK)
+                ],
+                axis=-1,
+            )  # (D, L) complex
 
         # FFT convolution using rfft for efficiency (x is real)
         fft_len = 1 << int(2 * L - 1).bit_length()

@@ -121,3 +121,19 @@ class LayerCache:
     norm: NormState | None = None
     ema: EMAState | None = None
     position: Int[Array, ""] = field(default_factory=_default_position)
+
+
+@_register_pytree
+@dataclass
+class ModelCache:
+    """Full model cache: layer caches + final norm state.
+
+    This cache structure holds all streaming state for the model:
+    - One LayerCache per decoder layer (attention, norm, EMA state)
+    - One NormState for the final TimestepNorm
+
+    Note: layer_caches must be a tuple (not list) for JAX pytree compatibility.
+    """
+
+    layer_caches: tuple[LayerCache | None, ...]
+    final_norm: NormState | None = None
