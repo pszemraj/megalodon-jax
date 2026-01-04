@@ -9,6 +9,7 @@ from typing import Any
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array
 
 from megalodon_jax.config import MegalodonConfig
@@ -49,6 +50,91 @@ def _validate_shape(
             f"  Expected:   {expected}\n"
             f"Check that config matches the checkpoint."
         )
+
+
+def _jax_to_numpy(x: Any) -> np.ndarray:
+    """Host-copy a JAX array (or tensor-like) to numpy."""
+
+    return np.array(jax.device_get(x))
+
+
+def convert_jax_to_torch(
+    model: MegalodonForCausalLM,
+) -> StateDict:
+    """Convert a JAX Megalodon model to a PyTorch-style state dict."""
+    import torch
+
+    state_dict: StateDict = {}
+    cfg = model.config
+
+    def to_torch(arr: Any) -> Any:
+        return torch.from_numpy(_jax_to_numpy(arr))
+
+    state_dict["model.embed.weight"] = to_torch(model.model.embed.weight)
+
+    for i, layer in enumerate(model.model.layers):
+        attn_prefix = f"model.layers.{i}.attn"
+        ffn_prefix = f"model.layers.{i}.ffn"
+
+        # TimestepNorm
+        if layer.attn.timenorm.weight is not None:
+            state_dict[f"{attn_prefix}.timenorm.weight"] = to_torch(layer.attn.timenorm.weight)
+        if layer.attn.timenorm.bias is not None:
+            state_dict[f"{attn_prefix}.timenorm.bias"] = to_torch(layer.attn.timenorm.bias)
+
+        # CEMA
+        state_dict[f"{attn_prefix}.cema.alpha"] = to_torch(layer.attn.cema.alpha)
+        state_dict[f"{attn_prefix}.cema.delta"] = to_torch(layer.attn.cema.delta)
+        state_dict[f"{attn_prefix}.cema.theta"] = to_torch(layer.attn.cema.theta)
+        state_dict[f"{attn_prefix}.cema.gamma_real"] = to_torch(layer.attn.cema.gamma_real)
+        state_dict[f"{attn_prefix}.cema.gamma_imag"] = to_torch(layer.attn.cema.gamma_imag)
+        state_dict[f"{attn_prefix}.cema.omega"] = to_torch(layer.attn.cema.omega)
+
+        # RMSNorm
+        if layer.attn.rmsnorm.gamma is not None:
+            state_dict[f"{attn_prefix}.rmsnorm.gamma"] = to_torch(layer.attn.rmsnorm.gamma)
+
+        # Linear projections
+        for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
+            proj = getattr(layer.attn, proj_name)
+            state_dict[f"{attn_prefix}.{proj_name}.weight"] = to_torch(proj.weight)
+            if proj.bias is not None:
+                state_dict[f"{attn_prefix}.{proj_name}.bias"] = to_torch(proj.bias)
+
+        state_dict[f"{attn_prefix}.gamma"] = to_torch(layer.attn.gamma)
+        state_dict[f"{attn_prefix}.beta"] = to_torch(layer.attn.beta)
+
+        # Rotary embedding
+        state_dict[f"{attn_prefix}.inner.rope.inv_freq"] = to_torch(
+            layer.attn.inner.rotary.inv_freq
+        )
+
+        # FFN norms
+        if layer.ffn.norm.weight is not None:
+            state_dict[f"{ffn_prefix}.norm.weight"] = to_torch(layer.ffn.norm.weight)
+        if layer.ffn.norm.bias is not None:
+            state_dict[f"{ffn_prefix}.norm.bias"] = to_torch(layer.ffn.norm.bias)
+
+        # FFN linear layers
+        for fc_name in ["fc1", "fc2", "fc3"]:
+            fc = getattr(layer.ffn, fc_name, None)
+            if fc is None:
+                continue
+            state_dict[f"{ffn_prefix}.{fc_name}.weight"] = to_torch(fc.weight)
+            if fc.bias is not None:
+                state_dict[f"{ffn_prefix}.{fc_name}.bias"] = to_torch(fc.bias)
+
+    # Final norm
+    if model.model.norm.weight is not None:
+        state_dict["model.norm.weight"] = to_torch(model.model.norm.weight)
+    if model.model.norm.bias is not None:
+        state_dict["model.norm.bias"] = to_torch(model.model.norm.bias)
+
+    # LM head (untied only)
+    if not model.tied and model.lm_head is not None:
+        state_dict["lm_head.weight"] = to_torch(model.lm_head.weight)
+
+    return state_dict
 
 
 def load_weights_from_torch(
@@ -360,3 +446,14 @@ def load_from_pretrained(
         model = jax.tree.map(cast_arrays, model)
 
     return model
+
+
+def save_safetensors(
+    model: MegalodonForCausalLM,
+    path: str | Path,
+) -> None:
+    """Save a MegalodonForCausalLM to SafeTensors (PyTorch format)."""
+    from safetensors.torch import save_file
+
+    state_dict = convert_jax_to_torch(model)
+    save_file(state_dict, str(path))
