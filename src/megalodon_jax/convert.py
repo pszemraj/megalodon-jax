@@ -65,7 +65,6 @@ def convert_jax_to_torch(
     import torch
 
     state_dict: StateDict = {}
-    cfg = model.config
 
     def to_torch(arr: Any) -> Any:
         return torch.from_numpy(_jax_to_numpy(arr))

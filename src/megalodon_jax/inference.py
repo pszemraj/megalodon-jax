@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import functools
-from typing import Callable
+from collections.abc import Callable
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
@@ -97,7 +96,7 @@ def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
     return ModelCache(layer_caches=trimmed_layers, final_norm=cache.final_norm)
 
 
-def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCache:
+def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache:
     """Select batch elements from a ModelCache (useful for beam search)."""
 
     def index_array(x: Array | None) -> Array | None:
@@ -152,7 +151,8 @@ def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCac
 # Sampling
 # ---------------------------------------------------------------------------
 
-def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, "batch"]:
+
+def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, batch]:
     """Deterministic argmax sampling."""
 
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -201,7 +201,7 @@ def sample_token(
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
-) -> Int[Array, "batch"]:
+) -> Int[Array, batch]:
     """Sample next token with temperature, top-k, and top-p."""
 
     if temperature == 0.0:
@@ -229,7 +229,7 @@ def _sample_fn(
     temperature: float,
     top_k: int | None,
     top_p: float | None,
-) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray], Int[Array, "batch"]]:
+) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray], Int[Array, batch]]:
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
     return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
@@ -279,11 +279,11 @@ def generate(
         first_token = jnp.where(finished, eos_token_id, first_token)
 
     def scan_step(
-        carry: tuple[ModelCache, Int[Array, "batch"], PRNGKeyArray, Bool[Array, "batch"]],
+        carry: tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
         _,
     ) -> tuple[
-        tuple[ModelCache, Int[Array, "batch"], PRNGKeyArray, Bool[Array, "batch"]],
-        Int[Array, "batch"],
+        tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
+        Int[Array, batch],
     ]:
         cached, last_token, rng, done = carry
 
