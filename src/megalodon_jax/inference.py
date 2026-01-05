@@ -249,10 +249,8 @@ def sample_token(
     else:
         work = _apply_top_k(work, top_k)
 
-    # Softmax in float32, guard against all -inf after filtering
-    probs = jax.nn.softmax(work, axis=-1)
-    log_probs = jnp.log(probs + 1e-9)
-    return jax.random.categorical(key, log_probs, axis=-1).astype(jnp.int32)
+    # Categorical accepts logits directly; keep float32 for numeric stability.
+    return jax.random.categorical(key, work, axis=-1).astype(jnp.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +282,11 @@ def generate(
     cache: ModelCache | None = None,
     return_cache: bool = False,
 ) -> tuple[Int[Array, "batch total_len"], ModelCache | None]:
-    """Autoregressive generation using a fixed-shape scan."""
+    """Autoregressive generation using a fixed-shape scan.
+
+    If return_cache is True and max_new_tokens == 1, the cache is advanced to
+    include the generated token.
+    """
 
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
@@ -296,12 +298,14 @@ def generate(
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
 
+    needs_cache = return_cache or max_new_tokens > 1
+
     # Prefill
     logits, cache = model(
         prompt_ids,
         attention_mask=attention_mask,
         cache=cache,
-        return_cache=True,
+        return_cache=needs_cache,
         deterministic=True,
     )
 
@@ -340,6 +344,13 @@ def generate(
         return (new_cache, next_token, rng, done), next_token
 
     if max_new_tokens == 1:
+        if return_cache:
+            _, cache = model(
+                first_token[:, None],
+                cache=cache,
+                return_cache=True,
+                deterministic=True,
+            )
         final_cache = cache if return_cache else None
         generated = first_token[:, None]
     else:

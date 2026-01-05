@@ -190,6 +190,26 @@ class TestSamplingAndGeneration:
         assert jnp.all(out1 >= 0)
         assert jnp.all(out1 < config.vocab_size)
 
+    def test_generate_single_token_updates_cache(self):
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+
+        out, cache = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            key=jax.random.PRNGKey(123),
+            temperature=0.0,
+            return_cache=True,
+        )
+
+        assert out.shape == (1, 4)
+        assert cache is not None
+        layer0 = cache.layer_caches[0]
+        assert layer0 is not None and layer0.attn is not None
+        assert int(layer0.attn.count) == prompt.shape[1] + 1
+
     def test_generate_zero_new_tokens_raises(self):
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
