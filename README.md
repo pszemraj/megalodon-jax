@@ -8,7 +8,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
 - JAX pytree caches for JIT-compatible streaming inference
 - Weight conversion utilities for PyTorch ↔ JAX interop
-- 165 tests covering parity with PyTorch reference
+- 180+ tests covering parity with PyTorch reference
 
 ## Installation
 

@@ -4,14 +4,14 @@
 
 Pure JAX/Equinox reimplementation of Megalodon. No CUDA kernels-all paths are JIT-compiled XLA.
 
-### Key Differences from PyTorch Reference
+### Key Differences from Upstream Reference
 
-| Component    | PyTorch Reference   | This Implementation                                   |
-| ------------ | ------------------- | ----------------------------------------------------- |
-| EMA          | Fused CUDA kernel   | JAX FFT path (training) / sequential scan (inference) |
-| TimestepNorm | Fused CUDA w/ Kahan | Vectorized Welford w/ fp32 accumulators               |
-| Attention    | SDPA + DropKey      | jnp.einsum, manual chunked attention                  |
-| Parallelism  | 4D chunk-parallel   | Single-device only                                    |
+| Component    | Upstream Reference (custom kernels) | This Implementation (JAX)                              |
+| ------------ | ----------------------------------- | ------------------------------------------------------ |
+| EMA          | Fused CUDA kernels                  | FFT path (training) / sequential scan (inference)      |
+| TimestepNorm | Fused CUDA w/ Kahan                 | Vectorized Welford w/ fp32 accumulators                |
+| Attention    | Fused SDPA + DropKey                | jnp.einsum, manual chunked attention                   |
+| Parallelism  | 4D chunk-parallel                   | Single-device only                                     |
 
 ### Performance Characteristics
 
@@ -32,7 +32,7 @@ The paper's chunk-parallel axis requires multi-device coordination and sharded K
 
 ### Sequential CEMA is Slow
 
-When `return_cache=True`, CEMA uses `jax.lax.scan` over timesteps. This is correct but ~10-100x slower than the FFT path. The reference uses fused CUDA kernels to return last-state cheaply. In JAX, `return_cache` now defaults to False and is automatically disabled when `deterministic=False`, matching the PyTorch training guard; opt in to caching explicitly for streaming inference.
+When `return_cache=True`, CEMA uses `jax.lax.scan` over timesteps. This is correct but ~10-100x slower than the FFT path. The reference uses fused CUDA kernels to return last-state cheaply. In JAX, `return_cache` defaults to False and is automatically disabled when `deterministic=False` to keep training on the FFT path; opt in to caching explicitly for streaming inference.
 
 ## Optional Experiments
 
@@ -87,9 +87,9 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Testing
 
-166 tests covering:
+180+ tests covering:
 
-- Parity with PyTorch reference (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
+- Parity with the reference implementation (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
 - JIT stability: no retracing on repeated calls with same shapes
 - GPU/CPU coverage via pytest fixtures

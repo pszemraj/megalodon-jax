@@ -1,47 +1,48 @@
-# EMA Hidden State: Upstream vs Pure PyTorch
+# EMA Implementation (JAX)
 
-This note summarizes how the original Megalodon implementation computes the EMA hidden state and how this repo mirrors the behavior in pure PyTorch without custom kernels.
+This note describes the JAX ComplexEMA implementation in this repo
+(`src/megalodon_jax/layers/complex_ema.py`) and how it relates to the upstream
+reference.
 
-## Upstream (CUDA-heavy) Implementation
+## Upstream Reference (Context)
 
-Source: third_party/upstream-megalodon. Key points:
+- The output is computed via FFT-based convolution when no streaming state is
+  required.
+- The final streaming state is produced by a fused kernel to avoid Python-side
+  loops.
 
-- The output is computed as an FFT-based convolution: coefficients are produced by `ema_parameters(p, q, gamma, hx, length)`, then applied via `fftconv(x, k)` (with CUDA fast paths in a length window).
-- When `hx` is provided, `ema_parameters` returns an additional bias term `b` that accounts for the contribution of the initial hidden state to the outputs.
-- The final hidden state for streaming (`hx_next`) is produced by a fused kernel (`ema_hidden`), which avoids an explicit Python loop over timesteps.
+## JAX Implementation
 
-## This Repo (Pure PyTorch)
+The JAX version provides two numerically equivalent paths:
 
-We provide two equivalent numerical paths:
+1. **FFT path (training / no state)**  
+   When no state is requested, ComplexEMA builds the EMA kernel and applies an
+   FFT-based convolution (O(L log L)).
 
-- FFT convolution (training): builds the EMA kernel over the current sequence and uses FFT-based convolution to compute the output when no cache is requested.
-- Sequential recurrence (streaming): updates the EMA state `h_t = q ⊙ h_{t-1} + p ⊙ x_t` one step at a time when cache/streaming is needed.
+2. **Sequential path (streaming)**  
+   When `h_init` is provided or `return_state=True`, ComplexEMA runs the
+   recurrence with `jax.lax.scan` (O(L)) and returns the final complex state.
 
-Rationale for divergence:
+### Path Selection
 
-- Upstream's "sequential" hidden-state path is fast because it relies on hand-tuned CUDA or cuBLAS. In pure PyTorch, a per-timestep recurrence is much slower. Using FFT for the no-cache case achieves competitive throughput while keeping correctness.
-- When cache is needed (streaming inference), correctness requires the stepwise recurrence; we keep a vectorized recurrence with disabled autocast inside the block to protect stability.
+- **FFT** when `h_init is None` and `return_state is False`
+- **Sequential** otherwise
 
-## Stability Practices Kept
+### Mask Handling
 
-- Coefficients follow upstream alpha/delta/theta parameterization: `|q| = 1 - alpha * delta` stays inside the unit circle by construction.
-- EMA accumulates in float32/complex64; autocast is disabled inside EMA paths.
-- FFT constructs powers via magnitude/phase (`|q|^t * exp(i * phi * t)`) to avoid cumprod error accumulation and `log(0)` NaNs.
+If a boolean `mask` is provided, masked positions are zeroed before the
+recurrence. This prevents padded tokens from contaminating the EMA state. This
+is intentionally more conservative than the upstream behavior.
 
-## Training Default
+## Stability Notes
 
-- Training now disables caches internally so the FFT path is always used in forward/backward. Sequential EMA remains for streaming inference and when callers explicitly request cache.
+- Coefficients are computed in float32/complex64 regardless of parameter dtype.
+- `|q| < 1` by construction, ensuring a decaying impulse response.
+- Kernel powers use magnitude/phase (`|q|^t * exp(i * phi * t)`) to avoid
+  numerical issues with cumprod or `log(0)`.
 
-## Optional Speed-Up for Sequential Path
+## Performance Notes
 
-- `torch.compile` can reduce the Python overhead of the recurrence. Compile the model (or just the `ComplexEMA` module) yourself, for example:
-
-```python
-import torch
-from megalodon import MegalodonForCausalLM, MegalodonConfig
-
-model = MegalodonForCausalLM(MegalodonConfig()).cuda()
-model = torch.compile(model, mode="default")  # PyTorch 2.1+
-```
-
-- Ensure you compile before the first forward pass. No additional flags or environment variables are required.
+The sequential path is much slower than the FFT path in pure JAX. For training,
+keep `return_cache=False` so the FFT path is used; use the sequential path only
+for streaming inference or when you explicitly need the EMA state.
