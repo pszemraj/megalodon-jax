@@ -224,6 +224,43 @@ class TestSamplingAndGeneration:
                 temperature=0.0,
             )
 
+    def test_generate_uses_last_valid_token_with_padding(self):
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        prompt = jnp.array(
+            [
+                [1, 2, 3, 4, 5],
+                [6, 7, 8, 0, 0],
+            ],
+            dtype=jnp.int32,
+        )
+        attention_mask = jnp.array(
+            [
+                [True, True, True, True, True],
+                [True, True, True, False, False],
+            ]
+        )
+
+        logits, _ = model(prompt, attention_mask=attention_mask, return_cache=False)
+        valid_counts = attention_mask.sum(axis=1).astype(jnp.int32)
+        last_idx = valid_counts - 1
+        gather_idx = jnp.broadcast_to(last_idx[:, None, None], (2, 1, logits.shape[-1]))
+        last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+        expected = jnp.argmax(last_logits, axis=-1)
+
+        out, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            key=jax.random.PRNGKey(123),
+            temperature=0.0,
+            attention_mask=attention_mask,
+            return_cache=False,
+        )
+
+        np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
+
 
 class TestConversion:
     """Weight conversion + SafeTensors roundtrip."""

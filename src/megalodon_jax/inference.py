@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Callable
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
@@ -309,8 +310,23 @@ def generate(
         deterministic=True,
     )
 
+    if attention_mask is not None:
+        mask = attention_mask.astype(jnp.bool_)
+        valid_counts = mask.sum(axis=1).astype(jnp.int32)
+        has_empty = jnp.any(valid_counts == 0)
+        valid_counts = eqx.error_if(
+            valid_counts,
+            has_empty,
+            "attention_mask must contain at least one True per batch element.",
+        )
+        last_idx = valid_counts - 1
+        gather_idx = jnp.broadcast_to(last_idx[:, None, None], (B, 1, logits.shape[-1]))
+        last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+    else:
+        last_logits = logits[:, -1, :]
+
     key, subkey = jax.random.split(key)
-    first_token = sample(logits[:, -1, :], subkey)
+    first_token = sample(last_logits, subkey)
 
     finished = jnp.zeros((B,), dtype=jnp.bool_)
     if eos_token_id is not None:
