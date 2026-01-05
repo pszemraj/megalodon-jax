@@ -377,8 +377,17 @@ def generate(
             None,
             length=max_new_tokens - 1,
         )
-        final_cache = final_carry[0] if return_cache else None
         generated = jnp.concatenate([first_token[:, None], tokens_scan.T], axis=1)
+        if return_cache:
+            last_token = generated[:, -1]
+            _, final_cache = model(
+                last_token[:, None],
+                cache=final_carry[0],
+                return_cache=True,
+                deterministic=True,
+            )
+        else:
+            final_cache = None
 
     result = jnp.concatenate([prompt_ids, generated], axis=1)
     return result, final_cache
