@@ -135,7 +135,7 @@ src/megalodon_jax/
 ## Limitations
 
 - Pure JAX implementation (no fused CUDA kernels)
-- Sequential CEMA path is slower than FFT; training uses FFT automatically
+- Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
 - CEMA zeros masked positions before recurrence to avoid padding contamination (differs from PyTorch)
 

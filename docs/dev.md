@@ -30,9 +30,16 @@ Pure JAX without custom XLA ops. Performance is adequate for research/testing bu
 
 The paper's chunk-parallel axis requires multi-device coordination and sharded KV/state exchange. Out of scope for single-device.
 
-### Sequential CEMA is Slow
+### Sequential CEMA vs FFT
 
-When `return_cache=True`, CEMA uses `jax.lax.scan` over timesteps. This is correct but ~10-100x slower than the FFT path. The reference uses fused CUDA kernels to return last-state cheaply. In JAX, `return_cache` defaults to False and is automatically disabled when `deterministic=False` to keep training on the FFT path; opt in to caching explicitly for streaming inference.
+When `return_state=True`, CEMA uses `jax.lax.scan` over timesteps. This is ~6x slower than FFT at 4k tokens (26ms vs 0.25ms). However, **JAX is ~5x faster than PyTorch** for both paths:
+
+| Seq Len | PyTorch FFT | JAX FFT | PyTorch Seq | JAX Seq |
+|---------|-------------|---------|-------------|---------|
+| 1024 | 0.31ms | 0.11ms | 38.5ms | 6.8ms |
+| 4096 | 1.27ms | 0.25ms | 153ms | 26ms |
+
+Training uses FFT automatically (`return_state=False`). Sequential path is only for streaming inference where state must be preserved.
 
 ## Optional Experiments
 
