@@ -51,6 +51,20 @@ next_token = jax.random.randint(key, (1, 1), 0, cfg.vocab_size)
 next_logits, new_cache = model(next_token, cache=cache, return_cache=True)
 ```
 
+```python
+from megalodon_jax.inference import generate
+
+# Autoregressive generation (sampling returns the next PRNG key)
+prompt_ids = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+tokens, cache, key = generate(
+    model,
+    prompt_ids,
+    max_new_tokens=16,
+    key=key,
+    temperature=1.0,
+)
+```
+
 ### Training with Loss
 
 ```python

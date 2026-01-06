@@ -170,14 +170,14 @@ class TestSamplingAndGeneration:
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
         key = jax.random.PRNGKey(42)
-        out1, _ = generate(
+        out1, _, key1 = generate(
             model,
             prompt,
             max_new_tokens=4,
             key=key,
             temperature=0.0,  # greedy for determinism
         )
-        out2, _ = generate(
+        out2, _, key2 = generate(
             model,
             prompt,
             max_new_tokens=4,
@@ -187,6 +187,7 @@ class TestSamplingAndGeneration:
 
         assert out1.shape == (1, 7)
         np.testing.assert_array_equal(np.array(out1), np.array(out2))
+        np.testing.assert_array_equal(np.array(key1), np.array(key2))
         assert jnp.all(out1 >= 0)
         assert jnp.all(out1 < config.vocab_size)
 
@@ -195,7 +196,7 @@ class TestSamplingAndGeneration:
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
-        out, cache = generate(
+        out, cache, _ = generate(
             model,
             prompt,
             max_new_tokens=1,
@@ -215,7 +216,7 @@ class TestSamplingAndGeneration:
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
-        out, cache = generate(
+        out, cache, _ = generate(
             model,
             prompt,
             max_new_tokens=3,
@@ -263,13 +264,14 @@ class TestSamplingAndGeneration:
         )
 
         logits, _ = model(prompt, attention_mask=attention_mask, return_cache=False)
-        valid_counts = attention_mask.sum(axis=1).astype(jnp.int32)
-        last_idx = valid_counts - 1
+        positions = jnp.arange(prompt.shape[1], dtype=jnp.int32)
+        masked_positions = jnp.where(attention_mask, positions, -1)
+        last_idx = masked_positions.max(axis=1)
         gather_idx = jnp.broadcast_to(last_idx[:, None, None], (2, 1, logits.shape[-1]))
         last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
         expected = jnp.argmax(last_logits, axis=-1)
 
-        out, _ = generate(
+        out, _, _ = generate(
             model,
             prompt,
             max_new_tokens=1,
@@ -280,6 +282,72 @@ class TestSamplingAndGeneration:
         )
 
         np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
+
+    def test_generate_uses_last_valid_token_with_left_padding(self):
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        prompt = jnp.array(
+            [
+                [0, 0, 1, 2, 3],
+                [0, 4, 5, 6, 7],
+            ],
+            dtype=jnp.int32,
+        )
+        attention_mask = jnp.array(
+            [
+                [False, False, True, True, True],
+                [False, True, True, True, True],
+            ]
+        )
+
+        logits, _ = model(prompt, attention_mask=attention_mask, return_cache=False)
+        positions = jnp.arange(prompt.shape[1], dtype=jnp.int32)
+        masked_positions = jnp.where(attention_mask, positions, -1)
+        last_idx = masked_positions.max(axis=1)
+        gather_idx = jnp.broadcast_to(last_idx[:, None, None], (2, 1, logits.shape[-1]))
+        last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+        expected = jnp.argmax(last_logits, axis=-1)
+
+        out, _, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            key=jax.random.PRNGKey(123),
+            temperature=0.0,
+            attention_mask=attention_mask,
+            return_cache=False,
+        )
+
+        np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
+
+    def test_generate_empty_prompt_uses_bos(self):
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.empty((1, 0), dtype=jnp.int32)
+
+        out, _, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            temperature=0.0,
+        )
+
+        assert out.shape == (1, 2)
+        assert int(out[0, 0]) == config.bos_token_id
+
+    def test_generate_sampling_requires_key_or_seed(self):
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="key or seed"):
+            generate(
+                model,
+                prompt,
+                max_new_tokens=1,
+                temperature=1.0,
+            )
 
 
 class TestConversion:

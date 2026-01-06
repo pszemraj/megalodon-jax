@@ -238,6 +238,13 @@ def sample_token(
 ) -> Int[Array, batch]:
     """Sample next token with temperature, top-k, and top-p."""
 
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be >= 0, got {temperature}")
+    if top_k is not None and top_k < 0:
+        raise ValueError(f"top_k must be >= 0, got {top_k}")
+    if temperature != 0.0 and top_p is not None and not (0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+
     if temperature == 0.0:
         return greedy_token(logits)
 
@@ -263,7 +270,7 @@ def _sample_fn(
     temperature: float,
     top_k: int | None,
     top_p: float | None,
-) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray], Int[Array, batch]]:
+) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, batch]]:
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
     return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
@@ -273,20 +280,23 @@ def generate(
     model: MegalodonForCausalLM,
     prompt_ids: Int[Array, "batch prompt_len"],
     max_new_tokens: int,
-    key: PRNGKeyArray,
+    key: PRNGKeyArray | None = None,
     *,
+    seed: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
+    bos_token_id: int | None = None,
     eos_token_id: int | None = None,
     attention_mask: Bool[Array, "batch prompt_len"] | None = None,
     cache: ModelCache | None = None,
     return_cache: bool = False,
-) -> tuple[Int[Array, "batch total_len"], ModelCache | None]:
+) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
     """Autoregressive generation using a fixed-shape scan.
 
     If return_cache is True and max_new_tokens == 1, the cache is advanced to
-    include the generated token.
+    include the generated token. If sampling is enabled (temperature > 0),
+    the returned key is the next key to use for subsequent sampling calls.
     """
 
     if max_new_tokens < 0:
@@ -296,8 +306,28 @@ def generate(
             "max_new_tokens must be > 0 to generate; Transformers treats this as an invalid length."
         )
 
+    if seed is not None and key is not None:
+        raise ValueError("Specify only one of key or seed (not both).")
+
+    needs_rng = temperature != 0.0
+    if key is None and seed is not None:
+        key = jax.random.PRNGKey(seed)
+    if needs_rng and key is None:
+        raise ValueError("key or seed is required when temperature > 0.")
+
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
+
+    if prompt_len == 0:
+        if bos_token_id is None:
+            bos_token_id = getattr(model.config, "bos_token_id", None)
+        if bos_token_id is None:
+            raise ValueError(
+                "prompt_ids is empty; provide bos_token_id or pass at least one token."
+            )
+        prompt_ids = jnp.full((B, 1), bos_token_id, dtype=prompt_ids.dtype)
+        attention_mask = jnp.ones((B, 1), dtype=jnp.bool_)
+        prompt_len = 1
 
     needs_cache = return_cache or max_new_tokens > 1
 
@@ -312,20 +342,24 @@ def generate(
 
     if attention_mask is not None:
         mask = attention_mask.astype(jnp.bool_)
-        valid_counts = mask.sum(axis=1).astype(jnp.int32)
-        has_empty = jnp.any(valid_counts == 0)
-        valid_counts = eqx.error_if(
-            valid_counts,
+        positions = jnp.arange(prompt_len, dtype=jnp.int32)
+        masked_positions = jnp.where(mask, positions, -1)
+        last_idx = masked_positions.max(axis=1)
+        has_empty = jnp.any(last_idx < 0)
+        last_idx = eqx.error_if(
+            last_idx,
             has_empty,
             "attention_mask must contain at least one True per batch element.",
         )
-        last_idx = valid_counts - 1
         gather_idx = jnp.broadcast_to(last_idx[:, None, None], (B, 1, logits.shape[-1]))
         last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
     else:
         last_logits = logits[:, -1, :]
 
-    key, subkey = jax.random.split(key)
+    if needs_rng:
+        key, subkey = jax.random.split(key)
+    else:
+        subkey = None
     first_token = sample(last_logits, subkey)
 
     finished = jnp.zeros((B,), dtype=jnp.bool_)
@@ -333,31 +367,60 @@ def generate(
         finished = first_token == eos_token_id
         first_token = jnp.where(finished, eos_token_id, first_token)
 
-    def scan_step(
-        carry: tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
-        _,
-    ) -> tuple[
-        tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
-        Int[Array, batch],
-    ]:
-        cached, last_token, rng, done = carry
+    if needs_rng:
 
-        logits_step, new_cache = model(
-            last_token[:, None],
-            cache=cached,
-            return_cache=True,
-            deterministic=True,
-        )
+        def scan_step(
+            carry: tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
+            _,
+        ) -> tuple[
+            tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
+            Int[Array, batch],
+        ]:
+            cached, last_token, rng, done = carry
 
-        rng, sub = jax.random.split(rng)
-        next_token = sample(logits_step[:, 0, :], sub)
+            logits_step, new_cache = model(
+                last_token[:, None],
+                cache=cached,
+                return_cache=True,
+                deterministic=True,
+            )
 
-        if eos_token_id is not None:
-            newly_done = next_token == eos_token_id
-            done = done | newly_done
-            next_token = jnp.where(done, eos_token_id, next_token)
+            rng, sub = jax.random.split(rng)
+            next_token = sample(logits_step[:, 0, :], sub)
 
-        return (new_cache, next_token, rng, done), next_token
+            if eos_token_id is not None:
+                newly_done = next_token == eos_token_id
+                done = done | newly_done
+                next_token = jnp.where(done, eos_token_id, next_token)
+
+            return (new_cache, next_token, rng, done), next_token
+
+    else:
+
+        def scan_step(
+            carry: tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
+            _,
+        ) -> tuple[
+            tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
+            Int[Array, batch],
+        ]:
+            cached, last_token, done = carry
+
+            logits_step, new_cache = model(
+                last_token[:, None],
+                cache=cached,
+                return_cache=True,
+                deterministic=True,
+            )
+
+            next_token = sample(logits_step[:, 0, :], None)
+
+            if eos_token_id is not None:
+                newly_done = next_token == eos_token_id
+                done = done | newly_done
+                next_token = jnp.where(done, eos_token_id, next_token)
+
+            return (new_cache, next_token, done), next_token
 
     if max_new_tokens == 1:
         if return_cache:
@@ -369,20 +432,35 @@ def generate(
             )
         final_cache = cache if return_cache else None
         generated = first_token[:, None]
+        final_key = key
     else:
-        init_carry = (cache, first_token, key, finished)
-        final_carry, tokens_scan = jax.lax.scan(
-            scan_step,
-            init_carry,
-            None,
-            length=max_new_tokens - 1,
-        )
+        if needs_rng:
+            init_carry = (cache, first_token, key, finished)
+            final_carry, tokens_scan = jax.lax.scan(
+                scan_step,
+                init_carry,
+                None,
+                length=max_new_tokens - 1,
+            )
+            scan_cache = final_carry[0]
+            final_key = final_carry[2]
+        else:
+            init_carry = (cache, first_token, finished)
+            final_carry, tokens_scan = jax.lax.scan(
+                scan_step,
+                init_carry,
+                None,
+                length=max_new_tokens - 1,
+            )
+            scan_cache = final_carry[0]
+            final_key = key
+
         generated = jnp.concatenate([first_token[:, None], tokens_scan.T], axis=1)
         if return_cache:
             last_token = generated[:, -1]
             _, final_cache = model(
                 last_token[:, None],
-                cache=final_carry[0],
+                cache=scan_cache,
                 return_cache=True,
                 deterministic=True,
             )
@@ -390,7 +468,7 @@ def generate(
             final_cache = None
 
     result = jnp.concatenate([prompt_ids, generated], axis=1)
-    return result, final_cache
+    return result, final_cache, final_key
 
 
 # Convenience JIT wrapper for generation with static knobs
@@ -401,6 +479,7 @@ generate_jit = jax.jit(
         "temperature",
         "top_k",
         "top_p",
+        "bos_token_id",
         "eos_token_id",
         "return_cache",
     ),

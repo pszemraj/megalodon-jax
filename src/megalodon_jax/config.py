@@ -36,6 +36,8 @@ class MegalodonConfig:
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
     pad_token_id: int = 0
+    bos_token_id: int = 1
+    eos_token_id: int = 2
     max_positions: int = 1_000_000
     init_mode: InitMode = "gaussian"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
