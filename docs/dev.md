@@ -75,11 +75,18 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 
 ## Weight Conversion
 
-`convert.py` provides `load_weights_from_torch()` for PyTorch checkpoint loading with:
+`convert.py` provides bidirectional PyTorch ↔ JAX conversion:
 
+**JAX → PyTorch** (`convert_jax_to_torch`):
+- Exports all weights including `lm_head.weight` for tied models (PyTorch strict loading compatibility)
+- Uses `.clone()` on tied weights to avoid SafeTensors shared memory errors
+- Compatible with `safetensors.torch.save_file`
+
+**PyTorch → JAX** (`load_weights_from_torch`):
 - Shape validation on critical weights (embed, cema.alpha, wz, fc1, lm_head)
 - Layer count validation before loading
 - Clear error messages for config/checkpoint mismatch
+- Handles both tied and untied LM heads
 
 ## Cache Design
 
@@ -87,7 +94,7 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Testing
 
-180+ tests covering:
+190+ tests covering:
 
 - Parity with the reference implementation (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)

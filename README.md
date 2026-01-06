@@ -8,7 +8,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
 - JAX pytree caches for JIT-compatible streaming inference
 - Weight conversion utilities for PyTorch ↔ JAX interop
-- 180+ tests covering parity with PyTorch reference
+- 190+ tests covering parity with PyTorch reference
 
 ## Installation
 
@@ -18,7 +18,7 @@ cd megalodon-jax
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.10+ with JAX 0.4.30+, Equinox 0.11.9+.
+Requires Python 3.10+ with JAX 0.4.30+ (tested with 0.8.x), Equinox 0.11.9+.
 
 ## Quick Start
 
