@@ -390,3 +390,141 @@ class TestConversion:
             rtol=1e-5,
             atol=1e-5,
         )
+
+    def test_tied_model_export_has_lm_head(self):
+        """Tied model should export lm_head.weight for PyTorch strict loading."""
+        config = small_config()  # default is tied (output_size=-1)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        assert model.tied, "Default model should be tied"
+
+        state_dict = convert_jax_to_torch(model)
+
+        # Must have lm_head.weight for PyTorch strict loading compatibility
+        assert "lm_head.weight" in state_dict
+        assert "model.embed.weight" in state_dict
+
+        # For tied models, lm_head.weight should equal embed.weight
+        np.testing.assert_array_equal(
+            state_dict["lm_head.weight"].numpy(),
+            state_dict["model.embed.weight"].numpy(),
+        )
+
+    def test_untied_model_export(self):
+        """Untied model should export separate lm_head.weight."""
+        config = MegalodonConfig(
+            vocab_size=64,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            output_size=32,  # Different from vocab_size -> untied
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        assert not model.tied, "Model should be untied with output_size != vocab_size"
+
+        state_dict = convert_jax_to_torch(model)
+
+        assert "lm_head.weight" in state_dict
+        assert "model.embed.weight" in state_dict
+
+        # For untied, shapes should differ
+        assert state_dict["lm_head.weight"].shape[0] == 32
+        assert state_dict["model.embed.weight"].shape[0] == 64
+
+    def test_shape_validation_error(self):
+        """Shape mismatch between config and checkpoint should raise ValueError."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state_dict = convert_jax_to_torch(model)
+
+        # Create model with different model_dim
+        config_wrong = MegalodonConfig(
+            vocab_size=64,
+            model_dim=128,  # Different from state_dict
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+        )
+        model_wrong = MegalodonForCausalLM(config_wrong, key=jax.random.PRNGKey(1))
+
+        with pytest.raises(ValueError, match="Shape mismatch"):
+            load_weights_from_torch(model_wrong, state_dict)
+
+    def test_layer_count_mismatch_error(self):
+        """Layer count mismatch should raise ValueError."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state_dict = convert_jax_to_torch(model)
+
+        # Create model with different layer count
+        config_wrong = MegalodonConfig(
+            vocab_size=64,
+            model_dim=64,
+            num_layers=2,  # Different from state_dict (1 layer)
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+        )
+        model_wrong = MegalodonForCausalLM(config_wrong, key=jax.random.PRNGKey(1))
+
+        with pytest.raises(ValueError, match="Layer count mismatch"):
+            load_weights_from_torch(model_wrong, state_dict)
+
+    def test_missing_key_error(self):
+        """Missing required key should raise KeyError."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state_dict = convert_jax_to_torch(model)
+
+        # Remove a required key
+        del state_dict["model.embed.weight"]
+
+        model_copy = MegalodonForCausalLM(config, key=jax.random.PRNGKey(1))
+
+        with pytest.raises(KeyError, match="model.embed.weight"):
+            load_weights_from_torch(model_copy, state_dict)
+
+    def test_dtype_casting(self, tmp_path):
+        """load_from_pretrained should cast to requested dtype."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        path = tmp_path / "model.safetensors"
+        save_safetensors(model, path)
+
+        loaded = load_from_pretrained(
+            str(path),
+            config=config,
+            dtype=jnp.bfloat16,
+            key=jax.random.PRNGKey(1),
+        )
+
+        # Check that floating point params are bf16
+        assert loaded.model.embed.weight.dtype == jnp.bfloat16
+
+    def test_missing_file_error(self):
+        """load_from_pretrained should raise FileNotFoundError for missing file."""
+        config = small_config()
+
+        with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
+            load_from_pretrained(
+                "/nonexistent/path/model.safetensors",
+                config=config,
+                key=jax.random.PRNGKey(0),
+            )

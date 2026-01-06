@@ -53,9 +53,11 @@ def _validate_shape(
 
 
 def _jax_to_numpy(x: Any) -> np.ndarray:
-    """Host-copy a JAX array (or tensor-like) to numpy."""
+    """Host-copy a JAX array (or tensor-like) to numpy.
 
-    return np.array(jax.device_get(x))
+    In JAX 0.8+, np.asarray() handles device transfer automatically.
+    """
+    return np.asarray(x)
 
 
 def convert_jax_to_torch(
@@ -129,9 +131,15 @@ def convert_jax_to_torch(
     if model.model.norm.bias is not None:
         state_dict["model.norm.bias"] = to_torch(model.model.norm.bias)
 
-    # LM head (untied only)
+    # LM head - always emit for PyTorch strict loading compatibility
     if not model.tied and model.lm_head is not None:
+        # Untied: use separate lm_head weights
         state_dict["lm_head.weight"] = to_torch(model.lm_head.weight)
+    elif model.tied:
+        # Tied: emit embed weight as lm_head.weight for PyTorch compatibility
+        # PyTorch MegalodonForCausalLM always has lm_head param (aliased when tied)
+        # Use .clone() to avoid SafeTensors shared memory error when saving
+        state_dict["lm_head.weight"] = to_torch(model.model.embed.weight).clone()
 
     return state_dict
 
