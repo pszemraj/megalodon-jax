@@ -65,6 +65,9 @@ tokens, cache, key = generate(
 )
 ```
 
+Note: when `attention_mask` contains padding and `max_new_tokens > 1`, generation groups
+by prompt length (left padding only) and does not support `return_cache=True`.
+
 ### Training with Loss
 
 ```python

@@ -90,7 +90,7 @@ class NormState:
 
     count: Int[Array, "batch"]  # tokens seen per batch element
     mean: Float[Array, "batch groups"]
-    var: Float[Array, "batch groups"]
+    var: Float[Array, "batch groups"]  # running variance estimate
 
 
 @_register_pytree

@@ -8,11 +8,12 @@ from collections.abc import Callable
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
-from megalodon_jax.types import AttentionCache, LayerCache, ModelCache, NormState
+from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -25,6 +26,8 @@ def init_cache(
     dtype: jnp.dtype = jnp.float32,
     *,
     allocate_kv: bool = False,
+    allocate_norm: bool = False,
+    allocate_ema: bool = False,
 ) -> ModelCache:
     """Create an empty ModelCache for autoregressive generation.
 
@@ -35,6 +38,8 @@ def init_cache(
         allocate_kv: If True, pre-allocate KV buffers; otherwise, leave None so the
             model allocates on first use (saves memory but changes shapes after
             the first call).
+        allocate_norm: If True, pre-allocate per-layer TimestepNorm state.
+        allocate_ema: If True, pre-allocate per-layer ComplexEMA state.
 
     Returns:
         ModelCache with per-layer caches and final norm state.
@@ -52,22 +57,29 @@ def init_cache(
         v = jnp.zeros((batch_size, cache_len, num_heads, value_head_dim), dtype=dtype)
         return AttentionCache(k=k, v=v, count=jnp.array(0, dtype=jnp.int32))
 
+    def make_norm_state() -> NormState:
+        return NormState(
+            count=jnp.zeros((batch_size,), dtype=jnp.int32),
+            mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=dtype),
+            var=jnp.ones((batch_size, config.norm_num_groups), dtype=dtype),
+        )
+
+    def make_ema_state() -> EMAState:
+        h = jnp.zeros((batch_size, config.model_dim, config.cema_ndim), dtype=jnp.complex64)
+        return EMAState(h=h)
+
     layer_caches = []
     for _ in range(config.num_layers):
         layer_caches.append(
             LayerCache(
                 attn=make_attn_cache(),
-                norm=None,
-                ema=None,
+                norm=make_norm_state() if allocate_norm else None,
+                ema=make_ema_state() if allocate_ema else None,
                 position=jnp.array(0, dtype=jnp.int32),
             )
         )
 
-    final_norm = NormState(
-        count=jnp.zeros((batch_size,), dtype=jnp.int32),
-        mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=dtype),
-        var=jnp.ones((batch_size, config.norm_num_groups), dtype=dtype),
-    )
+    final_norm = make_norm_state()
 
     return ModelCache(layer_caches=tuple(layer_caches), final_norm=final_norm)
 
@@ -120,7 +132,11 @@ def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
 
 
 def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache:
-    """Select batch elements from a ModelCache (useful for beam search)."""
+    """Select batch elements from a ModelCache.
+
+    Note: cache position/count fields are shared scalars; this is only valid
+    when all batch elements share the same history length.
+    """
 
     def index_array(x: Array | None) -> Array | None:
         if x is None:
@@ -250,7 +266,7 @@ def sample_token(
 
     work = logits.astype(jnp.float32)
     if temperature != 1.0:
-        work = work / temperature
+        work = work / jnp.asarray(temperature, dtype=work.dtype)
 
     if top_p is not None and top_p < 1.0:
         work = _apply_top_p(work, top_p, top_k=top_k)
@@ -276,13 +292,12 @@ def _sample_fn(
     return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
 
 
-def generate(
+def _generate_core(
     model: MegalodonForCausalLM,
     prompt_ids: Int[Array, "batch prompt_len"],
     max_new_tokens: int,
     key: PRNGKeyArray | None = None,
     *,
-    seed: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -306,14 +321,9 @@ def generate(
             "max_new_tokens must be > 0 to generate; Transformers treats this as an invalid length."
         )
 
-    if seed is not None and key is not None:
-        raise ValueError("Specify only one of key or seed (not both).")
-
     needs_rng = temperature != 0.0
-    if key is None and seed is not None:
-        key = jax.random.PRNGKey(seed)
     if needs_rng and key is None:
-        raise ValueError("key or seed is required when temperature > 0.")
+        raise ValueError("key is required when temperature > 0.")
 
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
@@ -471,16 +481,116 @@ def generate(
     return result, final_cache, final_key
 
 
+def generate(
+    model: MegalodonForCausalLM,
+    prompt_ids: Int[Array, "batch prompt_len"],
+    max_new_tokens: int,
+    key: PRNGKeyArray | None = None,
+    *,
+    seed: int | None = None,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+    bos_token_id: int | None = None,
+    eos_token_id: int | None = None,
+    attention_mask: Bool[Array, "batch prompt_len"] | None = None,
+    cache: ModelCache | None = None,
+    return_cache: bool = False,
+) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
+    """Autoregressive generation with optional padding-aware grouping.
+
+    When attention_mask contains padding and max_new_tokens > 1, prompts are
+    grouped by length (left padding only) and return_cache is disallowed.
+    """
+
+    if seed is not None and key is not None:
+        raise ValueError("Specify only one of key or seed (not both).")
+    if key is None and seed is not None:
+        key = jax.random.PRNGKey(seed)
+
+    if attention_mask is None:
+        return _generate_core(
+            model,
+            prompt_ids,
+            max_new_tokens,
+            key,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=None,
+            cache=cache,
+            return_cache=return_cache,
+        )
+
+    has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
+    needs_cache = return_cache or max_new_tokens > 1
+    if not has_padding or not needs_cache:
+        return _generate_core(
+            model,
+            prompt_ids,
+            max_new_tokens,
+            key,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=attention_mask,
+            cache=cache,
+            return_cache=return_cache,
+        )
+
+    if cache is not None:
+        raise ValueError(
+            "Cannot use cache with padded attention_mask. "
+            "Provide unpadded prompts or pass return_cache=False."
+        )
+    if return_cache:
+        raise ValueError(
+            "return_cache=True is not supported for padded batches. "
+            "Provide unpadded prompts or set return_cache=False."
+        )
+
+    mask_host = np.asarray(jax.device_get(attention_mask)).astype(bool)
+    B, Lmax = mask_host.shape
+    lens = mask_host.sum(axis=1).astype(np.int32)
+    for row in mask_host:
+        if not row.any():
+            raise ValueError("attention_mask must contain at least one True per batch element.")
+        if not row[-1]:
+            raise ValueError("Right padding is not supported for decoder-only generation.")
+        first_true = int(row.argmax())
+        if not row[first_true:].all():
+            raise ValueError("attention_mask must be a single contiguous True block per row.")
+
+    out = jnp.concatenate(
+        [prompt_ids, jnp.zeros((B, max_new_tokens), dtype=prompt_ids.dtype)], axis=1
+    )
+
+    for length in np.unique(lens):
+        idx = np.where(lens == length)[0]
+        trimmed = prompt_ids[idx, Lmax - length :]
+        group_out, _, key = _generate_core(
+            model,
+            trimmed,
+            max_new_tokens,
+            key,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            bos_token_id=bos_token_id,
+            eos_token_id=eos_token_id,
+            attention_mask=None,
+            cache=None,
+            return_cache=False,
+        )
+        gen_tail = group_out[:, length:]
+        out = out.at[idx, Lmax:].set(gen_tail)
+
+    return out, None, key
+
+
 # Convenience JIT wrapper for generation with static knobs
-generate_jit = jax.jit(
-    generate,
-    static_argnames=(
-        "max_new_tokens",
-        "temperature",
-        "top_k",
-        "top_p",
-        "bos_token_id",
-        "eos_token_id",
-        "return_cache",
-    ),
-)
+generate_jit = eqx.filter_jit(_generate_core)

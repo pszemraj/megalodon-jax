@@ -1093,7 +1093,9 @@ class MegalodonAttention(eqx.Module):
         # Cast to z.dtype to preserve bf16 in mixed-precision
         gamma_heads = self.gamma.reshape(2, H, Dh).astype(z.dtype)
         beta_heads = self.beta.reshape(2, H, Dh).astype(z.dtype)
-        scale = (gamma_heads + 1.0) / math.sqrt(Dh)
+        scale = (gamma_heads + jnp.asarray(1.0, dtype=z.dtype)) / jnp.asarray(
+            math.sqrt(Dh), dtype=z.dtype
+        )
 
         # Broadcast and apply: z_normed is (B, L, H, Dh)
         q = z_normed * scale[0] + beta_heads[0]

@@ -132,7 +132,8 @@ class ComplexEMA(eqx.Module):
         q = magnitude * jnp.exp(1j * phi)  # (D, N) complex64
 
         # gamma from real/imag parts
-        gamma = (gamma_real_f32 + 1j * gamma_imag_f32) * self.scale  # (D, N) complex64
+        scale = jnp.asarray(self.scale, dtype=gamma_real_f32.dtype)
+        gamma = (gamma_real_f32 + 1j * gamma_imag_f32) * scale  # (D, N) complex64
 
         return p, q, gamma
 

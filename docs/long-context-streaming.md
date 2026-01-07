@@ -93,6 +93,12 @@ flowchart TD
 - **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache).
 - **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV; RoPE offset advances with absolute position.
 
+## 5) Padding and Generation
+
+- Cached decoding does not support padding because cache validity is not tracked per position.
+- `generate()` handles left-padded batches by grouping prompts by length when `max_new_tokens > 1`.
+- Right padding or non-contiguous masks are rejected; padded batches cannot return a single cache.
+
 ## Defaults and Options
 
 - **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
