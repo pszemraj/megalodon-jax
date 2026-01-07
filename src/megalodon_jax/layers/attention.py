@@ -398,14 +398,16 @@ class ChunkedAttention(eqx.Module):
         # - cache_unbounded=False, max_cache_len>chunk_size: sliding window mode
         # - cache_unbounded=True: same as sliding window but no boundary resets
         #
-        # Buffer model: left-aligned cache window with masked validity.
+        # Buffer model: circular ring buffer with masked validity.
+        # Ordered cache views are materialized only when causal chunk attention
+        # requires chronological K/V layout.
         #
         # Mask semantics:
         # - Cached prefix keys are always valid for the current chunk.
         # - Masked tokens in the current chunk are excluded from attention in that chunk,
         #   but their keys are still cached for future chunks.
 
-        # Initialize or extract fixed-size cache buffers (left-aligned)
+        # Initialize or extract fixed-size cache buffers (ring order)
         if cache is None:
             cache_k = jnp.zeros((B, cache_size, H, self.head_dim), dtype=q.dtype)
             cache_v = jnp.zeros((B, cache_size, H, Dv), dtype=v.dtype)
@@ -424,7 +426,7 @@ class ChunkedAttention(eqx.Module):
                 cache_v = cache.v[:, -cache_size:]
 
         has_input_mask = mask is not None
-        cache_indices = jnp.arange(cache_size)
+        cache_indices = jnp.arange(cache_size, dtype=jnp.int32)
 
         def current_valid_len(cur_pos: Int[Array, ""]) -> Int[Array, ""]:
             """Return the valid cache length at the current position."""
@@ -432,9 +434,36 @@ class ChunkedAttention(eqx.Module):
                 return jnp.minimum(cur_pos % self.chunk_size, cache_size)
             return jnp.minimum(cur_pos, cache_size)
 
+        def cache_start(cur_pos: Int[Array, ""], valid_len: Int[Array, ""]) -> Int[Array, ""]:
+            """Oldest cache index for the current window."""
+            return jnp.mod(cur_pos - valid_len, cache_size)
+
+        def ordered_cache(
+            c_k: Float[Array, "batch cache_size heads head_dim"],
+            c_v: Float[Array, "batch cache_size heads value_dim"],
+            cur_pos: Int[Array, ""],
+            valid_len: Int[Array, ""],
+        ) -> tuple[
+            Float[Array, "batch cache_size heads head_dim"],
+            Float[Array, "batch cache_size heads value_dim"],
+        ]:
+            """Return cache K/V in chronological order for causal attention."""
+            start = cache_start(cur_pos, valid_len)
+            order = jnp.mod(start + cache_indices, cache_size)
+            return jnp.take(c_k, order, axis=1), jnp.take(c_v, order, axis=1)
+
         def cache_mask_for(valid_len: Int[Array, ""]) -> Bool[Array, "batch cache_size"]:
             """Build a broadcasted cache validity mask."""
             mask_vec = cache_indices < valid_len
+            return jnp.broadcast_to(mask_vec, (B, cache_size))
+
+        def cache_mask_ring(
+            cur_pos: Int[Array, ""], valid_len: Int[Array, ""]
+        ) -> Bool[Array, "batch cache_size"]:
+            """Cache validity mask for ring-ordered buffers."""
+            start = cache_start(cur_pos, valid_len)
+            age = jnp.mod(cache_indices - start, cache_size)
+            mask_vec = age < valid_len
             return jnp.broadcast_to(mask_vec, (B, cache_size))
 
         def append_token(
@@ -442,6 +471,7 @@ class ChunkedAttention(eqx.Module):
             c_v: Float[Array, "batch cache_size heads value_dim"],
             k_tok: Float[Array, "batch 1 heads head_dim"],
             v_tok: Float[Array, "batch 1 heads value_dim"],
+            cur_pos: Int[Array, ""],
             valid_len: Int[Array, ""],
         ) -> tuple[
             Float[Array, "batch cache_size heads head_dim"],
@@ -449,40 +479,12 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             Int[Array, ""],
         ]:
-            """Append a single token to the cache, rolling if full."""
-
-            def append_at_end(
-                _: None,
-            ) -> tuple[
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                Int[Array, ""],
-            ]:
-                """Append token at the next free cache slot."""
-                write_pos = valid_len
-                new_k = jax.lax.dynamic_update_slice(c_k, k_tok, (0, write_pos, 0, 0))
-                new_v = jax.lax.dynamic_update_slice(c_v, v_tok, (0, write_pos, 0, 0))
-                return new_k, new_v, write_pos, valid_len + 1
-
-            def roll_and_append(
-                _: None,
-            ) -> tuple[
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                Int[Array, ""],
-            ]:
-                """Roll the cache window and append token at the tail."""
-                rolled_k = jnp.roll(c_k, shift=-1, axis=1)
-                rolled_v = jnp.roll(c_v, shift=-1, axis=1)
-                write_pos = jnp.array(cache_size - 1, dtype=jnp.int32)
-                new_k = jax.lax.dynamic_update_slice(rolled_k, k_tok, (0, write_pos, 0, 0))
-                new_v = jax.lax.dynamic_update_slice(rolled_v, v_tok, (0, write_pos, 0, 0))
-                new_valid_len = jnp.array(cache_size, dtype=jnp.int32)
-                return new_k, new_v, write_pos, new_valid_len
-
-            return jax.lax.cond(valid_len < cache_size, append_at_end, roll_and_append, None)
+            """Append a single token to the ring buffer."""
+            write_pos = jnp.mod(cur_pos, cache_size).astype(jnp.int32)
+            new_k = c_k.at[:, write_pos].set(k_tok[:, 0])
+            new_v = c_v.at[:, write_pos].set(v_tok[:, 0])
+            new_valid_len = jnp.minimum(valid_len + 1, cache_size)
+            return new_k, new_v, write_pos, new_valid_len
 
         if L < self.chunk_size:
             # Small-L fast path: avoid padding to chunk_size and trace only token updates.
@@ -515,9 +517,9 @@ class ChunkedAttention(eqx.Module):
 
                 valid_len = current_valid_len(pos_step)
                 c_k_step, c_v_step, write_pos, valid_len_new = append_token(
-                    c_k_step, c_v_step, k_rot, v_i, valid_len
+                    c_k_step, c_v_step, k_rot, v_i, pos_step, valid_len
                 )
-                cache_mask = cache_mask_for(valid_len_new)
+                cache_mask = cache_mask_ring(pos_step + 1, valid_len_new)
                 if has_input_mask:
                     mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
                     write_slot = cache_indices == write_pos
@@ -572,16 +574,20 @@ class ChunkedAttention(eqx.Module):
                 c_v: Float[Array, "batch cache_size heads value_dim"],
                 k_blk: Float[Array, "batch chunk_size heads head_dim"],
                 v_blk: Float[Array, "batch chunk_size heads value_dim"],
-                valid_len: Int[Array, ""],
+                cur_pos: Int[Array, ""],
             ) -> tuple[
                 Float[Array, "batch cache_size heads head_dim"],
                 Float[Array, "batch cache_size heads value_dim"],
             ]:
                 """Append a full chunk, keeping only the most recent cache_size tokens."""
-                del valid_len
-                k_keep = k_blk[:, -cache_size:]
-                v_keep = v_blk[:, -cache_size:]
-                return k_keep, v_keep
+                tail_offset = self.chunk_size - cache_size
+                k_keep = k_blk[:, tail_offset:]
+                v_keep = v_blk[:, tail_offset:]
+                start_pos = cur_pos + tail_offset
+                write_idx = jnp.mod(start_pos + cache_indices, cache_size)
+                new_k = c_k.at[:, write_idx].set(k_keep)
+                new_v = c_v.at[:, write_idx].set(v_keep)
+                return new_k, new_v
 
         else:
 
@@ -590,42 +596,18 @@ class ChunkedAttention(eqx.Module):
                 c_v: Float[Array, "batch cache_size heads value_dim"],
                 k_blk: Float[Array, "batch chunk_size heads head_dim"],
                 v_blk: Float[Array, "batch chunk_size heads value_dim"],
-                valid_len: Int[Array, ""],
+                cur_pos: Int[Array, ""],
             ) -> tuple[
                 Float[Array, "batch cache_size heads head_dim"],
                 Float[Array, "batch cache_size heads value_dim"],
             ]:
-                """Append a full chunk to the cache with rolling when needed."""
-                total_len = valid_len + self.chunk_size
-
-                def append_tail(
-                    _: None,
-                ) -> tuple[
-                    Float[Array, "batch cache_size heads head_dim"],
-                    Float[Array, "batch cache_size heads value_dim"],
-                ]:
-                    """Append a full chunk at the current cache tail."""
-                    start = valid_len
-                    new_k = jax.lax.dynamic_update_slice(c_k, k_blk, (0, start, 0, 0))
-                    new_v = jax.lax.dynamic_update_slice(c_v, v_blk, (0, start, 0, 0))
-                    return new_k, new_v
-
-                def roll_and_append(
-                    _: None,
-                ) -> tuple[
-                    Float[Array, "batch cache_size heads head_dim"],
-                    Float[Array, "batch cache_size heads value_dim"],
-                ]:
-                    """Roll the cache window and append a full chunk at the tail."""
-                    drop = total_len - cache_size
-                    rolled_k = jnp.roll(c_k, shift=-drop, axis=1)
-                    rolled_v = jnp.roll(c_v, shift=-drop, axis=1)
-                    start = cache_size - self.chunk_size
-                    new_k = jax.lax.dynamic_update_slice(rolled_k, k_blk, (0, start, 0, 0))
-                    new_v = jax.lax.dynamic_update_slice(rolled_v, v_blk, (0, start, 0, 0))
-                    return new_k, new_v
-
-                return jax.lax.cond(total_len <= cache_size, append_tail, roll_and_append, None)
+                """Append a full chunk to the ring buffer."""
+                write_pos = jnp.mod(cur_pos, cache_size)
+                offsets = cache_indices[: self.chunk_size]
+                write_idx = jnp.mod(write_pos + offsets, cache_size)
+                new_k = c_k.at[:, write_idx].set(k_blk)
+                new_v = c_v.at[:, write_idx].set(v_blk)
+                return new_k, new_v
 
         def process_full_chunk(
             offset: Int[Array, ""],
@@ -663,9 +645,6 @@ class ChunkedAttention(eqx.Module):
             else:
                 kv_mask = jnp.concatenate([cache_mask, full_chunk_mask], axis=1)
 
-            k_cat = jnp.concatenate([c_k, k_rot], axis=1)
-            v_cat = jnp.concatenate([c_v, v_blk], axis=1)
-
             if rng is not None:
                 rng, step_rng = jax.random.split(rng)
             else:
@@ -673,6 +652,9 @@ class ChunkedAttention(eqx.Module):
 
             def attend_with_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
                 """Attend with cache concatenated to the current chunk."""
+                ordered_k, ordered_v = ordered_cache(c_k, c_v, cur_pos, valid_len)
+                k_cat = jnp.concatenate([ordered_k, k_rot], axis=1)
+                v_cat = jnp.concatenate([ordered_v, v_blk], axis=1)
                 return attention_single_chunk(
                     q_rot,
                     k_cat,
@@ -704,7 +686,7 @@ class ChunkedAttention(eqx.Module):
 
             out_buf = jax.lax.dynamic_update_slice(out_buf, out_blk, (0, offset, 0, 0))
 
-            c_k, c_v = append_full_chunk(c_k, c_v, k_rot, v_blk, valid_len)
+            c_k, c_v = append_full_chunk(c_k, c_v, k_rot, v_blk, cur_pos)
             cur_pos = cur_pos + self.chunk_size
 
             return out_buf, c_k, c_v, cur_pos, rng
@@ -754,9 +736,9 @@ class ChunkedAttention(eqx.Module):
 
                 valid_len = current_valid_len(pos_step)
                 c_k_step, c_v_step, write_pos, valid_len_new = append_token(
-                    c_k_step, c_v_step, k_rot, v_i, valid_len
+                    c_k_step, c_v_step, k_rot, v_i, pos_step, valid_len
                 )
-                cache_mask = cache_mask_for(valid_len_new)
+                cache_mask = cache_mask_ring(pos_step + 1, valid_len_new)
                 if has_input_mask:
                     mask_i = jax.lax.dynamic_slice(mask_full, (0, idx), (B, 1))[:, 0]
                     write_slot = cache_indices == write_pos
@@ -1111,7 +1093,9 @@ class MegalodonAttention(eqx.Module):
         # Cast to z.dtype to preserve bf16 in mixed-precision
         gamma_heads = self.gamma.reshape(2, H, Dh).astype(z.dtype)
         beta_heads = self.beta.reshape(2, H, Dh).astype(z.dtype)
-        scale = (gamma_heads + 1.0) / math.sqrt(Dh)
+        scale = (gamma_heads + jnp.asarray(1.0, dtype=z.dtype)) / jnp.asarray(
+            math.sqrt(Dh), dtype=z.dtype
+        )
 
         # Broadcast and apply: z_normed is (B, L, H, Dh)
         q = z_normed * scale[0] + beta_heads[0]

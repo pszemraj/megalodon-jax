@@ -8,7 +8,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
 - JAX pytree caches for JIT-compatible streaming inference
 - Weight conversion utilities for PyTorch ↔ JAX interop
-- 165 tests covering parity with PyTorch reference
+- 190+ tests covering parity with PyTorch reference
 
 ## Installation
 
@@ -18,7 +18,7 @@ cd megalodon-jax
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.10+ with JAX 0.4.30+, Equinox 0.11.9+.
+Requires Python 3.10+ with JAX 0.4.30+ (tested with 0.8.x), Equinox 0.11.9+.
 
 ## Quick Start
 
@@ -50,6 +50,23 @@ print(logits.shape)  # (1, 128, 32000)
 next_token = jax.random.randint(key, (1, 1), 0, cfg.vocab_size)
 next_logits, new_cache = model(next_token, cache=cache, return_cache=True)
 ```
+
+```python
+from megalodon_jax.inference import generate
+
+# Autoregressive generation (sampling returns the next PRNG key)
+prompt_ids = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+tokens, cache, key = generate(
+    model,
+    prompt_ids,
+    max_new_tokens=16,
+    key=key,
+    temperature=1.0,
+)
+```
+
+Note: when `attention_mask` contains padding and `max_new_tokens > 1`, generation groups
+by prompt length (left padding only) and does not support `return_cache=True`.
 
 ### Training with Loss
 
@@ -112,19 +129,18 @@ src/megalodon_jax/
 
 ## Current Status
 
-**Phase 4 Complete**:
+**Phase 5 Complete**:
 
-- All core components implemented
-- Parity with PyTorch reference validated
-- Weight conversion utilities ready
-
-**Phase 5 (TODO)**: `generate()` loop for text generation
+- Core components + streaming cache utilities
+- Sampling + `generate()` loop for text generation
+- PyTorch ↔ JAX conversion (SafeTensors via PyTorch state dicts)
 
 ## Limitations
 
 - Pure JAX implementation (no fused CUDA kernels)
-- Sequential CEMA path is slower than FFT; training uses FFT automatically
+- Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
+- CEMA zeros masked positions before recurrence to avoid padding contamination (differs from PyTorch)
 
 ## Testing
 

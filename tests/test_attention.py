@@ -256,6 +256,65 @@ class TestChunkedAttention:
         assert cache.count == seq  # should only advance by actual tokens
         assert position == seq
 
+    def test_streaming_cache_ring_order(self, random_seed):
+        """Ring buffer should retain the latest tokens by absolute position."""
+        batch, heads, head_dim, value_dim = 1, 1, 2, 2
+        chunk_size = 4
+        cache_size = 4
+        seq = 6  # force wraparound
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            max_cache_len=cache_size,
+            cache_unbounded=True,
+            key=k1,
+        )
+
+        q = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k3, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k4, (batch, seq, heads, value_dim))
+
+        cache = None
+        for i in range(seq):
+            _, cache, _ = attn(
+                q[:, i : i + 1],
+                k[:, i : i + 1],
+                v[:, i : i + 1],
+                cache=cache,
+                return_cache=True,
+            )
+
+        assert cache is not None
+        assert cache.count == seq
+        assert cache.k.shape[1] == cache_size
+
+        _, k_rot_full = attn.rotary(q, k, jnp.array(0, dtype=jnp.int32))
+        expected_k = jnp.zeros_like(cache.k)
+        expected_v = jnp.zeros_like(cache.v)
+        for t in range(seq - cache_size, seq):
+            idx = t % cache_size
+            expected_k = expected_k.at[:, idx].set(k_rot_full[:, t])
+            expected_v = expected_v.at[:, idx].set(v[:, t])
+
+        np.testing.assert_allclose(
+            np.array(cache.k),
+            np.array(expected_k),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(
+            np.array(cache.v),
+            np.array(expected_v),
+            rtol=1e-6,
+            atol=1e-6,
+        )
+
 
 # -----------------------------------------------------------------------------
 # NormalizedFFN Tests

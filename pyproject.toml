@@ -4,31 +4,39 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "megalodon-jax"
-description = "JAX/Equinox implementation of Megalodon for efficient long-context LLM pretraining and inference"
+description = "JAX/Equinox impl of Megalodon for efficient, JIT-compiled training and inference"
 authors = [
   { name = "Peter Szemraj", email = "peterszemraj+megalodon@gmail.com" },
 ]
 readme = "README.md"
 license = { text = "Apache-2.0" }
-keywords = ["megalodon", "attention", "ema", "long-context", "llm", "jax", "equinox"]
+keywords = [
+  "megalodon",
+  "attention",
+  "ema",
+  "long-context",
+  "llm",
+  "jax",
+  "equinox",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
   "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
-  "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
-    "jax>=0.4.30",
-    "equinox>=0.11.9",
-    "jaxtyping>=0.2",
-    "safetensors>=0.4",
+  "jax>=0.7.0",
+  "equinox>=0.12.0",
+  "jaxtyping>=0.2",
+  "safetensors>=0.4",
 ]
 
 [project.urls]
@@ -36,7 +44,7 @@ Homepage = "https://github.com/pszemraj/megalodon-jax"
 Repository = "https://github.com/pszemraj/megalodon-jax"
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0", "torch>=2.0", "optax", "ruff>=0.5"]
+dev = ["pytest>=7.0", "torch>=2.6", "optax", "ruff>=0.5"]
 
 [tool.setuptools]
 package-dir = { "" = "src" }
@@ -53,8 +61,8 @@ pythonpath = ["src"]
 # Run all tests in tests/ directory
 testpaths = ["tests"]
 markers = [
-    "cuda: tests that require a CUDA-capable device",
-    "torch_ref: PyTorch reference tests (not run by default)",
+  "cuda: tests that require a CUDA-capable device",
+  "torch_ref: PyTorch reference tests (not run by default)",
 ]
 
 [tool.ruff]

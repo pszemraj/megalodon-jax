@@ -1,18 +1,15 @@
 # Megalodon Profiling Playbook
 
-This guide explains how to profile Megalodon's PyTorch implementation for throughput and memory, interpret traces, and compare EMA paths (FFT vs sequential) and precision toggles.
+This guide explains how to profile the PyTorch reference copy included in this repo
+(for parity and conversion validation), interpret traces, and compare EMA paths
+(FFT vs sequential) and precision toggles. It does not cover JAX profiling.
 
 ## TL;DR
-
-- Current nano_short timing check (RTX 4070 Laptop, bf16, chunk=512):
-  - Megalodon (6L, d=384): ~8m09 for 300 steps; val loss 7.98→2.21→1.81 (steps 0/100/200).
-  - Llama baseline (6L, d=384): ~3m46 for 300 steps; val loss 4.58→2.70→2.29.
-  - Throughput: Megalodon ~2.2× slower but converges faster at the same step count.
 
 - Use the provided script to capture Chrome traces and summaries:
 
 ```bash
-conda run -n mega python scripts/profile_ops.py \
+conda run --name mega-jax python scripts/profile_ops.py \
   --seq-lens 512 \
   --dtype bf16 \
   --schedule 1 1 2 1
@@ -43,7 +40,7 @@ These give step-level visibility; use `key_averages` for op-level detail.
 Use a short schedule to sanity-check steady-state timing:
 
 ```bash
-conda run -n mega python scripts/profile_ops.py \
+conda run --name mega-jax python scripts/profile_ops.py \
   --seq-lens 512 2048 \
   --dtype bf16 \
   --bf16-sweep \
@@ -55,7 +52,7 @@ conda run -n mega python scripts/profile_ops.py \
 To reduce variance in timing:
 
 ```bash
-conda run -n mega python scripts/profile_ops.py \
+conda run --name mega-jax python scripts/profile_ops.py \
   --seq-lens 4096 8192 \
   --dtype bf16 \
   --bf16-sweep \
@@ -64,10 +61,11 @@ conda run -n mega python scripts/profile_ops.py \
 
 ### Sequential EMA vs FFT
 
-Training defaults to FFT EMA (no cache) because the sequential recurrence is much slower in pure PyTorch. To profile the sequential path, enable caching in the training loop:
+Training defaults to FFT EMA (no cache) because the sequential recurrence is much slower in
+pure PyTorch. To profile the sequential path, enable caching in the training loop:
 
 ```bash
-conda run -n mega python scripts/profile_ops.py \
+conda run --name mega-jax python scripts/profile_ops.py \
   --seq-lens 2048 \
   --dtype fp32 \
   --train-use-cache
@@ -96,7 +94,7 @@ The profiler script exposes a BF16 sweep that compares reduced-precision reducti
 ### 1. EMA path selection
 
 - Upstream uses FFT for the forward output and a fused CUDA kernel for the last EMA state. That makes cache updates cheap.
-- In pure PyTorch, computing the last EMA state via a sequential recurrence is much slower. We now disable caches during training (always FFT); sequential is reserved for streaming inference.
+- In pure PyTorch, computing the last EMA state via a sequential recurrence is much slower. Caches are disabled during training (FFT only); sequential is reserved for streaming inference.
 
 ### 2. Stability and precision
 

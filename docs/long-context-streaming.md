@@ -57,7 +57,7 @@ sequenceDiagram
     participant Cache as KV Cache (window)
     participant State as EMA + TN state
     participant Block as Attn Block
-    Note over Cache: default max_cache_len = chunk_size (chunk-local)<br/>max_cache_len = W => keep last W<br/>cache_unbounded = True => keep all
+    Note over Cache: default max_cache_len = chunk_size (chunk-local)<br/>max_cache_len = W => keep last W<br/>cache_unbounded = True => no boundary reset (still bounded)
 
     Loop for each chunk
         Block->>State: TimestepNorm (update running mean/var)
@@ -73,7 +73,7 @@ sequenceDiagram
 
 - Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`); chunk-local streaming calls can span boundaries and are processed chunk-by-chunk with cache reset at each boundary.
 - A finite `max_cache_len` above the chunk size enables a sliding window.
-- Setting `cache_unbounded=True` keeps all KV (VRAM grows linearly).
+- Setting `cache_unbounded=True` disables boundary resets but still uses a fixed `max_cache_len` for JIT compatibility.
 
 ## 3) RoPE Offsets
 
@@ -91,10 +91,16 @@ flowchart TD
 ## 4) Training vs. Inference
 
 - **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache).
-- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding/unbounded KV; RoPE offset advances with absolute position.
+- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV; RoPE offset advances with absolute position.
+
+## 5) Padding and Generation
+
+- Cached decoding does not support padding because cache validity is not tracked per position.
+- `generate()` handles left-padded batches by grouping prompts by length when `max_new_tokens > 1`.
+- Right padding or non-contiguous masks are rejected; padded batches cannot return a single cache.
 
 ## Defaults and Options
 
 - **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable clamping.
+- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable chunk resets (still fixed-size).
