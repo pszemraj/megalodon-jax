@@ -1,17 +1,40 @@
 # Dev Notes - megalodon-jax
 
+---
+
+- [Dev Notes - megalodon-jax](#dev-notes---megalodon-jax)
+  - [Architecture Overview](#architecture-overview)
+    - [Key Differences from Upstream Reference](#key-differences-from-upstream-reference)
+    - [Performance Characteristics](#performance-characteristics)
+  - [Known Gaps](#known-gaps)
+    - [No Fused Kernels](#no-fused-kernels)
+    - [No 4D Chunk Parallelism](#no-4d-chunk-parallelism)
+    - [Sequential CEMA vs FFT](#sequential-cema-vs-fft)
+  - [Optional Experiments](#optional-experiments)
+  - [Numerical Stability](#numerical-stability)
+    - [TimestepNorm - Kahan Summation Analysis](#timestepnorm---kahan-summation-analysis)
+    - [EMA Eigenvalue Stability](#ema-eigenvalue-stability)
+    - [Q/K Normalization](#qk-normalization)
+    - [Attention Masking](#attention-masking)
+  - [Weight Conversion](#weight-conversion)
+  - [Cache Design](#cache-design)
+  - [Testing](#testing)
+  - [Profiling](#profiling)
+
+---
+
 ## Architecture Overview
 
 Pure JAX/Equinox reimplementation of Megalodon. No CUDA kernels-all paths are JIT-compiled XLA.
 
 ### Key Differences from Upstream Reference
 
-| Component    | Upstream Reference (custom kernels) | This Implementation (JAX)                              |
-| ------------ | ----------------------------------- | ------------------------------------------------------ |
-| EMA          | Fused CUDA kernels                  | FFT path (training) / sequential scan (inference)      |
-| TimestepNorm | Fused CUDA w/ Kahan                 | Vectorized Welford w/ fp32 accumulators                |
-| Attention    | Fused SDPA + DropKey                | jnp.einsum, manual chunked attention                   |
-| Parallelism  | 4D chunk-parallel                   | Single-device only                                     |
+| Component    | Upstream Reference (custom kernels) | This Implementation (JAX)                         |
+| ------------ | ----------------------------------- | ------------------------------------------------- |
+| EMA          | Fused CUDA kernels                  | FFT path (training) / sequential scan (inference) |
+| TimestepNorm | Fused CUDA w/ Kahan                 | Vectorized Welford w/ fp32 accumulators           |
+| Attention    | Fused SDPA + DropKey                | jnp.einsum, manual chunked attention              |
+| Parallelism  | 4D chunk-parallel                   | Single-device only                                |
 
 ### Performance Characteristics
 
@@ -35,9 +58,9 @@ The paper's chunk-parallel axis requires multi-device coordination and sharded K
 When `return_state=True`, CEMA uses `jax.lax.scan` over timesteps. This is ~6x slower than FFT at 4k tokens (26ms vs 0.25ms). However, **JAX is ~5x faster than PyTorch** for both paths:
 
 | Seq Len | PyTorch FFT | JAX FFT | PyTorch Seq | JAX Seq |
-|---------|-------------|---------|-------------|---------|
-| 1024 | 0.31ms | 0.11ms | 38.5ms | 6.8ms |
-| 4096 | 1.27ms | 0.25ms | 153ms | 26ms |
+| ------- | ----------- | ------- | ----------- | ------- |
+| 1024    | 0.31ms      | 0.11ms  | 38.5ms      | 6.8ms   |
+| 4096    | 1.27ms      | 0.25ms  | 153ms       | 26ms    |
 
 Training uses FFT automatically (`return_state=False`). Sequential path is only for streaming inference where state must be preserved.
 
@@ -85,11 +108,13 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 `convert.py` provides bidirectional PyTorch ↔ JAX conversion:
 
 **JAX → PyTorch** (`convert_jax_to_torch`):
+
 - Exports all weights including `lm_head.weight` for tied models (PyTorch strict loading compatibility)
 - Uses `.clone()` on tied weights to avoid SafeTensors shared memory errors
 - Compatible with `safetensors.torch.save_file`
 
 **PyTorch → JAX** (`load_weights_from_torch`):
+
 - Shape validation on critical weights (embed, cema.alpha, wz, fc1, lm_head)
 - Layer count validation before loading
 - Clear error messages for config/checkpoint mismatch
