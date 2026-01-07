@@ -469,6 +469,67 @@ class TestConversion:
             atol=1e-5,
         )
 
+    def test_load_weights_requires_lm_head_for_untied(self):
+        config = MegalodonConfig(
+            vocab_size=64,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            output_size=32,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state_dict = convert_jax_to_torch(model)
+        state_dict.pop("lm_head.weight")
+
+        with pytest.raises(KeyError, match="lm_head.weight"):
+            load_weights_from_torch(
+                MegalodonForCausalLM(config, key=jax.random.PRNGKey(1)),
+                state_dict,
+            )
+
+    def test_load_weights_rejects_swiglu_mismatch(self):
+        config_swiglu = MegalodonConfig(
+            vocab_size=64,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            swiglu=True,
+        )
+        model_swiglu = MegalodonForCausalLM(config_swiglu, key=jax.random.PRNGKey(0))
+        state_dict = convert_jax_to_torch(model_swiglu)
+
+        config_no_swiglu = MegalodonConfig(
+            vocab_size=64,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            swiglu=False,
+        )
+
+        with pytest.raises(ValueError, match="swiglu"):
+            load_weights_from_torch(
+                MegalodonForCausalLM(config_no_swiglu, key=jax.random.PRNGKey(1)),
+                state_dict,
+            )
+
     def test_tied_model_export_has_lm_head(self):
         """Tied model should export lm_head.weight for PyTorch strict loading."""
         config = small_config()  # default is tied (output_size=-1)

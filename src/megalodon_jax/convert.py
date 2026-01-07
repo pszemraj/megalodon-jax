@@ -184,9 +184,13 @@ def load_weights_from_torch(
         """Check if key exists in state_dict."""
         return key in state_dict
 
+    cfg = model.config
+    norm_affine = cfg.norm_affine
+    swiglu = cfg.swiglu
+
     # Embedding - validate shape before loading
     embed_weight = get_weight("model.embed.weight")
-    expected_embed = (model.config.vocab_size, model.config.model_dim)
+    expected_embed = (cfg.vocab_size, cfg.model_dim)
     _validate_shape(embed_weight, expected_embed, "model.embed.weight")
     model = eqx.tree_at(
         lambda m: m.model.embed.weight,
@@ -210,23 +214,26 @@ def load_weights_from_torch(
         attn_prefix = f"{prefix}.attn"
 
         # TimestepNorm
-        if has_key(f"{attn_prefix}.timenorm.weight"):
+        if norm_affine:
             model = eqx.tree_at(
                 lambda m, idx=i: m.model.layers[idx].attn.timenorm.weight,
                 model,
                 get_weight(f"{attn_prefix}.timenorm.weight"),
             )
-        if has_key(f"{attn_prefix}.timenorm.bias"):
             model = eqx.tree_at(
                 lambda m, idx=i: m.model.layers[idx].attn.timenorm.bias,
                 model,
                 get_weight(f"{attn_prefix}.timenorm.bias"),
             )
+        else:
+            if has_key(f"{attn_prefix}.timenorm.weight") or has_key(f"{attn_prefix}.timenorm.bias"):
+                raise ValueError(
+                    "Checkpoint provides TimestepNorm affine parameters but config.norm_affine=False."
+                )
 
         # ComplexEMA - validate shapes on first layer
         alpha_weight = get_weight(f"{attn_prefix}.cema.alpha")
         if i == 0:
-            cfg = model.config
             expected_alpha = (cfg.model_dim, cfg.cema_ndim, 1)
             _validate_shape(alpha_weight, expected_alpha, f"{attn_prefix}.cema.alpha")
         model = eqx.tree_at(
@@ -264,11 +271,15 @@ def load_weights_from_torch(
         )
 
         # RMSNorm
-        if has_key(f"{attn_prefix}.rmsnorm.gamma"):
+        if norm_affine:
             model = eqx.tree_at(
                 lambda m, idx=i: m.model.layers[idx].attn.rmsnorm.gamma,
                 model,
                 get_weight(f"{attn_prefix}.rmsnorm.gamma"),
+            )
+        elif has_key(f"{attn_prefix}.rmsnorm.gamma"):
+            raise ValueError(
+                "Checkpoint provides RMSNorm affine parameters but config.norm_affine=False."
             )
 
         # Linear projections - validate wz shape on first layer
@@ -313,18 +324,22 @@ def load_weights_from_torch(
         ffn_prefix = f"{prefix}.ffn"
 
         # LayerNorm
-        if has_key(f"{ffn_prefix}.norm.weight"):
+        if norm_affine:
             model = eqx.tree_at(
                 lambda m, idx=i: m.model.layers[idx].ffn.norm.weight,
                 model,
                 get_weight(f"{ffn_prefix}.norm.weight"),
             )
-        if has_key(f"{ffn_prefix}.norm.bias"):
             model = eqx.tree_at(
                 lambda m, idx=i: m.model.layers[idx].ffn.norm.bias,
                 model,
                 get_weight(f"{ffn_prefix}.norm.bias"),
             )
+        else:
+            if has_key(f"{ffn_prefix}.norm.weight") or has_key(f"{ffn_prefix}.norm.bias"):
+                raise ValueError(
+                    "Checkpoint provides LayerNorm affine parameters but config.norm_affine=False."
+                )
 
         # FC layers - validate fc1 shape on first layer
         for fc_name in ["fc1", "fc2"]:
@@ -345,7 +360,7 @@ def load_weights_from_torch(
                 )
 
         # fc3 for SwiGLU (optional)
-        if has_key(f"{ffn_prefix}.fc3.weight"):
+        if swiglu:
             model = eqx.tree_at(
                 lambda m, idx=i: m.model.layers[idx].ffn.fc3.weight,
                 model,
@@ -357,28 +372,33 @@ def load_weights_from_torch(
                     model,
                     get_weight(f"{ffn_prefix}.fc3.bias"),
                 )
+        elif has_key(f"{ffn_prefix}.fc3.weight") or has_key(f"{ffn_prefix}.fc3.bias"):
+            raise ValueError("Checkpoint includes SwiGLU weights but config.swiglu=False.")
 
     # Final norm
-    if has_key("model.norm.weight"):
+    if norm_affine:
         model = eqx.tree_at(
             lambda m: m.model.norm.weight,
             model,
             get_weight("model.norm.weight"),
         )
-    if has_key("model.norm.bias"):
         model = eqx.tree_at(
             lambda m: m.model.norm.bias,
             model,
             get_weight("model.norm.bias"),
         )
-
-    # lm_head.weight - load only if untied (model.lm_head is not None)
-    if not model.tied and model.lm_head is not None and has_key("lm_head.weight"):
-        lm_head_weight = get_weight("lm_head.weight")
-        lm_out = (
-            model.config.vocab_size if model.config.output_size == -1 else model.config.output_size
+    elif has_key("model.norm.weight") or has_key("model.norm.bias"):
+        raise ValueError(
+            "Checkpoint provides final norm affine parameters but config.norm_affine=False."
         )
-        expected_lm_head = (lm_out, model.config.model_dim)
+
+    # lm_head.weight - require for untied configs
+    if not model.tied and model.lm_head is not None:
+        if not has_key("lm_head.weight"):
+            raise KeyError("Missing key in state_dict: lm_head.weight")
+        lm_head_weight = get_weight("lm_head.weight")
+        lm_out = cfg.vocab_size if cfg.output_size == -1 else cfg.output_size
+        expected_lm_head = (lm_out, cfg.model_dim)
         _validate_shape(lm_head_weight, expected_lm_head, "lm_head.weight")
         model = eqx.tree_at(
             lambda m: m.lm_head.weight,
