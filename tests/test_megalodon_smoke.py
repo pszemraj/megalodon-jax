@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 Peter Szemraj.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,17 +14,16 @@
 """End-to-end smoke tests covering inference utilities and cache behaviour."""
 
 import math
-from typing import List, Optional, Tuple
 
 import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon.modeling_megalodon import (
+    FFT_KERNEL_CHUNK,
     AttentionCache,
     ChunkedSelfAttention,
     ComplexEMA,
-    FFT_KERNEL_CHUNK,
     MegalodonAttention,
     RMSNorm,
     TimestepNorm,
@@ -40,8 +38,8 @@ def _greedy_decode(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     max_new_tokens: int,
-    eos_token_id: Optional[int] = None,
-) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    eos_token_id: int | None = None,
+) -> tuple[torch.Tensor, list[torch.Tensor]]:
     """Greedy decode with cache, returning generated tokens and per-step logits."""
     outputs = lm(
         input_ids=input_ids,
@@ -51,8 +49,8 @@ def _greedy_decode(
     )
     pkv = outputs.past_key_values
     logits = outputs.logits[:, -1]
-    logits_history: List[torch.Tensor] = []
-    generated: List[torch.Tensor] = []
+    logits_history: list[torch.Tensor] = []
+    generated: list[torch.Tensor] = []
     for _ in range(max_new_tokens):
         logits_history.append(logits)
         next_token = logits.argmax(dim=-1, keepdim=True)
@@ -81,7 +79,7 @@ def _stream_logits(
     prompt_ids: torch.Tensor,
     prompt_mask: torch.Tensor,
     continuation_ids: torch.Tensor,
-) -> List[torch.Tensor]:
+) -> list[torch.Tensor]:
     """Run streaming teacher-forced logits over a continuation sequence."""
     outputs = lm(
         input_ids=prompt_ids,
@@ -90,7 +88,7 @@ def _stream_logits(
         return_dict=True,
     )
     pkv = outputs.past_key_values
-    logits_history: List[torch.Tensor] = []
+    logits_history: list[torch.Tensor] = []
     for step in range(continuation_ids.size(1)):
         token = continuation_ids[:, step : step + 1]
         outputs = lm(
@@ -148,7 +146,7 @@ def _reference_timestep_norm(
     prev_var: torch.Tensor,
     padding_mask: torch.Tensor,
     eps: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, L, D = x.shape
     G = prev_mean.size(1)
     gs = D // G
