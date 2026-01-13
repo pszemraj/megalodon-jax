@@ -1,3 +1,4 @@
+# coding=utf-8
 # Copyright 2025 Peter Szemraj.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -28,14 +29,13 @@ from .modeling_megalodon import (
 
 def configure_precision(
     *,
-    allow_tf32: bool | None = True,
-    allow_bf16_reduced_precision_reduction: bool | None = None,
+    allow_tf32: Optional[bool] = True,
+    allow_bf16_reduced_precision_reduction: Optional[bool] = None,
 ) -> None:
     """Set recommended backend precision toggles for Megalodon workloads.
 
-    :param allow_tf32: Whether TF32 matmuls are permitted (defaults to ``True``).
-    :param allow_bf16_reduced_precision_reduction: Toggle cuBLAS reduced-precision
-        reductions for BF16 matmuls. ``None`` leaves the PyTorch default in place.
+    :param Optional[bool] allow_tf32: Whether TF32 matmuls are permitted (defaults to ``True``).
+    :param Optional[bool] allow_bf16_reduced_precision_reduction: Toggle cuBLAS reduced-precision reductions for BF16 matmuls, defaults to ``None`` (leaves the PyTorch default in place).
     """
     if torch.cuda.is_available():
         if allow_tf32 is not None:
