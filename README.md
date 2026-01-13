@@ -98,7 +98,7 @@ grads = loss_fn(model, input_ids, labels)
 
 4. **Two-Hop Residual**: FFN adds residual from block input, not post-attention activations.
 
-5. **Mask-Aware Loss**: Unlike PyTorch reference, padding tokens are correctly excluded from loss computation.
+5. **Mask-Aware Loss**: Padding tokens are excluded from loss computation (matches PyTorch/HF).
 
 ### Source Layout
 
@@ -140,7 +140,7 @@ src/megalodon_jax/
 - Pure JAX implementation (no fused CUDA kernels)
 - Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
-- CEMA zeros masked positions before recurrence to avoid padding contamination (differs from PyTorch)
+- CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
 
 ## Testing
 

@@ -111,6 +111,9 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 
 - Exports all weights including `lm_head.weight` for tied models (PyTorch strict loading compatibility)
 - Uses `.clone()` on tied weights to avoid SafeTensors shared memory errors
+- Skips `inner.rope.inv_freq` by default because it is non-persistent in PyTorch; opt in with `include_rope_inv_freq=True`
+- Supports `dtype=` for exported tensors; floats are normalized to fp32 before optional casting
+- CEMA `gamma_{real,imag}` is exported in fp32 for stability
 - Compatible with `safetensors.torch.save_file`
 
 **PyTorch → JAX** (`load_weights_from_torch`):

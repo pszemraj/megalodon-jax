@@ -1,0 +1,86 @@
+# JAX and PyTorch Interop
+
+This repo includes a JAX implementation alongside the PyTorch reference to keep
+training fast while preserving weight and behavior parity for export.
+
+## Why the JAX version exists
+
+- Fast training and experimentation with JIT compilation.
+- Clean parity path to PyTorch for production inference and tooling.
+- Explicit, readable kernels that are easy to audit for correctness.
+
+## When to use which
+
+Use JAX for:
+- Training and large-scale ablations.
+- Research workflows where compile-time shape control matters.
+- Exporting checkpoints for downstream PyTorch use.
+
+Use PyTorch for:
+- HuggingFace integration and generation APIs.
+- Deployment and production inference.
+- Compatibility with existing PyTorch tooling and ecosystems.
+
+## Conversion workflows
+
+### JAX -> PyTorch
+
+Use `convert_jax_to_torch` to get a PyTorch-style state dict, or
+`save_safetensors` to write a `.safetensors` file.
+
+```python
+from megalodon_jax import convert_jax_to_torch, save_safetensors
+
+state_dict = convert_jax_to_torch(model)
+save_safetensors(model, "model.safetensors")
+```
+
+Notes:
+- `inner.rope.inv_freq` is not in the PyTorch state dict. The JAX exporter
+  skips it by default. Use `include_rope_inv_freq=True` only if you need it
+  for tooling (it will be an unexpected key under strict loading).
+- Use `dtype=` to export bf16 checkpoints (fp32 is the default and recommended).
+- CEMA `gamma_{real,imag}` is exported in fp32 for stability.
+
+### PyTorch -> JAX
+
+Use `load_from_pretrained` for a checkpoint file, or `load_weights_from_torch`
+if you already have a state dict in memory.
+
+```python
+from megalodon_jax import load_from_pretrained
+
+model = load_from_pretrained(
+    "model.safetensors",
+    config=config,
+    key=key,
+)
+```
+
+Make sure the JAX config matches the PyTorch config (dims, layer count, swiglu,
+norm_affine, output_size, etc).
+
+## Functional differences (current)
+
+- **Cache + padding**: JAX does not support streaming cache with padded inputs.
+  Use unpadded prompts for cached decoding, or set `return_cache=False`.
+- **Cache sizing**: JAX uses a fixed-size ring buffer for KV cache (required for
+  JIT). PyTorch can grow dynamically.
+- **Generation API**: JAX provides its own `generate` loop; it does not implement
+  the full HuggingFace `GenerationMixin` surface.
+- **Compilation shapes**: JAX recompiles on new shapes. Pad sequences to a
+  consistent length for throughput.
+
+## Parity and compatibility notes
+
+- The torch fixes for masking, cache semantics, and per-batch positions do not
+  add or rename parameters; weight mapping is unchanged.
+- `max_cache_len` must be `>= chunk_size` when provided (validated in config).
+- Loss masking uses `ignore_index=-100` and attention masks consistently, same
+  as the PyTorch/HF convention.
+
+## Quick parity checklist
+
+- Configs match (dims, layers, swiglu, norm_affine, output_size).
+- Export with `convert_jax_to_torch` and load in torch with `strict=True`.
+- Compare logits on a small batch in fp32 with deterministic settings.
