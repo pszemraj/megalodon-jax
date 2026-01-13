@@ -77,6 +77,15 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match="model_dim.*divisible by.*norm_num_groups"):
             MegalodonConfig(model_dim=1000, norm_num_groups=32)
 
+    def test_max_cache_len_validation(self):
+        """Test max_cache_len must be positive and >= chunk_size when provided."""
+        with pytest.raises(ValueError, match="max_cache_len.*positive"):
+            MegalodonConfig(chunk_size=8, max_cache_len=0)
+        with pytest.raises(ValueError, match="max_cache_len.*positive"):
+            MegalodonConfig(chunk_size=8, max_cache_len=-1)
+        with pytest.raises(ValueError, match="max_cache_len.*chunk_size"):
+            MegalodonConfig(chunk_size=8, max_cache_len=4)
+
     def test_config_is_frozen(self):
         """Test that config is immutable."""
         cfg = MegalodonConfig()

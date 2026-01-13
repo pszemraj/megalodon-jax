@@ -23,7 +23,7 @@ class MegalodonConfig:
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16  # complex EMA orders per channel
     chunk_size: int = 2048
-    max_cache_len: int | None = None  # defaults to chunk_size if None
+    max_cache_len: int | None = None  # defaults to chunk_size if None; must be >= chunk_size
     cache_unbounded: bool = False
     norm_num_groups: int = 32
     norm_eps: float = 1e-5
@@ -66,6 +66,10 @@ class MegalodonConfig:
             raise ValueError(f"attention_dropout must be in [0, 1], got {self.attention_dropout}")
         if not 0.0 <= self.hidden_dropout <= 1.0:
             raise ValueError(f"hidden_dropout must be in [0, 1], got {self.hidden_dropout}")
+        if self.max_cache_len is not None and self.max_cache_len <= 0:
+            raise ValueError("max_cache_len must be positive when provided.")
+        if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
+            raise ValueError("max_cache_len must be >= chunk_size to preserve causal attention.")
 
     @property
     def head_dim(self) -> int:

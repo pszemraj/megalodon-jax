@@ -4,7 +4,7 @@ This module provides functions to load PyTorch Megalodon weights into JAX models
 """
 
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import equinox as eqx
 import jax
@@ -17,6 +17,10 @@ from megalodon_jax.model import MegalodonForCausalLM
 
 # Type alias for state dict
 StateDict = dict[str, Any]
+
+
+if TYPE_CHECKING:
+    import torch
 
 
 def _to_jax(tensor: Any) -> Array:
@@ -60,16 +64,42 @@ def _jax_to_numpy(x: Any) -> np.ndarray:
     return np.asarray(x)
 
 
+def _to_torch_tensor(x: Any, *, dtype: "torch.dtype | None" = None) -> "torch.Tensor":
+    """Convert an array-like object into a torch tensor with safe host dtype handling."""
+    import torch
+
+    arr = _jax_to_numpy(x)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = arr.astype(np.float32, copy=False)
+    tensor = torch.from_numpy(arr)
+    if dtype is not None:
+        tensor = tensor.to(dtype)
+    return tensor
+
+
 def convert_jax_to_torch(
     model: MegalodonForCausalLM,
+    *,
+    dtype: "torch.dtype | None" = None,
+    include_rope_inv_freq: bool = False,
 ) -> StateDict:
-    """Convert a JAX Megalodon model to a PyTorch-style state dict."""
+    """Convert a JAX Megalodon model to a PyTorch-style state dict.
+
+    Args:
+        model: JAX MegalodonForCausalLM to export.
+        dtype: Optional torch dtype for floating tensors in the output.
+        include_rope_inv_freq: If True, include RoPE inv_freq buffers (not
+            present in the PyTorch state_dict by default).
+
+    Note:
+        CEMA gamma parameters are exported in float32 for stability.
+    """
     import torch
 
     state_dict: StateDict = {}
 
     def to_torch(arr: Any) -> Any:
-        return torch.from_numpy(_jax_to_numpy(arr))
+        return _to_torch_tensor(arr, dtype=dtype)
 
     state_dict["model.embed.weight"] = to_torch(model.model.embed.weight)
 
@@ -87,8 +117,12 @@ def convert_jax_to_torch(
         state_dict[f"{attn_prefix}.cema.alpha"] = to_torch(layer.attn.cema.alpha)
         state_dict[f"{attn_prefix}.cema.delta"] = to_torch(layer.attn.cema.delta)
         state_dict[f"{attn_prefix}.cema.theta"] = to_torch(layer.attn.cema.theta)
-        state_dict[f"{attn_prefix}.cema.gamma_real"] = to_torch(layer.attn.cema.gamma_real)
-        state_dict[f"{attn_prefix}.cema.gamma_imag"] = to_torch(layer.attn.cema.gamma_imag)
+        state_dict[f"{attn_prefix}.cema.gamma_real"] = _to_torch_tensor(
+            layer.attn.cema.gamma_real, dtype=torch.float32
+        )
+        state_dict[f"{attn_prefix}.cema.gamma_imag"] = _to_torch_tensor(
+            layer.attn.cema.gamma_imag, dtype=torch.float32
+        )
         state_dict[f"{attn_prefix}.cema.omega"] = to_torch(layer.attn.cema.omega)
 
         # RMSNorm
@@ -105,10 +139,11 @@ def convert_jax_to_torch(
         state_dict[f"{attn_prefix}.gamma"] = to_torch(layer.attn.gamma)
         state_dict[f"{attn_prefix}.beta"] = to_torch(layer.attn.beta)
 
-        # Rotary embedding
-        state_dict[f"{attn_prefix}.inner.rope.inv_freq"] = to_torch(
-            layer.attn.inner.rotary.inv_freq
-        )
+        # Rotary embedding (inv_freq is not a persistent buffer in PyTorch)
+        if include_rope_inv_freq:
+            state_dict[f"{attn_prefix}.inner.rope.inv_freq"] = to_torch(
+                layer.attn.inner.rotary.inv_freq
+            )
 
         # FFN norms
         if layer.ffn.norm.weight is not None:
@@ -478,9 +513,23 @@ def load_from_pretrained(
 def save_safetensors(
     model: MegalodonForCausalLM,
     path: str | Path,
+    *,
+    dtype: "torch.dtype | None" = None,
+    include_rope_inv_freq: bool = False,
 ) -> None:
-    """Save a MegalodonForCausalLM to SafeTensors (PyTorch format)."""
+    """Save a MegalodonForCausalLM to SafeTensors (PyTorch format).
+
+    Args:
+        model: JAX MegalodonForCausalLM to export.
+        path: Output path for the .safetensors file.
+        dtype: Optional torch dtype for exported tensors.
+        include_rope_inv_freq: If True, include RoPE inv_freq buffers.
+    """
     from safetensors.torch import save_file
 
-    state_dict = convert_jax_to_torch(model)
+    state_dict = convert_jax_to_torch(
+        model,
+        dtype=dtype,
+        include_rope_inv_freq=include_rope_inv_freq,
+    )
     save_file(state_dict, str(path))

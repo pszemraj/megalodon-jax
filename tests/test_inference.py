@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 
 from megalodon_jax import (
     MegalodonConfig,
@@ -548,6 +549,35 @@ class TestConversion:
             state_dict["lm_head.weight"].numpy(),
             state_dict["model.embed.weight"].numpy(),
         )
+
+    def test_export_skips_rope_inv_freq_by_default(self):
+        """JAX export should omit RoPE inv_freq to match PyTorch state_dict."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        state_dict = convert_jax_to_torch(model)
+
+        assert not any(key.endswith("inner.rope.inv_freq") for key in state_dict)
+
+    def test_export_includes_rope_inv_freq_when_requested(self):
+        """JAX export should include RoPE inv_freq when explicitly requested."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        state_dict = convert_jax_to_torch(model, include_rope_inv_freq=True)
+
+        assert "model.layers.0.attn.inner.rope.inv_freq" in state_dict
+
+    def test_export_dtype_casting_keeps_cema_gamma_fp32(self):
+        """Export dtype should cast weights while keeping CEMA gamma in fp32."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        state_dict = convert_jax_to_torch(model, dtype=torch.bfloat16)
+
+        assert state_dict["model.embed.weight"].dtype == torch.bfloat16
+        assert state_dict["model.layers.0.attn.cema.gamma_real"].dtype == torch.float32
+        assert state_dict["model.layers.0.attn.cema.gamma_imag"].dtype == torch.float32
 
     def test_untied_model_export(self):
         """Untied model should export separate lm_head.weight."""
