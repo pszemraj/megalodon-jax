@@ -71,6 +71,8 @@ def _to_torch_tensor(x: Any, *, dtype: "torch.dtype | None" = None) -> "torch.Te
     arr = _jax_to_numpy(x)
     if np.issubdtype(arr.dtype, np.floating):
         arr = arr.astype(np.float32, copy=False)
+    if not arr.flags.writeable:
+        arr = arr.copy()
     tensor = torch.from_numpy(arr)
     if dtype is not None:
         tensor = tensor.to(dtype)
