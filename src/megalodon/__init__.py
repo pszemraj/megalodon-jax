@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 Peter Szemraj.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,8 +28,8 @@ from .modeling_megalodon import (
 
 def configure_precision(
     *,
-    allow_tf32: Optional[bool] = True,
-    allow_bf16_reduced_precision_reduction: Optional[bool] = None,
+    allow_tf32: bool | None = True,
+    allow_bf16_reduced_precision_reduction: bool | None = None,
 ) -> None:
     """Set recommended backend precision toggles for Megalodon workloads.
 

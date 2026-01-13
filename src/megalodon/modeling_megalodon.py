@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 Peter Szemraj.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,8 +38,9 @@ from __future__ import annotations
 import contextlib
 import math
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -79,7 +79,7 @@ FFT_KERNEL_CHUNK = 4096
 InitFn = Callable[[Tensor], Tensor]
 
 
-def get_init_fn(mode: InitMode, dim: Optional[int] = None) -> InitFn:
+def get_init_fn(mode: InitMode, dim: int | None = None) -> InitFn:
     """Return a callable that applies the requested parameter initialisation.
 
     :param InitMode mode: Initialisation scheme matching :class:`InitMode`.
@@ -149,9 +149,7 @@ class RotaryEmbedding(nn.Module):
     Computes cos/sin on the fly to avoid large precomputed tables.
     """
 
-    def __init__(
-        self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0
-    ):
+    def __init__(self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0):
         """Prepare rotary frequencies for a ``dim``-dimensional head space.
 
         :param int dim: Per-head dimensionality (must be even).
@@ -167,9 +165,7 @@ class RotaryEmbedding(nn.Module):
         self.max_positions = max_positions
         half = dim // 2
         # Store per-dimension frequencies; angles computed per-call.
-        inv_freq = torch.exp(
-            torch.arange(half, dtype=torch.float32) * -(math.log(base) / half)
-        )
+        inv_freq = torch.exp(torch.arange(half, dtype=torch.float32) * -(math.log(base) / half))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _get_cis(
@@ -177,7 +173,7 @@ class RotaryEmbedding(nn.Module):
         positions: Tensor,
         device: torch.device,
         dtype: torch.dtype,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
         """Return cosine and sine tables for given positions.
 
         :param Tensor positions: Position indices, shape ``(length,)`` or ``(batch, length)``.
@@ -220,8 +216,8 @@ class RotaryEmbedding(nn.Module):
         q: Tensor,
         k: Tensor,
         start_index: int = 0,
-        position_ids: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
+        position_ids: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """Rotate per-head ``q`` and ``k`` vectors.
 
         :param Tensor q: Query tensor shaped ``(batch, time, heads, dim)``.
@@ -242,9 +238,7 @@ class RotaryEmbedding(nn.Module):
         else:
             # Scalar start_index (backward compatible)
             if start_index < 0:
-                raise ValueError(
-                    f"start_index must be non-negative for RoPE, got {start_index}."
-                )
+                raise ValueError(f"start_index must be non-negative for RoPE, got {start_index}.")
             positions = torch.arange(
                 start_index, start_index + T, dtype=torch.long, device=q.device
             )
@@ -304,11 +298,11 @@ class TimestepNorm(nn.Module):
     def forward(
         self,
         x: Tensor,
-        prev_count: Optional[Tensor] = None,
-        prev_mean: Optional[Tensor] = None,
-        prev_var: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        prev_count: Tensor | None = None,
+        prev_mean: Tensor | None = None,
+        prev_var: Tensor | None = None,
+        padding_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Normalize ``x`` while carrying forward streaming statistics.
 
         :param Tensor x: Input tensor of shape ``(batch, length, dim)``.
@@ -453,12 +447,8 @@ class ComplexEMA(nn.Module):
         self.theta = nn.Parameter(torch.empty(embed_dim, 1, 1))
         # Gamma stored as two real fp32 params (real/imag parts) instead of complex64.
         # PyTorch's complex64 loses its imaginary part on bf16 casts; this avoids that.
-        self.gamma_real = nn.Parameter(
-            torch.zeros(embed_dim, ndim, dtype=torch.float32)
-        )
-        self.gamma_imag = nn.Parameter(
-            torch.zeros(embed_dim, ndim, dtype=torch.float32)
-        )
+        self.gamma_real = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.float32))
+        self.gamma_imag = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.float32))
         self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
@@ -500,7 +490,7 @@ class ComplexEMA(nn.Module):
         """
         return a.real * b.real - a.imag * b.imag
 
-    def _apply(self, fn: Callable[[Tensor], Tensor]) -> "ComplexEMA":
+    def _apply(self, fn: Callable[[Tensor], Tensor]) -> ComplexEMA:
         """Override to keep gamma parameters in fp32 regardless of model dtype.
 
         Complex EMA coefficients require fp32 precision to avoid numerical issues
@@ -519,7 +509,7 @@ class ComplexEMA(nn.Module):
 
     def _coeffs(
         self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return per-channel EMA coefficients ``(p, q, gamma)``.
 
         ``q`` is complex with magnitude in (0, 1) by construction, ensuring a
@@ -531,9 +521,9 @@ class ComplexEMA(nn.Module):
         # D x 1 x 1
         theta = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
         # 1 x N x 1
-        wavelets = torch.arange(
-            1, self.ndim + 1, dtype=theta.dtype, device=theta.device
-        ).view(1, self.ndim, 1)
+        wavelets = torch.arange(1, self.ndim + 1, dtype=theta.dtype, device=theta.device).view(
+            1, self.ndim, 1
+        )
         # D x N x 1
         phi = wavelets * theta
 
@@ -541,21 +531,17 @@ class ComplexEMA(nn.Module):
         delta = torch.sigmoid(self.delta.float())  # (D, N, 1)
 
         p = alpha.squeeze(-1)  # (D, N)
-        q = torch.polar((1.0 - alpha * delta).squeeze(-1), phi.squeeze(-1)).to(
-            torch.complex64
-        )
+        q = torch.polar((1.0 - alpha * delta).squeeze(-1), phi.squeeze(-1)).to(torch.complex64)
         # Reconstruct complex gamma from real/imag parts (bf16-safe)
-        gamma = (
-            torch.complex(self.gamma_real.float(), self.gamma_imag.float()) * self.scale
-        )
+        gamma = torch.complex(self.gamma_real.float(), self.gamma_imag.float()) * self.scale
         return p, q, gamma
 
     def _forward_sequential(
         self,
         x: torch.Tensor,
-        hx: Optional[torch.Tensor],
-        last_valid_idx: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        hx: torch.Tensor | None,
+        last_valid_idx: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Evaluate the EMA recurrence sequentially, optionally using cached state.
 
         :param torch.Tensor x: Input activations shaped ``(batch, dim, length)``.
@@ -565,9 +551,7 @@ class ComplexEMA(nn.Module):
         """
         B, D, L = x.shape
         autocast_ctx = (
-            torch.amp.autocast("cuda", enabled=False)
-            if x.is_cuda
-            else contextlib.nullcontext()
+            torch.amp.autocast("cuda", enabled=False) if x.is_cuda else contextlib.nullcontext()
         )
         with autocast_ctx:
             p, q, gamma = self._coeffs()
@@ -609,7 +593,7 @@ class ComplexEMA(nn.Module):
         h_out = h_last_best if h_last_best is not None else h
         return y, h_out
 
-    def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+    def _forward_fft(self, x: torch.Tensor) -> tuple[torch.Tensor, None]:
         """FFT-based convolution for training when no streaming state is required.
 
         Uses ``O(L log L)`` FFT convolution when cache state is not needed. For very
@@ -634,9 +618,7 @@ class ComplexEMA(nn.Module):
                 )
 
         autocast_ctx = (
-            torch.amp.autocast("cuda", enabled=False)
-            if x.is_cuda
-            else contextlib.nullcontext()
+            torch.amp.autocast("cuda", enabled=False) if x.is_cuda else contextlib.nullcontext()
         )
         with autocast_ctx:
             p, q, gamma = self._coeffs()
@@ -659,9 +641,7 @@ class ComplexEMA(nn.Module):
                 j_chunk_f = j_chunk.float()
 
                 # q^j via magnitude/phase to keep q==0 stable (0^0 -> 1)
-                mag_chunk = torch.pow(
-                    radius.unsqueeze(-1), j_chunk
-                )  # (D, N, chunk_len)
+                mag_chunk = torch.pow(radius.unsqueeze(-1), j_chunk)  # (D, N, chunk_len)
                 phase_chunk = torch.exp(1j * phi.unsqueeze(-1) * j_chunk_f).to(
                     torch.complex64
                 )  # (D, N, chunk_len)
@@ -676,12 +656,8 @@ class ComplexEMA(nn.Module):
             # Using rfft/irfft is ~2x faster and uses ~2x less memory than full fft.
             kernel_real = kernel.real  # (D, L)
 
-            X = torch.fft.rfft(
-                x_fp32, n=fft_len, dim=-1
-            )  # (B, D, fft_len//2+1) complex
-            K = torch.fft.rfft(
-                kernel_real, n=fft_len, dim=-1
-            )  # (D, fft_len//2+1) complex
+            X = torch.fft.rfft(x_fp32, n=fft_len, dim=-1)  # (B, D, fft_len//2+1) complex
+            K = torch.fft.rfft(kernel_real, n=fft_len, dim=-1)  # (D, fft_len//2+1) complex
             Y = X * K.unsqueeze(0)
             y = torch.fft.irfft(Y, n=fft_len, dim=-1)[..., :L].to(dtype=x.dtype)
             return y, None
@@ -689,10 +665,10 @@ class ComplexEMA(nn.Module):
     def forward(
         self,
         x: Tensor,  # (B, D, L)
-        hx: Optional[Tensor] = None,  # (B, D, N) complex or last dim 2
+        hx: Tensor | None = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
-        mask: Optional[Tensor] = None,  # (B, L) bool where True marks valid tokens
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        mask: Tensor | None = None,  # (B, L) bool where True marks valid tokens
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Apply the EMA block and optionally return the final complex state.
 
         :param Tensor x: Input tensor shaped ``(batch, dim, length)``.
@@ -704,7 +680,7 @@ class ComplexEMA(nn.Module):
         # Optional mask handling: zero masked timesteps before the recurrence so they
         # cannot inject information into the EMA hidden state (important with
         # TimestepNorm, where padded tokens can become non-zero after normalization).
-        last_valid_idx: Optional[Tensor] = None
+        last_valid_idx: Tensor | None = None
         if mask is not None:
             if mask.dim() != 2:
                 raise ValueError(
@@ -753,7 +729,7 @@ class AttentionCache:
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
     count: Tensor  # (B,) total valid tokens seen per batch item (mask-aware positions)
-    mask: Optional[Tensor] = None  # (B, Lc) - True for valid, False for padded
+    mask: Tensor | None = None  # (B, Lc) - True for valid, False for padded
 
     @property
     def length(self) -> int:
@@ -776,9 +752,7 @@ class AttentionCache:
         return self.count - valid_len
 
 
-def _clamp_attn_cache(
-    cache: Optional[AttentionCache], limit: Optional[int]
-) -> Optional[AttentionCache]:
+def _clamp_attn_cache(cache: AttentionCache | None, limit: int | None) -> AttentionCache | None:
     """Clamp an attention cache to the most recent ``limit`` tokens.
 
     :param Optional[AttentionCache] cache: Existing attention cache to clamp.
@@ -801,9 +775,7 @@ def _clamp_attn_cache(
     )
 
 
-def _clamp_layer_cache(
-    cache: Optional["LayerCache"], limit: Optional[int]
-) -> Optional["LayerCache"]:
+def _clamp_layer_cache(cache: LayerCache | None, limit: int | None) -> LayerCache | None:
     """Clamp a full LayerCache (attention only) to a fixed window.
 
     :param Optional[LayerCache] cache: Layer cache containing attention and norm/EMA state.
@@ -814,9 +786,7 @@ def _clamp_layer_cache(
     if cache is None:
         return None
     if not isinstance(cache, LayerCache):
-        raise TypeError(
-            f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
-        )
+        raise TypeError(f"Expected cache to be LayerCache or None, got {type(cache).__name__}")
     attn = _clamp_attn_cache(cache.attn, limit)
     position = attn.count if attn is not None else cache.position
     return LayerCache(
@@ -840,10 +810,10 @@ class NormState:
 class LayerCache:
     """Streaming cache combining attention, normalization, and EMA state."""
 
-    attn: Optional[AttentionCache] = None
-    norm: Optional[NormState] = None
-    ema: Optional[Tensor] = None
-    position: Optional[Tensor] = (
+    attn: AttentionCache | None = None
+    norm: NormState | None = None
+    ema: Tensor | None = None
+    position: Tensor | None = (
         None  # (B,) absolute position cursor (valid token count) for RoPE per batch item
     )
 
@@ -869,7 +839,7 @@ class ChunkedSelfAttention(nn.Module):
         head_dim: int,
         value_head_dim: int,
         chunk_size: int,
-        rope_base: Optional[float],
+        rope_base: float | None,
         attention_dropout: float,
     ):
         """Initialise chunked attention with rotary embeddings and caching.
@@ -912,13 +882,13 @@ class ChunkedSelfAttention(nn.Module):
 
     def _dropkey_additive_mask(
         self,
-        shape: Tuple[int, ...],
+        shape: tuple[int, ...],
         device: torch.device,
         dtype: torch.dtype,
         training: bool,
-        valid_mask: Optional[Tensor] = None,
-        keep_cols: Optional[Tensor] = None,
-    ) -> Optional[Tensor]:
+        valid_mask: Tensor | None = None,
+        keep_cols: Tensor | None = None,
+    ) -> Tensor | None:
         """DropKey placeholder (not implemented; kept for API parity).
 
         :param Tuple[int, ...] shape: Desired mask shape.
@@ -937,18 +907,15 @@ class ChunkedSelfAttention(nn.Module):
         k: Tensor,
         v: Tensor,
         start_index: int,
-        cache: Optional[AttentionCache],
-        attn_mask: Optional[Tensor],
+        cache: AttentionCache | None,
+        attn_mask: Tensor | None,
         training: bool,
-        max_cache_len: Optional[int] = None,
+        max_cache_len: int | None = None,
         return_cache: bool = False,
         return_position: bool = False,
         cache_unbounded: bool = False,
-        position_ids: Optional[Tensor] = None,
-    ) -> (
-        Tuple[Tensor, Optional[AttentionCache]]
-        | Tuple[Tensor, Optional[AttentionCache], Tensor]
-    ):
+        position_ids: Tensor | None = None,
+    ) -> tuple[Tensor, AttentionCache | None] | tuple[Tensor, AttentionCache | None, Tensor]:
         """Compute chunked self-attention and return the result plus cache.
 
         :param Tensor q: Query tensor shaped ``(batch, length, heads, dim_q)``.
@@ -998,35 +965,29 @@ class ChunkedSelfAttention(nn.Module):
                 if cache is not None:
                     cur_pos = cache.count
                 else:
-                    cur_pos = torch.full(
-                        (B,), start_index, dtype=torch.long, device=device
-                    )
+                    cur_pos = torch.full((B,), start_index, dtype=torch.long, device=device)
                 return empty_out, result_cache, cur_pos
             return empty_out, result_cache
         if position_ids is None and attn_mask is not None:
             if cache is not None:
                 start_pos = cache.count
             else:
-                start_pos = torch.full(
-                    (B,), start_index, dtype=torch.long, device=device
-                )
+                start_pos = torch.full((B,), start_index, dtype=torch.long, device=device)
             mask_long = attn_mask.to(torch.long)
             pos_offsets = mask_long.cumsum(dim=1) - 1
             pos_offsets = pos_offsets.clamp(min=0)
             position_ids = start_pos.unsqueeze(1) + pos_offsets
-        faithful_chunk_local = (not cache_unbounded) and (
-            cache_limit == self.chunk_size
-        )
+        faithful_chunk_local = (not cache_unbounded) and (cache_limit == self.chunk_size)
 
         def attend_single_chunk(
             q_blk: Tensor,
             k_blk: Tensor,
             v_blk: Tensor,
             start_pos: Tensor,
-            cache_blk: Optional[AttentionCache],
-            mask_blk: Optional[Tensor],
-            position_ids_blk: Optional[Tensor] = None,
-        ) -> Tuple[Tensor, Optional[AttentionCache], Tensor]:
+            cache_blk: AttentionCache | None,
+            mask_blk: Tensor | None,
+            position_ids_blk: Tensor | None = None,
+        ) -> tuple[Tensor, AttentionCache | None, Tensor]:
             """Attend over a single chunk (L <= chunk_size) with optional cache.
 
             :param Tensor q_blk: Query block shaped ``(batch, length, heads, dim_q)``.
@@ -1039,27 +1000,20 @@ class ChunkedSelfAttention(nn.Module):
             :return Tuple[Tensor, Optional[AttentionCache], Tensor]: Attention outputs, updated cache, and new position cursor.
             """
             if cache_limit is None:
-                keep_limit: Optional[int] = None
+                keep_limit: int | None = None
             else:
                 keep_limit = (
                     cache_limit
                     if return_cache
-                    else (cache_blk.length if cache_blk is not None else 0)
-                    + k_blk.size(1)
+                    else (cache_blk.length if cache_blk is not None else 0) + k_blk.size(1)
                 )
             # Clamp incoming cache only when streaming.
-            if (
-                cache_blk is not None
-                and keep_limit is not None
-                and cache_blk.length > keep_limit
-            ):
+            if cache_blk is not None and keep_limit is not None and cache_blk.length > keep_limit:
                 cache_blk = AttentionCache(
                     k=cache_blk.k[:, -keep_limit:],
                     v=cache_blk.v[:, -keep_limit:],
                     count=cache_blk.count,
-                    mask=cache_blk.mask[:, -keep_limit:]
-                    if cache_blk.mask is not None
-                    else None,
+                    mask=cache_blk.mask[:, -keep_limit:] if cache_blk.mask is not None else None,
                 )
             B_, L_, H_, Dh_ = q_blk.shape
             # Build position_ids for RoPE from per-batch start positions
@@ -1067,18 +1021,14 @@ class ChunkedSelfAttention(nn.Module):
                 offsets = torch.arange(L_, device=device, dtype=torch.long)
                 position_ids_blk = start_pos.unsqueeze(1) + offsets.unsqueeze(0)
             # Rotate only the new block, then concatenate with already-rotated cache.
-            q_blk, k_blk = self.rope(
-                q_blk, k_blk, start_index=0, position_ids=position_ids_blk
-            )
+            q_blk, k_blk = self.rope(q_blk, k_blk, start_index=0, position_ids=position_ids_blk)
             if cache_blk is not None:
                 k_cat = torch.cat([cache_blk.k, k_blk], dim=1)
                 v_cat = torch.cat([cache_blk.v, v_blk], dim=1)
             else:
                 k_cat = k_blk
                 v_cat = v_blk
-            keep = (
-                k_cat.size(1) if keep_limit is None else min(keep_limit, k_cat.size(1))
-            )
+            keep = k_cat.size(1) if keep_limit is None else min(keep_limit, k_cat.size(1))
             if keep_limit is not None and k_cat.size(1) > keep:
                 k_cat = k_cat[:, -keep:]
                 v_cat = v_cat[:, -keep:]
@@ -1095,9 +1045,7 @@ class ChunkedSelfAttention(nn.Module):
                     if has_prefix_mask:
                         prefix_mask = cache_blk.mask
                     else:
-                        prefix_mask = q_blk.new_ones(
-                            B_, cache_blk.length, dtype=torch.bool
-                        )
+                        prefix_mask = q_blk.new_ones(B_, cache_blk.length, dtype=torch.bool)
                 else:
                     prefix_mask = None
                 if has_current_mask:
@@ -1127,9 +1075,7 @@ class ChunkedSelfAttention(nn.Module):
                     cache_positions = cache_mask_long.cumsum(dim=1) - 1
                     cache_positions = cache_positions.clamp(min=0)
                     cache_positions = cache_offset.unsqueeze(1) + cache_positions
-                key_positions = torch.cat(
-                    [cache_positions, position_ids_blk.to(torch.long)], dim=1
-                )
+                key_positions = torch.cat([cache_positions, position_ids_blk.to(torch.long)], dim=1)
             else:
                 key_positions = position_ids_blk.to(torch.long)
             if key_positions.size(1) > Lk_blk:
@@ -1175,9 +1121,7 @@ class ChunkedSelfAttention(nn.Module):
                 # Check: for every valid query, must have at least one valid key
                 # has_valid_key: (B_, 1, L_) -> squeeze to (B_, L_)
                 # Only check positions where query_is_valid is True
-                valid_queries_have_keys = ~query_is_valid | has_valid_key.squeeze(
-                    1
-                )  # (B_, L_)
+                valid_queries_have_keys = ~query_is_valid | has_valid_key.squeeze(1)  # (B_, L_)
                 if not valid_queries_have_keys.all():
                     raise ValueError(
                         "Fully-masked sequences detected: some non-padded query positions "
@@ -1224,14 +1168,12 @@ class ChunkedSelfAttention(nn.Module):
 
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
             if mask_blk is not None:
-                out_blk = torch.where(
-                    mask_blk.unsqueeze(-1), out_blk, out_blk.new_zeros(())
-                )
+                out_blk = torch.where(mask_blk.unsqueeze(-1), out_blk, out_blk.new_zeros(()))
             return out_blk, new_cache_blk, total
 
         streaming_mode = return_cache or (cache is not None)
         if streaming_mode:
-            outs: List[Tensor] = []
+            outs: list[Tensor] = []
             cur_cache = cache
             # Convert start_index to per-batch tensor if needed
             if cache is not None:
@@ -1263,12 +1205,8 @@ class ChunkedSelfAttention(nn.Module):
                             )
                         if cur_cache.length > 0:
                             keep_counts = pos_in_chunk.clamp(max=cur_cache.length)
-                            idx = torch.arange(
-                                cur_cache.length, device=device
-                            ).unsqueeze(0)
-                            chunk_mask = idx >= (
-                                cur_cache.length - keep_counts
-                            ).unsqueeze(1)
+                            idx = torch.arange(cur_cache.length, device=device).unsqueeze(0)
+                            chunk_mask = idx >= (cur_cache.length - keep_counts).unsqueeze(1)
                             if cur_cache.mask is None:
                                 if not chunk_mask.all():
                                     cur_cache = AttentionCache(
@@ -1288,15 +1226,11 @@ class ChunkedSelfAttention(nn.Module):
                     chunk_len = min(remaining, self.chunk_size - max_pos_in_chunk)
                 else:
                     chunk_len = (
-                        min(remaining, self.chunk_size)
-                        if L > self.chunk_size
-                        else remaining
+                        min(remaining, self.chunk_size) if L > self.chunk_size else remaining
                     )
                 end = offset + chunk_len
                 mask_chunk = None if attn_mask is None else attn_mask[:, offset:end]
-                pos_ids_chunk = (
-                    None if position_ids is None else position_ids[:, offset:end]
-                )
+                pos_ids_chunk = None if position_ids is None else position_ids[:, offset:end]
                 q_blk = q[:, offset:end]
                 k_blk = k[:, offset:end]
                 v_blk = v[:, offset:end]
@@ -1330,9 +1264,7 @@ class ChunkedSelfAttention(nn.Module):
         # Single-block path (non-streaming or already chunked)
         if L <= self.chunk_size:
             # Convert start_index to per-batch tensor
-            start_pos_tensor = torch.full(
-                (B,), start_index, dtype=torch.long, device=device
-            )
+            start_pos_tensor = torch.full((B,), start_index, dtype=torch.long, device=device)
             out, new_cache, new_pos = attend_single_chunk(
                 q, k, v, start_pos_tensor, cache, attn_mask, position_ids
             )
@@ -1351,9 +1283,7 @@ class ChunkedSelfAttention(nn.Module):
         if attn_mask is None:
             # === VECTORIZED PATH (fast) ===
             # Apply RoPE once to full sequence with absolute positions
-            q_rot, k_rot = self.rope(
-                q, k, start_index=start_index, position_ids=position_ids
-            )
+            q_rot, k_rot = self.rope(q, k, start_index=start_index, position_ids=position_ids)
 
             # Reshape: (B, L, H, Dh) -> (B*nc, C, H, Dh)
             q_chunks = q_rot.view(B, nc, C, H, Dh).reshape(B * nc, C, H, Dh)
@@ -1384,9 +1314,7 @@ class ChunkedSelfAttention(nn.Module):
             k_chunks = k[:, -L:].view(B, nc, C, H, Dh)
             v_chunks = v[:, -L:].view(B, nc, C, H, Dv)
             attn_mask_chunks = attn_mask.view(B, nc, C)
-            pos_ids_chunks = (
-                None if position_ids is None else position_ids.view(B, nc, C)
-            )
+            pos_ids_chunks = None if position_ids is None else position_ids.view(B, nc, C)
 
             # Pre-compute causal mask for manual path
             mask_block = self._causal_mask(C, C, device, torch.float32)
@@ -1408,9 +1336,7 @@ class ChunkedSelfAttention(nn.Module):
                 mask_i = attn_mask_chunks[:, i]
                 # Combine causal + padding: broadcastable (B, 1, C, C)
                 mask_chunk = mask_block.unsqueeze(0).expand(B, -1, -1).unsqueeze(1)
-                mask_chunk = mask_chunk.masked_fill(
-                    (mask_i == 0).view(B, 1, 1, C), float("-inf")
-                )
+                mask_chunk = mask_chunk.masked_fill((mask_i == 0).view(B, 1, 1, C), float("-inf"))
 
                 if self._sdpa_available:
                     out_i = F.scaled_dot_product_attention(
@@ -1440,14 +1366,11 @@ class ChunkedSelfAttention(nn.Module):
             out = out[:, :orig_L, :]
         # Convert final_pos to per-batch tensor (mask-aware when provided)
         if attn_mask is None:
-            final_pos = torch.full(
-                (B,), start_index + orig_L, dtype=torch.long, device=device
-            )
+            final_pos = torch.full((B,), start_index + orig_L, dtype=torch.long, device=device)
         else:
             valid_counts = attn_mask.to(torch.long).sum(dim=1)
             final_pos = (
-                torch.full((B,), start_index, dtype=torch.long, device=device)
-                + valid_counts
+                torch.full((B,), start_index, dtype=torch.long, device=device) + valid_counts
             )
         if return_position:
             return out, None, final_pos
@@ -1542,13 +1465,13 @@ class MegalodonAttention(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cache: Optional[LayerCache] = None,
-        attn_mask: Optional[Tensor] = None,
+        cache: LayerCache | None = None,
+        attn_mask: Tensor | None = None,
         return_cache: bool = False,
-        max_cache_len: Optional[int] = None,
-    ) -> Tuple[
+        max_cache_len: int | None = None,
+    ) -> tuple[
         Tensor,
-        Optional[LayerCache],
+        LayerCache | None,
     ]:
         """Run the Megalodon attention block and return outputs plus cache.
 
@@ -1564,9 +1487,7 @@ class MegalodonAttention(nn.Module):
 
         # Validate cache type
         if cache is not None and not isinstance(cache, LayerCache):
-            raise TypeError(
-                f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
-            )
+            raise TypeError(f"Expected cache to be LayerCache or None, got {type(cache).__name__}")
         if cache is not None:
             attn_cache = cache.attn
             # Position is now Optional[Tensor]; when attn_cache exists, its count is used
@@ -1701,9 +1622,7 @@ class NormalizedFFN(nn.Module):
         """
         super().__init__()
         D, H = cfg.model_dim, cfg.ffn_hidden_dim
-        self.norm = nn.LayerNorm(
-            D, eps=cfg.norm_eps, elementwise_affine=cfg.norm_affine
-        )
+        self.norm = nn.LayerNorm(D, eps=cfg.norm_eps, elementwise_affine=cfg.norm_affine)
         self.swiglu = cfg.swiglu
         self.alpha = (0.1 * (0.5**layer_id)) if cfg.rescale_nffn else None
 
@@ -1730,7 +1649,7 @@ class NormalizedFFN(nn.Module):
         """
         return x if self.alpha is None else (self.alpha * x)
 
-    def forward(self, x: Tensor, residual_base: Optional[Tensor] = None) -> Tensor:
+    def forward(self, x: Tensor, residual_base: Tensor | None = None) -> Tensor:
         """Run the normalized feed-forward block with optional SwiGLU.
 
         When ``residual_base`` is provided, it is used for the residual addition.
@@ -1774,11 +1693,11 @@ class MegalodonBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cache: Optional[LayerCache] = None,
-        attn_mask: Optional[Tensor] = None,
+        cache: LayerCache | None = None,
+        attn_mask: Tensor | None = None,
         return_cache: bool = False,
-        max_cache_len: Optional[int] = None,
-    ) -> Tuple[Tensor, Optional[LayerCache]]:
+        max_cache_len: int | None = None,
+    ) -> tuple[Tensor, LayerCache | None]:
         """Apply attention + FFN returning updated states and cache.
 
         :param Tensor x: Input activations shaped ``(batch, length, dim)``.
@@ -1789,9 +1708,7 @@ class MegalodonBlock(nn.Module):
         :return Tuple[Tensor, Optional[LayerCache]]: Tuple of updated hidden states and optional cache.
         """
         if cache is not None and not isinstance(cache, LayerCache):
-            raise TypeError(
-                f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
-            )
+            raise TypeError(f"Expected cache to be LayerCache or None, got {type(cache).__name__}")
         residual_base = x
         x, cache = self.attn(
             x,
@@ -1834,9 +1751,7 @@ class MegalodonModel(PreTrainedModel):
         if config.init_mode != "none":
             init_emb = get_init_fn(config.init_mode, dim=D)
             init_emb(self.embed.weight)
-        self.layers = nn.ModuleList(
-            [MegalodonBlock(config, i) for i in range(config.num_layers)]
-        )
+        self.layers = nn.ModuleList([MegalodonBlock(config, i) for i in range(config.num_layers)])
         self.norm = TimestepNorm(
             D, config.norm_num_groups, eps=config.norm_eps, affine=config.norm_affine
         )
@@ -1860,9 +1775,7 @@ class MegalodonModel(PreTrainedModel):
         """
         self.embed = value
 
-    def _gradient_checkpointing_func(
-        self, func: Callable[..., Tensor], *inputs: Tensor
-    ) -> Tensor:
+    def _gradient_checkpointing_func(self, func: Callable[..., Tensor], *inputs: Tensor) -> Tensor:
         """Forward wrapper passed to PyTorch checkpoint with new API signature.
 
         :param Callable[..., Tensor] func: Function to checkpoint.
@@ -1874,15 +1787,15 @@ class MegalodonModel(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[Tensor] = None,
-        past_key_values: Optional[List[Optional[LayerCache]]] = None,
+        attention_mask: Tensor | None = None,
+        past_key_values: list[LayerCache | None] | None = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
-        return_dict: Optional[bool] = None,
-        max_cache_len: Optional[int] = None,
+        return_dict: bool | None = None,
+        max_cache_len: int | None = None,
         enable_training_cache: bool = False,
-    ) -> BaseModelOutputWithPast | Tuple[Tensor, ...]:
+    ) -> BaseModelOutputWithPast | tuple[Tensor, ...]:
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
@@ -1902,9 +1815,7 @@ class MegalodonModel(PreTrainedModel):
         # Normalize attention mask to bool for consistent semantics
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
-            if past_key_values is not None and attention_mask.size(1) != input_ids.size(
-                1
-            ):
+            if past_key_values is not None and attention_mask.size(1) != input_ids.size(1):
                 if attention_mask.size(1) < input_ids.size(1):
                     raise ValueError(
                         "attention_mask length must match input_ids when using past_key_values."
@@ -1937,7 +1848,7 @@ class MegalodonModel(PreTrainedModel):
         use_cache = use_cache and ((not self.training) or enable_training_cache)
 
         cache_enabled = use_cache or (past_key_values is not None)
-        past_final_norm: Optional[NormState] = None
+        past_final_norm: NormState | None = None
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
@@ -1956,9 +1867,7 @@ class MegalodonModel(PreTrainedModel):
             # Check if the first non-None item is a LayerCache
             if pkv_list:
                 first_item = next((x for x in pkv_list if x is not None), None)
-                if first_item is not None and not isinstance(
-                    first_item, (LayerCache, NormState)
-                ):
+                if first_item is not None and not isinstance(first_item, (LayerCache, NormState)):
                     # Incompatible cache type (e.g., HF DynamicCache, tuple, etc.)
                     # Fall back to fresh cache
                     caches = [None] * len(self.layers)
@@ -1974,16 +1883,11 @@ class MegalodonModel(PreTrainedModel):
             if pkv_list:
                 if len(pkv_list) > len(self.layers):
                     past_final_norm = pkv_list.pop()
-                    if past_final_norm is not None and not isinstance(
-                        past_final_norm, NormState
-                    ):
+                    if past_final_norm is not None and not isinstance(past_final_norm, NormState):
                         raise TypeError(
                             f"Expected final cache entry to be NormState, got {type(past_final_norm).__name__}"
                         )
-                caches = [
-                    _clamp_layer_cache(c, cache_limit)
-                    for c in pkv_list[: len(self.layers)]
-                ]
+                caches = [_clamp_layer_cache(c, cache_limit) for c in pkv_list[: len(self.layers)]]
                 if len(caches) < len(self.layers):
                     caches.extend([None] * (len(self.layers) - len(caches)))
             else:
@@ -1993,9 +1897,7 @@ class MegalodonModel(PreTrainedModel):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
 
-                def custom_forward(
-                    y: Tensor, *, layer: MegalodonBlock = layer
-                ) -> Tensor:
+                def custom_forward(y: Tensor, *, layer: MegalodonBlock = layer) -> Tensor:
                     """Checkpointing wrapper for a single decoder block.
 
                     :param Tensor y: Input activations for the block.
@@ -2036,9 +1938,7 @@ class MegalodonModel(PreTrainedModel):
             count=norm_count.detach(), mean=norm_mean.detach(), var=norm_var.detach()
         )
 
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         last_hidden = x
         past_key_values = None
@@ -2079,11 +1979,7 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         """
         super().__init__(config)
         self.model = MegalodonModel(config)
-        lm_out = (
-            config.vocab_size
-            if config.output_size in (-1, None)
-            else config.output_size
-        )
+        lm_out = config.vocab_size if config.output_size in (-1, None) else config.output_size
         self.lm_head = nn.Linear(config.model_dim, lm_out, bias=False)
         self._tied_embeddings = lm_out == config.vocab_size
         if not self._tied_embeddings and config.init_mode != "none":
@@ -2134,17 +2030,17 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[Optional[LayerCache]]] = None,
+        attention_mask: Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        past_key_values: list[LayerCache | None] | None = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
-        return_dict: Optional[bool] = None,
-        max_cache_len: Optional[int] = None,
+        return_dict: bool | None = None,
+        max_cache_len: int | None = None,
         enable_training_cache: bool = False,
         ignore_index: int = -100,
-    ) -> CausalLMOutputWithPast | Tuple[Tensor, ...]:
+    ) -> CausalLMOutputWithPast | tuple[Tensor, ...]:
         """Run the decoder and LM head, optionally returning loss for labels.
 
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
@@ -2160,9 +2056,7 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         :param int ignore_index: Label value to ignore in cross-entropy loss (default ``-100``).
         :return CausalLMOutputWithPast or Tuple[Tensor, ...]: Language modeling outputs following Hugging Face conventions.
         """
-        return_dict = (
-            return_dict if return_dict is not None else self.config.use_return_dict
-        )
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         model_outputs = self.model(
             input_ids=input_ids,
@@ -2223,8 +2117,8 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
     def prepare_inputs_for_generation(
         self,
         input_ids: torch.LongTensor,
-        past_key_values: Optional[List[Optional[LayerCache]]] = None,
-        attention_mask: Optional[Tensor] = None,
+        past_key_values: list[LayerCache | None] | None = None,
+        attention_mask: Tensor | None = None,
         **kwargs: Any,
     ) -> dict:
         """Prepare model inputs for generation.
@@ -2294,9 +2188,7 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
                     k=attn.k.index_select(0, beam_idx),
                     v=attn.v.index_select(0, beam_idx),
                     count=attn.count.index_select(0, beam_idx),
-                    mask=attn.mask.index_select(0, beam_idx)
-                    if attn.mask is not None
-                    else None,
+                    mask=attn.mask.index_select(0, beam_idx) if attn.mask is not None else None,
                 )
 
             # Reorder norm state inside LayerCache
