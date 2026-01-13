@@ -536,7 +536,8 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
     v = torch.randn(B, chunk_size, num_heads, value_head_dim)
     cache_k = torch.randn(B, prefix_len, num_heads, head_dim)
     cache_v = torch.randn(B, prefix_len, num_heads, value_head_dim)
-    cache = AttentionCache(cache_k, cache_v, prefix_len)
+    cache_count = torch.full((B,), prefix_len, dtype=torch.long, device=cache_k.device)
+    cache = AttentionCache(cache_k, cache_v, cache_count)
     attn_mask = torch.tensor([[1, 0, 1, 1]], dtype=torch.long)
 
     out_sdpa, _ = attn(
@@ -550,7 +551,12 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
         max_cache_len=prefix_len + chunk_size,
     )
 
-    q_rot, k_rot = attn.rope(q, k, start_index=prefix_len)
+    mask_long = attn_mask.to(torch.long)
+    pos_offsets = mask_long.cumsum(dim=1) - 1
+    pos_offsets = pos_offsets.clamp(min=0)
+    position_ids = cache_count.unsqueeze(1) + pos_offsets
+
+    q_rot, k_rot = attn.rope(q, k, start_index=0, position_ids=position_ids)
     k_full = torch.cat([cache_k, k_rot], dim=1)
     v_full = torch.cat([cache_v, v], dim=1)
 
@@ -559,14 +565,20 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
     v_ = v_full.transpose(1, 2)
 
     scores = torch.matmul(q_, k_.transpose(-2, -1))
-    causal = attn._causal_mask(
-        chunk_size,
-        prefix_len + chunk_size,
-        q.device,
-        q.dtype,
-        offset=prefix_len,
+
+    cache_offset = cache_count - prefix_len
+    cache_positions = cache_offset.unsqueeze(1) + torch.arange(
+        prefix_len, device=q.device
+    ).unsqueeze(0)
+    key_positions = torch.cat([cache_positions, position_ids.to(torch.long)], dim=1)
+    query_positions = position_ids.to(torch.long)
+    causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(2)
+    base_mask = torch.where(
+        causal,
+        torch.zeros_like(causal, dtype=q_.dtype),
+        torch.tensor(float("-inf"), dtype=q_.dtype, device=q.device),
     )
-    scores = scores + causal
+    scores = scores + base_mask.unsqueeze(1)
 
     prefix_mask = attn_mask.new_ones(B, prefix_len)
     mask_tokens = torch.cat([prefix_mask, attn_mask], dim=1)
@@ -575,6 +587,7 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
 
     weights = torch.softmax(scores.float(), dim=-1).to(q_)
     ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, chunk_size, -1)
+    ref = torch.where(attn_mask.unsqueeze(-1).bool(), ref, ref.new_zeros(()))
     assert torch.allclose(out_sdpa, ref, atol=1e-5, rtol=1e-5)
 
 
@@ -721,8 +734,7 @@ def test_complex_ema_fft_chunked_matches_full() -> None:
 
 
 def test_layer_cache_rejects_invalid_type() -> None:
-    """MegalodonAttention must reject invalid cache types with TypeError."""
-    import pytest
+    """Invalid cache types should be ignored to keep HF compatibility."""
 
     torch.manual_seed(0)
     cfg = MegalodonConfig(
@@ -740,11 +752,11 @@ def test_layer_cache_rejects_invalid_type() -> None:
     with torch.no_grad():
         _ = model(x, use_cache=False)
 
-    # Invalid: tuple cache should raise TypeError
+    # Invalid: tuple cache should be ignored (treated as no cache)
     invalid_cache = [(None, None, None)]  # Old-style tuple cache
-    with pytest.raises(TypeError, match="Expected cache to be LayerCache"):
-        with torch.no_grad():
-            _ = model(x, past_key_values=invalid_cache)
+    with torch.no_grad():
+        out = model(x, past_key_values=invalid_cache, use_cache=True, return_dict=True)
+    assert out.logits.shape == (1, 32, cfg.vocab_size)
 
 
 @torch.no_grad()
@@ -848,7 +860,7 @@ def test_cache_equivalence_multi_chunk_tail() -> None:
 
 
 def test_attention_cache_respects_max_len() -> None:
-    """Attention cache should obey the caller-provided max_cache_len limit."""
+    """Attention cache should reject max_cache_len smaller than chunk_size."""
     torch.manual_seed(0)
     cfg = MegalodonConfig(
         model_dim=16,
@@ -868,17 +880,14 @@ def test_attention_cache_respects_max_len() -> None:
     x = torch.randn(B, L, cfg.model_dim)
     mask = torch.ones(B, L, dtype=torch.long)
 
-    _, cache = attn(
-        x,
-        cache=None,
-        attn_mask=mask,
-        return_cache=True,
-        max_cache_len=5,
-    )
-
-    assert cache is not None and cache.attn is not None
-    assert cache.attn.k.shape[1] == 5
-    assert cache.attn.count == L
+    with pytest.raises(ValueError, match="max_cache_len"):
+        _ = attn(
+            x,
+            cache=None,
+            attn_mask=mask,
+            return_cache=True,
+            max_cache_len=5,
+        )
 
 
 def test_attention_cache_truncation_keeps_causality() -> None:
@@ -900,12 +909,14 @@ def test_attention_cache_truncation_keeps_causality() -> None:
     B = 1
     k_past = torch.randn(B, past_len, H, Dh)
     v_past = torch.randn(B, past_len, H, Dv)
-    cache_full = AttentionCache(k_past, v_past, past_len)
+    cache_count = torch.full((B,), past_len, dtype=torch.long, device=k_past.device)
+    cache_full = AttentionCache(k_past, v_past, cache_count)
 
     q_new = torch.randn(B, new_len, H, Dh)
     k_new = torch.randn(B, new_len, H, Dh)
     v_new = torch.randn(B, new_len, H, Dv)
-    pos_in_chunk = cache_full.count % chunk_size
+    start_index = int(cache_full.count[0].item())
+    pos_in_chunk = start_index % chunk_size
     effective_limit = min(max_cache_len, pos_in_chunk) if pos_in_chunk > 0 else 0
 
     # Path A: provide full cache, let attention clamp internally.
@@ -913,7 +924,7 @@ def test_attention_cache_truncation_keeps_causality() -> None:
         q_new,
         k_new,
         v_new,
-        start_index=cache_full.count,
+        start_index=start_index,
         cache=cache_full,
         attn_mask=None,
         training=False,
@@ -935,7 +946,7 @@ def test_attention_cache_truncation_keeps_causality() -> None:
         q_new,
         k_new,
         v_new,
-        start_index=cache_full.count,
+        start_index=start_index,
         cache=cache_manual,
         attn_mask=None,
         training=False,
@@ -981,8 +992,9 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         return_position=True,
     )
     assert out1.shape == (B, chunk_size, H * Dv)
-    assert cache1 is not None and cache1.length == chunk_size and cache1.count == chunk_size
-    assert pos1 == chunk_size
+    assert cache1 is not None and cache1.length == chunk_size
+    assert cache1.count.item() == chunk_size
+    assert pos1.item() == chunk_size
 
     q2 = torch.randn(B, chunk_size, H, Dh)
     k2 = torch.randn(B, chunk_size, H, Dh)
@@ -992,7 +1004,7 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         q2,
         k2,
         v2,
-        start_index=pos1,
+        start_index=int(pos1[0].item()),
         cache=cache1,
         attn_mask=mask,
         training=False,
@@ -1004,16 +1016,17 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
     assert out2.shape == (B, chunk_size, H * Dv)
     assert cache2 is not None
     assert cache2.length == max_cache_len
-    assert cache2.count == pos1 + chunk_size
-    assert cache2.start_index == cache2.count - cache2.length
-    assert pos2 == cache2.count
+    pos1_val = int(pos1[0].item())
+    assert cache2.count.item() == pos1_val + chunk_size
+    assert torch.equal(cache2.start_index, cache2.count - cache2.length)
+    assert torch.equal(pos2, cache2.count)
 
     # Unbounded cache should retain the full history (2 * chunk_size).
     out_u, cache_u, pos_u = attn(
         q2,
         k2,
         v2,
-        start_index=pos1,
+        start_index=pos1_val,
         cache=cache1,
         attn_mask=mask,
         training=False,
@@ -1028,16 +1041,16 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
 
     # Manual reference with sliding window (keep last max_cache_len keys)
     q1_rot, k1_rot = attn.rope(q1, k1, start_index=0)
-    q2_rot, k2_rot = attn.rope(q2, k2, start_index=pos1)
+    q2_rot, k2_rot = attn.rope(q2, k2, start_index=pos1_val)
     k_all = torch.cat([k1_rot, k2_rot], dim=1)
     v_all = torch.cat([v1, v2], dim=1)
     k_keep = k_all[:, -max_cache_len:]
     v_keep = v_all[:, -max_cache_len:]
 
     key_positions = torch.arange(
-        pos1 + chunk_size - max_cache_len, pos1 + chunk_size, device=q1.device
+        pos1_val + chunk_size - max_cache_len, pos1_val + chunk_size, device=q1.device
     )
-    query_positions = torch.arange(pos1, pos1 + chunk_size, device=q1.device)
+    query_positions = torch.arange(pos1_val, pos1_val + chunk_size, device=q1.device)
     causal = key_positions.view(1, 1, 1, max_cache_len) <= query_positions.view(1, 1, chunk_size, 1)
     mask_causal = torch.where(
         causal,
