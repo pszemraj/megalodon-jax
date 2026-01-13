@@ -1041,11 +1041,13 @@ class TestFix6InitMode:
         # BERT init has stddev=0.02, which should have much smaller variance than He
         bert_var = jnp.var(model_bert.model.embed.weight)
         he_var = jnp.var(model_he.model.embed.weight)
+        xavier_var = jnp.var(model_xavier.model.embed.weight)
 
         # BERT has fixed small stddev, He scales with dimensions
         # BERT std=0.02 means var ~0.0004
         assert bert_var < 0.01, f"BERT init variance {bert_var} should be small"
-        assert he_var != bert_var, "Different init modes should produce different weights"
+        assert xavier_var > bert_var, "Xavier init variance should exceed BERT variance"
+        assert he_var > xavier_var, "He init variance should exceed Xavier variance"
 
 
 class TestComputeLossMasking:
@@ -1176,7 +1178,7 @@ class TestComputeLossMasking:
         # Use -1 as ignore index instead of -100
         labels_custom = labels.at[:, -4:].set(-1)
         loss = model.compute_loss(input_ids, labels_custom, ignore_index=-1)
-        assert jnp.isfinite(loss), f"Loss should be finite with custom ignore_index"
+        assert jnp.isfinite(loss), "Loss should be finite with custom ignore_index"
 
     def test_bounds_check_only_on_valid_labels(self, random_seed):
         """Test that bounds check only applies to non-ignored labels."""
