@@ -1,6 +1,7 @@
 """Phase 5 inference and conversion tests."""
 
 from dataclasses import asdict
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -22,7 +23,10 @@ from tests.torch_ref import megalodon as torch_megalodon
 
 
 def small_config() -> MegalodonConfig:
-    """Create a tiny config for fast inference tests."""
+    """Create a tiny config for fast inference tests.
+
+    :return MegalodonConfig: Minimal configuration for inference tests.
+    """
     return MegalodonConfig(
         vocab_size=64,
         model_dim=64,
@@ -40,7 +44,11 @@ def small_config() -> MegalodonConfig:
 class TestCacheUtilities:
     """Cache init/index/trim helpers."""
 
-    def test_init_and_trim_cache_shapes(self):
+    def test_init_and_trim_cache_shapes(self) -> None:
+        """Validate cache initialization and trimming shapes.
+
+        :return None: None.
+        """
         config = small_config()
         cache = init_cache(config, batch_size=2, allocate_kv=True)
 
@@ -77,7 +85,11 @@ class TestCacheUtilities:
         assert trimmed_attn is not None
         assert trimmed_attn.k.shape[1] == config.effective_max_cache_len
 
-    def test_index_cache_slices_batch(self):
+    def test_index_cache_slices_batch(self) -> None:
+        """Ensure index_cache slices the batch dimension correctly.
+
+        :return None: None.
+        """
         config = small_config()
         cache = init_cache(config, batch_size=2, allocate_kv=True)
         layer0 = cache.layer_caches[0]
@@ -110,7 +122,11 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
-    def test_trim_cache_preserves_ring_order(self):
+    def test_trim_cache_preserves_ring_order(self) -> None:
+        """Ensure trim_cache preserves ring-buffer order.
+
+        :return None: None.
+        """
         cache_size = 6
         max_len = 4
         batch = 1
@@ -158,7 +174,11 @@ class TestCacheUtilities:
 class TestSamplingAndGeneration:
     """Sampling primitives and generation loop."""
 
-    def test_sample_token_top_k(self):
+    def test_sample_token_top_k(self) -> None:
+        """Test top-k sampling selects the highest logit.
+
+        :return None: None.
+        """
         logits = jnp.array([[0.1, 2.0, -1.0]], dtype=jnp.float32)
         token = sample_token(
             logits,
@@ -168,7 +188,11 @@ class TestSamplingAndGeneration:
         )
         assert int(token[0]) == 1
 
-    def test_generate_shapes_and_determinism(self):
+    def test_generate_shapes_and_determinism(self) -> None:
+        """Test generate shape, determinism, and vocabulary bounds.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -195,7 +219,11 @@ class TestSamplingAndGeneration:
         assert jnp.all(out1 >= 0)
         assert jnp.all(out1 < config.vocab_size)
 
-    def test_generate_single_token_updates_cache(self):
+    def test_generate_single_token_updates_cache(self) -> None:
+        """Test single-token generation updates cache counts.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -215,7 +243,11 @@ class TestSamplingAndGeneration:
         assert layer0 is not None and layer0.attn is not None
         assert int(layer0.attn.count) == prompt.shape[1] + 1
 
-    def test_generate_multi_token_updates_cache(self):
+    def test_generate_multi_token_updates_cache(self) -> None:
+        """Test multi-token generation updates cache counts.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -235,7 +267,11 @@ class TestSamplingAndGeneration:
         assert layer0 is not None and layer0.attn is not None
         assert int(layer0.attn.count) == prompt.shape[1] + 3
 
-    def test_generate_zero_new_tokens_raises(self):
+    def test_generate_zero_new_tokens_raises(self) -> None:
+        """Ensure generate rejects zero-length outputs.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -249,7 +285,11 @@ class TestSamplingAndGeneration:
                 temperature=0.0,
             )
 
-    def test_generate_uses_last_valid_token_with_padding(self):
+    def test_generate_uses_last_valid_token_with_padding(self) -> None:
+        """Use last valid token when padding is present.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -287,7 +327,11 @@ class TestSamplingAndGeneration:
 
         np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
 
-    def test_generate_uses_last_valid_token_with_left_padding(self):
+    def test_generate_uses_last_valid_token_with_left_padding(self) -> None:
+        """Use last valid token when left padding is present.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -325,7 +369,11 @@ class TestSamplingAndGeneration:
 
         np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
 
-    def test_generate_empty_prompt_uses_bos(self):
+    def test_generate_empty_prompt_uses_bos(self) -> None:
+        """Ensure empty prompts use BOS token.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.empty((1, 0), dtype=jnp.int32)
@@ -340,7 +388,11 @@ class TestSamplingAndGeneration:
         assert out.shape == (1, 2)
         assert int(out[0, 0]) == config.bos_token_id
 
-    def test_generate_sampling_requires_key_or_seed(self):
+    def test_generate_sampling_requires_key_or_seed(self) -> None:
+        """Ensure sampling requires a PRNG key or seed.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -353,7 +405,11 @@ class TestSamplingAndGeneration:
                 temperature=1.0,
             )
 
-    def test_generate_grouped_left_padding_multi_token(self):
+    def test_generate_grouped_left_padding_multi_token(self) -> None:
+        """Ensure grouped left-padding generation matches per-group outputs.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -398,7 +454,11 @@ class TestSamplingAndGeneration:
         np.testing.assert_array_equal(np.array(out[0, 4:]), np.array(out0[0, 2:]))
         np.testing.assert_array_equal(np.array(out[1, 4:]), np.array(out1[0, 3:]))
 
-    def test_generate_right_padding_raises(self):
+    def test_generate_right_padding_raises(self) -> None:
+        """Ensure right padding is rejected for generation.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -414,7 +474,11 @@ class TestSamplingAndGeneration:
                 attention_mask=attention_mask,
             )
 
-    def test_generate_padded_return_cache_raises(self):
+    def test_generate_padded_return_cache_raises(self) -> None:
+        """Ensure return_cache is rejected for padded batches.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -435,7 +499,11 @@ class TestSamplingAndGeneration:
 class TestConversion:
     """Weight conversion + SafeTensors roundtrip."""
 
-    def test_torch_roundtrip_matches_logits(self):
+    def test_torch_roundtrip_matches_logits(self) -> None:
+        """Ensure JAX export/load roundtrip preserves logits.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -449,7 +517,12 @@ class TestConversion:
 
         np.testing.assert_allclose(np.array(logits1), np.array(logits2), rtol=1e-5, atol=1e-5)
 
-    def test_safetensors_roundtrip(self, tmp_path):
+    def test_safetensors_roundtrip(self, tmp_path: Path) -> None:
+        """Ensure SafeTensors roundtrip preserves logits.
+
+        :param Path tmp_path: Temporary directory fixture.
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -473,8 +546,12 @@ class TestConversion:
             atol=1e-5,
         )
 
-    def test_export_loads_in_torch_strict(self, tmp_path):
-        """JAX export should load strictly into the PyTorch reference."""
+    def test_export_loads_in_torch_strict(self, tmp_path: Path) -> None:
+        """Ensure JAX export loads strictly in the PyTorch reference.
+
+        :param Path tmp_path: Temporary directory fixture.
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -502,7 +579,11 @@ class TestConversion:
             )
         assert not torch.isnan(out.logits).any()
 
-    def test_load_weights_requires_lm_head_for_untied(self):
+    def test_load_weights_requires_lm_head_for_untied(self) -> None:
+        """Require lm_head weight for untied head loading.
+
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=64,
             model_dim=64,
@@ -526,7 +607,11 @@ class TestConversion:
                 state_dict,
             )
 
-    def test_load_weights_rejects_swiglu_mismatch(self):
+    def test_load_weights_rejects_swiglu_mismatch(self) -> None:
+        """Reject mismatched SwiGLU configs on load.
+
+        :return None: None.
+        """
         config_swiglu = MegalodonConfig(
             vocab_size=64,
             model_dim=64,
@@ -563,8 +648,11 @@ class TestConversion:
                 state_dict,
             )
 
-    def test_tied_model_export_has_lm_head(self):
-        """Tied model should export lm_head.weight for PyTorch strict loading."""
+    def test_tied_model_export_has_lm_head(self) -> None:
+        """Ensure tied models export lm_head for strict loading.
+
+        :return None: None.
+        """
         config = small_config()  # default is tied (output_size=-1)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -582,8 +670,11 @@ class TestConversion:
             state_dict["model.embed.weight"].numpy(),
         )
 
-    def test_export_skips_rope_inv_freq_by_default(self):
-        """JAX export should omit RoPE inv_freq to match PyTorch state_dict."""
+    def test_export_skips_rope_inv_freq_by_default(self) -> None:
+        """Ensure default export omits RoPE inv_freq.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -591,8 +682,11 @@ class TestConversion:
 
         assert not any(key.endswith("inner.rope.inv_freq") for key in state_dict)
 
-    def test_export_includes_rope_inv_freq_when_requested(self):
-        """JAX export should include RoPE inv_freq when explicitly requested."""
+    def test_export_includes_rope_inv_freq_when_requested(self) -> None:
+        """Ensure explicit export includes RoPE inv_freq.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -600,8 +694,11 @@ class TestConversion:
 
         assert "model.layers.0.attn.inner.rope.inv_freq" in state_dict
 
-    def test_export_dtype_casting_keeps_cema_gamma_fp32(self):
-        """Export dtype should cast weights while keeping CEMA gamma in fp32."""
+    def test_export_dtype_casting_keeps_cema_gamma_fp32(self) -> None:
+        """Ensure dtype export keeps CEMA gamma in fp32.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -611,8 +708,11 @@ class TestConversion:
         assert state_dict["model.layers.0.attn.cema.gamma_real"].dtype == torch.float32
         assert state_dict["model.layers.0.attn.cema.gamma_imag"].dtype == torch.float32
 
-    def test_untied_model_export(self):
-        """Untied model should export separate lm_head.weight."""
+    def test_untied_model_export(self) -> None:
+        """Ensure untied models export separate lm_head weights.
+
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=64,
             model_dim=64,
@@ -639,8 +739,11 @@ class TestConversion:
         assert state_dict["lm_head.weight"].shape[0] == 32
         assert state_dict["model.embed.weight"].shape[0] == 64
 
-    def test_shape_validation_error(self):
-        """Shape mismatch between config and checkpoint should raise ValueError."""
+    def test_shape_validation_error(self) -> None:
+        """Ensure shape mismatches raise a ValueError.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -663,8 +766,11 @@ class TestConversion:
         with pytest.raises(ValueError, match="Shape mismatch"):
             load_weights_from_torch(model_wrong, state_dict)
 
-    def test_layer_count_mismatch_error(self):
-        """Layer count mismatch should raise ValueError."""
+    def test_layer_count_mismatch_error(self) -> None:
+        """Ensure layer count mismatches raise a ValueError.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -687,8 +793,11 @@ class TestConversion:
         with pytest.raises(ValueError, match="Layer count mismatch"):
             load_weights_from_torch(model_wrong, state_dict)
 
-    def test_missing_key_error(self):
-        """Missing required key should raise KeyError."""
+    def test_missing_key_error(self) -> None:
+        """Ensure missing keys raise a KeyError.
+
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -701,8 +810,12 @@ class TestConversion:
         with pytest.raises(KeyError, match="model.embed.weight"):
             load_weights_from_torch(model_copy, state_dict)
 
-    def test_dtype_casting(self, tmp_path):
-        """load_from_pretrained should cast to requested dtype."""
+    def test_dtype_casting(self, tmp_path: Path) -> None:
+        """Ensure load_from_pretrained casts to requested dtype.
+
+        :param Path tmp_path: Temporary directory fixture.
+        :return None: None.
+        """
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -719,8 +832,11 @@ class TestConversion:
         # Check that floating point params are bf16
         assert loaded.model.embed.weight.dtype == jnp.bfloat16
 
-    def test_missing_file_error(self):
-        """load_from_pretrained should raise FileNotFoundError for missing file."""
+    def test_missing_file_error(self) -> None:
+        """Ensure load_from_pretrained raises for missing files.
+
+        :return None: None.
+        """
         config = small_config()
 
         with pytest.raises(FileNotFoundError, match="Checkpoint not found"):

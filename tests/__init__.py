@@ -1,1 +1,1 @@
-# Test package marker for shared helpers.
+"""Shared test utilities package marker."""

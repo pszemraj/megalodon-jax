@@ -1,5 +1,7 @@
 """Phase 3 Attention tests - primitives, ChunkedAttention, MegalodonAttention, NormalizedFFN."""
 
+from typing import Any
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -18,12 +20,20 @@ from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert PyTorch tensor to JAX array."""
+    """Convert a PyTorch tensor to a JAX array.
+
+    :param torch.Tensor t: Input PyTorch tensor.
+    :return jnp.ndarray: JAX array on the default device.
+    """
     return jnp.array(t.detach().cpu().numpy())
 
 
 def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert JAX array to PyTorch tensor."""
+    """Convert a JAX array to a PyTorch tensor.
+
+    :param jnp.ndarray a: Input JAX array.
+    :return torch.Tensor: Torch tensor on CPU.
+    """
     return torch.from_numpy(np.array(a))
 
 
@@ -35,8 +45,12 @@ def to_torch(a: jnp.ndarray) -> torch.Tensor:
 class TestAttentionPrimitives:
     """Tests for attention_single_chunk and attention_multi_chunk."""
 
-    def test_single_chunk_shapes(self, random_seed):
-        """Test that attention_single_chunk produces correct output shapes."""
+    def test_single_chunk_shapes(self, random_seed: int) -> None:
+        """Test that attention_single_chunk produces correct output shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim, value_dim = 2, 16, 4, 32, 64
 
         key = jax.random.PRNGKey(random_seed)
@@ -50,8 +64,12 @@ class TestAttentionPrimitives:
 
         assert out.shape == (batch, seq, heads, value_dim)
 
-    def test_single_chunk_causal_masking(self, random_seed):
-        """Test that causal masking prevents attending to future positions."""
+    def test_single_chunk_causal_masking(self, random_seed: int) -> None:
+        """Test that causal masking prevents attending to future positions.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim = 1, 4, 1, 8
 
         key = jax.random.PRNGKey(random_seed)
@@ -82,8 +100,12 @@ class TestAttentionPrimitives:
             err_msg="Causal masking failed: position 0 saw future position 3",
         )
 
-    def test_single_chunk_no_temperature_scaling(self, random_seed):
-        """Test that attention uses scale=1.0 (no temperature scaling)."""
+    def test_single_chunk_no_temperature_scaling(self, random_seed: int) -> None:
+        """Test that attention uses scale=1.0 (no temperature scaling).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim = 1, 4, 1, 8
 
         key = jax.random.PRNGKey(random_seed)
@@ -99,8 +121,12 @@ class TestAttentionPrimitives:
         # Verify output is not NaN and has reasonable magnitude
         assert not jnp.any(jnp.isnan(out))
 
-    def test_single_chunk_preserves_bf16_dtype(self, random_seed):
-        """Test that attention_single_chunk preserves bf16 dtype (no forced fp32)."""
+    def test_single_chunk_preserves_bf16_dtype(self, random_seed: int) -> None:
+        """Test that attention_single_chunk preserves bf16 dtype (no forced fp32).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim, value_dim = 1, 4, 2, 16, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -115,8 +141,12 @@ class TestAttentionPrimitives:
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
 
-    def test_multi_chunk_shapes(self, random_seed):
-        """Test that attention_multi_chunk produces correct output shapes."""
+    def test_multi_chunk_shapes(self, random_seed: int) -> None:
+        """Test that attention_multi_chunk produces correct output shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim, value_dim = 2, 64, 4, 32, 64
         chunk_size = 16
 
@@ -136,8 +166,12 @@ class TestAttentionPrimitives:
 
         assert out.shape == (batch, seq, heads, value_dim)
 
-    def test_multi_chunk_padding(self, random_seed):
-        """Test multi_chunk handles sequences not divisible by chunk_size."""
+    def test_multi_chunk_padding(self, random_seed: int) -> None:
+        """Test multi_chunk handles sequences not divisible by chunk_size.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim, value_dim = 2, 50, 4, 32, 64
         chunk_size = 16  # 50 is not divisible by 16
 
@@ -168,8 +202,12 @@ class TestAttentionPrimitives:
 class TestChunkedAttention:
     """Tests for ChunkedAttention module."""
 
-    def test_forward_shapes(self, random_seed):
-        """Test ChunkedAttention forward pass shapes."""
+    def test_forward_shapes(self, random_seed: int) -> None:
+        """Test ChunkedAttention forward pass shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim, value_dim = 2, 32, 4, 32, 64
         chunk_size = 16
 
@@ -193,8 +231,12 @@ class TestChunkedAttention:
         assert out.shape == (batch, seq, heads, value_dim)
         assert cache is None  # No cache returned without return_cache=True
 
-    def test_streaming_with_cache(self, random_seed):
-        """Test ChunkedAttention streaming with cache."""
+    def test_streaming_with_cache(self, random_seed: int) -> None:
+        """Test ChunkedAttention streaming with cache.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 2, 4, 32, 64
         chunk_size = 16
 
@@ -228,8 +270,12 @@ class TestChunkedAttention:
         # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
         assert cache.k.shape[1] == chunk_size
 
-    def test_streaming_small_l_preserves_dtype_and_cache_count(self, random_seed):
-        """Small-L streaming should keep dtype and track cache count without padding."""
+    def test_streaming_small_l_preserves_dtype_and_cache_count(self, random_seed: int) -> None:
+        """Small-L streaming should keep dtype and track cache count without padding.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 2, 16, 16
         chunk_size = 8
         seq = 3  # L < chunk_size to hit the token-wise path
@@ -257,8 +303,12 @@ class TestChunkedAttention:
         assert cache.count == seq  # should only advance by actual tokens
         assert position == seq
 
-    def test_streaming_cache_ring_order(self, random_seed):
-        """Ring buffer should retain the latest tokens by absolute position."""
+    def test_streaming_cache_ring_order(self, random_seed: int) -> None:
+        """Ring buffer should retain the latest tokens by absolute position.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 1, 2, 2
         chunk_size = 4
         cache_size = 4
@@ -325,8 +375,12 @@ class TestChunkedAttention:
 class TestNormalizedFFN:
     """Tests for NormalizedFFN module."""
 
-    def test_forward_shapes(self, random_seed):
-        """Test NormalizedFFN forward pass shapes."""
+    def test_forward_shapes(self, random_seed: int) -> None:
+        """Test NormalizedFFN forward pass shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, model_dim, ffn_dim = 2, 16, 64, 128
 
         key = jax.random.PRNGKey(random_seed)
@@ -344,8 +398,12 @@ class TestNormalizedFFN:
 
         assert out.shape == (batch, seq, model_dim)
 
-    def test_swiglu_variant(self, random_seed):
-        """Test NormalizedFFN with SwiGLU activation."""
+    def test_swiglu_variant(self, random_seed: int) -> None:
+        """Test NormalizedFFN with SwiGLU activation.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, model_dim, ffn_dim = 2, 16, 64, 128
 
         key = jax.random.PRNGKey(random_seed)
@@ -364,8 +422,12 @@ class TestNormalizedFFN:
         assert out.shape == (batch, seq, model_dim)
         assert ffn.fc3 is not None  # SwiGLU has fc3
 
-    def test_two_hop_residual(self, random_seed):
-        """Test NormalizedFFN with two-hop residual."""
+    def test_two_hop_residual(self, random_seed: int) -> None:
+        """Test NormalizedFFN with two-hop residual.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, model_dim, ffn_dim = 2, 16, 64, 128
 
         key = jax.random.PRNGKey(random_seed)
@@ -387,8 +449,12 @@ class TestNormalizedFFN:
         # Two-hop should use residual_base, not x
         assert not jnp.allclose(out_normal, out_two_hop)
 
-    def test_ffn_parity(self, random_seed):
-        """Test NormalizedFFN parity with PyTorch reference."""
+    def test_ffn_parity(self, random_seed: int) -> None:
+        """Test NormalizedFFN parity with PyTorch reference.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         torch_module = torch_modeling()
         TorchConfig = torch_module.MegalodonConfig
         TorchFFN = torch_module.NormalizedFFN
@@ -452,8 +518,12 @@ class TestNormalizedFFN:
 class TestMegalodonAttention:
     """Tests for MegalodonAttention block."""
 
-    def test_forward_shapes(self, random_seed):
-        """Test MegalodonAttention forward pass shapes."""
+    def test_forward_shapes(self, random_seed: int) -> None:
+        """Test MegalodonAttention forward pass shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq = 2, 32
         model_dim, z_dim, value_dim = 64, 32, 64
         num_heads, cema_ndim, chunk_size = 4, 8, 16
@@ -479,8 +549,12 @@ class TestMegalodonAttention:
         assert y.shape == (batch, seq, model_dim)
         assert cache is None  # No cache without return_cache=True
 
-    def test_gradient_flow(self, random_seed):
-        """Test gradients flow through MegalodonAttention."""
+    def test_gradient_flow(self, random_seed: int) -> None:
+        """Test gradients flow through MegalodonAttention.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq = 2, 16
         model_dim, z_dim, value_dim = 64, 32, 64
         num_heads, cema_ndim, chunk_size = 4, 8, 16
@@ -500,7 +574,13 @@ class TestMegalodonAttention:
             key=k1,
         )
 
-        def loss_fn(model, x):
+        def loss_fn(model: MegalodonAttention, x: jnp.ndarray) -> jnp.ndarray:
+            """Compute a simple squared loss for gradient checks.
+
+            :param MegalodonAttention model: Attention module under test.
+            :param jnp.ndarray x: Input activations.
+            :return jnp.ndarray: Scalar loss value.
+            """
             y, _ = model(x)
             return jnp.sum(y**2)
 
@@ -513,8 +593,12 @@ class TestMegalodonAttention:
         assert not jnp.any(jnp.isnan(grads.wz.weight))
         assert not jnp.any(jnp.isnan(grads.wv.weight))
 
-    def test_streaming_with_cache(self, random_seed):
-        """Test MegalodonAttention streaming with cache."""
+    def test_streaming_with_cache(self, random_seed: int) -> None:
+        """Test MegalodonAttention streaming with cache.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch = 2
         model_dim, z_dim, value_dim = 64, 32, 64
         num_heads, cema_ndim, chunk_size = 4, 8, 16
@@ -559,8 +643,12 @@ class TestMegalodonAttention:
 class TestPrecision:
     """Tests for bf16 precision handling."""
 
-    def test_attention_primitives_bf16(self, random_seed):
-        """Test attention primitives work with bf16 inputs."""
+    def test_attention_primitives_bf16(self, random_seed: int) -> None:
+        """Test attention primitives work with bf16 inputs.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim = 2, 16, 4, 32
 
         key = jax.random.PRNGKey(random_seed)
@@ -575,8 +663,12 @@ class TestPrecision:
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
 
-    def test_megalodon_attention_bf16(self, random_seed):
-        """Test MegalodonAttention with bf16 inputs and params."""
+    def test_megalodon_attention_bf16(self, random_seed: int) -> None:
+        """Test MegalodonAttention with bf16 inputs and params.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq = 2, 16
         model_dim, z_dim, value_dim = 64, 32, 64
         num_heads, cema_ndim, chunk_size = 4, 8, 16
@@ -597,7 +689,12 @@ class TestPrecision:
         )
 
         # Cast params to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
@@ -610,8 +707,12 @@ class TestPrecision:
         assert y.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(y))
 
-    def test_normalized_ffn_bf16(self, random_seed):
-        """Test NormalizedFFN with bf16 inputs and params."""
+    def test_normalized_ffn_bf16(self, random_seed: int) -> None:
+        """Test NormalizedFFN with bf16 inputs and params.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, model_dim, ffn_dim = 2, 16, 64, 128
 
         key = jax.random.PRNGKey(random_seed)
@@ -625,7 +726,12 @@ class TestPrecision:
         )
 
         # Cast params to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
@@ -647,8 +753,12 @@ class TestPrecision:
 class TestJITCompilation:
     """Tests for JIT compilation stability."""
 
-    def test_chunked_attention_jit(self, random_seed):
-        """Test ChunkedAttention compiles without errors."""
+    def test_chunked_attention_jit(self, random_seed: int) -> None:
+        """Test ChunkedAttention compiles without errors.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq, heads, head_dim, value_dim = 2, 32, 4, 32, 64
         chunk_size = 16
 
@@ -664,7 +774,20 @@ class TestJITCompilation:
         )
 
         @eqx.filter_jit
-        def forward(model, q, k, v):
+        def forward(
+            model: ChunkedAttention,
+            q: jnp.ndarray,
+            k: jnp.ndarray,
+            v: jnp.ndarray,
+        ) -> tuple[jnp.ndarray, Any, Any]:
+            """Run a forward pass through ChunkedAttention.
+
+            :param ChunkedAttention model: Attention module under test.
+            :param jnp.ndarray q: Query tensor.
+            :param jnp.ndarray k: Key tensor.
+            :param jnp.ndarray v: Value tensor.
+            :return tuple[jnp.ndarray, Any, Any]: Output, cache, and position.
+            """
             return model(q, k, v)
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim))
@@ -674,7 +797,7 @@ class TestJITCompilation:
         out, _, _ = forward(attn, q, k, v)
         assert out.shape == (batch, seq, heads, value_dim)
 
-    def test_streaming_jit_no_recompile(self, random_seed):
+    def test_streaming_jit_no_recompile(self, random_seed: int) -> None:
         """Verify streaming path is JIT-compatible without recompilation.
 
         This test ensures that:
@@ -697,7 +820,22 @@ class TestJITCompilation:
         )
 
         @eqx.filter_jit
-        def step(model, q, k, v, cache):
+        def step(
+            model: ChunkedAttention,
+            q: jnp.ndarray,
+            k: jnp.ndarray,
+            v: jnp.ndarray,
+            cache: Any,
+        ) -> tuple[jnp.ndarray, Any, Any]:
+            """Run a streaming step through ChunkedAttention.
+
+            :param ChunkedAttention model: Attention module under test.
+            :param jnp.ndarray q: Query tensor.
+            :param jnp.ndarray k: Key tensor.
+            :param jnp.ndarray v: Value tensor.
+            :param Any cache: Optional attention cache.
+            :return tuple[jnp.ndarray, Any, Any]: Output, cache, and position.
+            """
             return model(q, k, v, cache=cache, return_cache=True)
 
         # Process 10 tokens one at a time
@@ -717,8 +855,12 @@ class TestJITCompilation:
         assert cache.k.shape[1] == chunk_size
         assert int(cache.count) == 10
 
-    def test_megalodon_attention_jit(self, random_seed):
-        """Test MegalodonAttention compiles without errors."""
+    def test_megalodon_attention_jit(self, random_seed: int) -> None:
+        """Test MegalodonAttention compiles without errors.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq = 2, 32
         model_dim, z_dim, value_dim = 64, 32, 64
         num_heads, cema_ndim, chunk_size = 4, 8, 16
@@ -739,7 +881,16 @@ class TestJITCompilation:
         )
 
         @eqx.filter_jit
-        def forward(model, x):
+        def forward(
+            model: MegalodonAttention,
+            x: jnp.ndarray,
+        ) -> tuple[jnp.ndarray, Any]:
+            """Run a forward pass through MegalodonAttention.
+
+            :param MegalodonAttention model: Attention module under test.
+            :param jnp.ndarray x: Input tensor.
+            :return tuple[jnp.ndarray, Any]: Output and cache.
+            """
             return model(x)
 
         x = jax.random.normal(k2, (batch, seq, model_dim))
@@ -755,8 +906,15 @@ class TestJITCompilation:
 class TestStreamingEquivalence:
     """Tests for streaming (token-by-token) equivalence with batch processing."""
 
-    def test_chunked_attention_streaming_equivalence(self, random_seed, force_fp32_matmul):
-        """Verify streaming with cache matches batch processing within a chunk."""
+    def test_chunked_attention_streaming_equivalence(
+        self, random_seed: int, force_fp32_matmul: None
+    ) -> None:
+        """Verify streaming with cache matches batch processing within a chunk.
+
+        :param int random_seed: Random seed fixture.
+        :param None force_fp32_matmul: Fixture enabling fp32 matmul precision.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 2, 16, 16
         chunk_size = 8
         seq_len = 6  # Within one chunk
@@ -802,8 +960,12 @@ class TestStreamingEquivalence:
             err_msg="Streaming output should match batch output within a single chunk",
         )
 
-    def test_chunk_boundary_cache_reset(self, random_seed):
-        """Verify cache is reset at chunk boundaries."""
+    def test_chunk_boundary_cache_reset(self, random_seed: int) -> None:
+        """Verify cache is reset at chunk boundaries.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 2, 8, 8
         chunk_size = 4
 
@@ -834,8 +996,12 @@ class TestStreamingEquivalence:
             # The count tracks absolute position
             assert cache.count == i + 1, f"Cache count should be {i + 1}, got {cache.count}"
 
-    def test_cache_resize_on_input(self, random_seed):
-        """Test that incoming caches are resized to fixed buffer size."""
+    def test_cache_resize_on_input(self, random_seed: int) -> None:
+        """Test that incoming caches are resized to fixed buffer size.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 2, 8, 8
         chunk_size = 4
 
@@ -882,8 +1048,12 @@ class TestStreamingEquivalence:
 class TestParity:
     """Additional parity tests for MegalodonAttention and related modules."""
 
-    def test_chunked_attention_block_diagonal_structure(self, random_seed):
-        """Verify block-diagonal attention structure across chunks."""
+    def test_chunked_attention_block_diagonal_structure(self, random_seed: int) -> None:
+        """Verify block-diagonal attention structure across chunks.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 2, 8, 8
         chunk_size = 4
         seq_len = 8  # Two full chunks
@@ -932,8 +1102,12 @@ class TestParity:
             err_msg="Second chunk output should match independent processing",
         )
 
-    def test_multi_token_streaming_across_boundary(self, random_seed):
-        """Test that multi-token streaming calls properly split across chunk boundaries."""
+    def test_multi_token_streaming_across_boundary(self, random_seed: int) -> None:
+        """Test that multi-token streaming calls properly split across chunk boundaries.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, heads, head_dim, value_dim = 1, 2, 8, 8
         chunk_size = 4
 
@@ -1003,8 +1177,15 @@ class TestParity:
 class TestMegalodonAttentionParity:
     """Parity tests for MegalodonAttention against PyTorch reference."""
 
-    def test_megalodon_attention_forward_parity(self, random_seed, torch_device):
-        """Test MegalodonAttention forward pass parity with PyTorch reference."""
+    def test_megalodon_attention_forward_parity(
+        self, random_seed: int, torch_device: torch.device
+    ) -> None:
+        """Test MegalodonAttention forward pass parity with PyTorch reference.
+
+        :param int random_seed: Random seed fixture.
+        :param torch.device torch_device: Torch device fixture.
+        :return None: None.
+        """
         from tests.conftest import sync_and_clear_torch
 
         pytest = __import__("pytest")
@@ -1160,8 +1341,12 @@ class TestMegalodonAttentionParity:
             err_msg="MegalodonAttention output should match PyTorch reference",
         )
 
-    def test_megalodon_attention_gradient_flow(self, random_seed):
-        """Verify gradients flow through all parameters without NaN."""
+    def test_megalodon_attention_gradient_flow(self, random_seed: int) -> None:
+        """Verify gradients flow through all parameters without NaN.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         batch, seq_len = 1, 8
         model_dim = 32
         z_dim = 16
@@ -1187,7 +1372,12 @@ class TestMegalodonAttentionParity:
 
         x = jax.random.normal(k2, (batch, seq_len, model_dim))
 
-        def loss_fn(model):
+        def loss_fn(model: MegalodonAttention) -> jnp.ndarray:
+            """Compute a mean-squared loss for gradient checks.
+
+            :param MegalodonAttention model: Attention module under test.
+            :return jnp.ndarray: Scalar loss value.
+            """
             y, _ = model(x, deterministic=True)
             return jnp.mean(y**2)
 

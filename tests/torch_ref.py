@@ -10,6 +10,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _ensure_external(module: ModuleType, name: str) -> ModuleType:
+    """Ensure the imported module resolves outside this repository.
+
+    :param ModuleType module: Imported module instance to validate.
+    :param str name: Module name for error reporting.
+    :raises RuntimeError: If the module resolves inside this repository.
+    :return ModuleType: The validated module instance.
+    """
     module_path = getattr(module, "__file__", None)
     if module_path is None:
         return module
@@ -20,6 +27,12 @@ def _ensure_external(module: ModuleType, name: str) -> ModuleType:
 
 
 def _import_external(name: str) -> ModuleType:
+    """Import a module and guard against in-repo resolution.
+
+    :param str name: Module import path.
+    :raises RuntimeError: If megalodon-hf is not installed or resolves locally.
+    :return ModuleType: Imported module instance.
+    """
     try:
         module = importlib.import_module(name)
     except ModuleNotFoundError as exc:
@@ -33,11 +46,17 @@ def _import_external(name: str) -> ModuleType:
 
 
 def megalodon() -> object:
-    """Import the external megalodon package."""
+    """Import the external megalodon package.
+
+    :return object: The imported megalodon package module.
+    """
     return _import_external("megalodon")
 
 
 def modeling() -> object:
-    """Import megalodon.modeling_megalodon from the external package."""
+    """Import megalodon.modeling_megalodon from the external package.
+
+    :return object: The imported modeling module from megalodon-hf.
+    """
     _import_external("megalodon")
     return _import_external("megalodon.modeling_megalodon")
