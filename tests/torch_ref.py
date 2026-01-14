@@ -7,6 +7,16 @@ from pathlib import Path
 from types import ModuleType
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_LOCAL_SRC = _PROJECT_ROOT / "src"
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    """Return True if ``path`` is inside ``parent`` (Python <3.9 compatible)."""
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
 
 
 def _ensure_external(module: ModuleType, name: str) -> ModuleType:
@@ -21,7 +31,9 @@ def _ensure_external(module: ModuleType, name: str) -> ModuleType:
     if module_path is None:
         return module
     resolved = Path(module_path).resolve()
-    if _PROJECT_ROOT in resolved.parents:
+    # Only reject modules that live under the repository source tree.
+    # Virtual environments placed under the repo (e.g., .venv/) are allowed.
+    if _is_relative_to(resolved, _LOCAL_SRC):
         raise RuntimeError(f"{name} resolved inside this repo ({resolved}).")
     return module
 
