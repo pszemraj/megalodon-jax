@@ -12,6 +12,16 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 
 ## Installation
 
+Install with pip+git for the latest version:
+
+```sh
+pip install "git+https://github.com/pszemraj/megalodon-jax.git"
+```
+
+### development install
+
+For development, clone the repository and install with the `[dev]` extras:
+
 ```bash
 git clone https://github.com/pszemraj/megalodon-jax.git
 cd megalodon-jax
