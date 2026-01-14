@@ -139,4 +139,5 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Profiling
 
-See `scripts/profile_forward.py` and `scripts/profile_ops.py` for timing runs.
+This repo no longer ships profiling scripts. For the PyTorch reference timing helpers,
+use https://github.com/pszemraj/megalodon-hf/tree/f85a47849d07d52982a2e6e4cf0297c2621e9916/scripts.
