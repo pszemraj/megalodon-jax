@@ -8,9 +8,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
-from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -42,7 +42,7 @@ class TestTimestepNormParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_norm_cls = torch_modeling().TimestepNorm
+        torch_norm_cls = torch_modeling.TimestepNorm
 
         dim = 64
         num_groups = 8
@@ -187,7 +187,7 @@ class TestComplexEMAParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling().ComplexEMA
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
@@ -221,7 +221,7 @@ class TestComplexEMAParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling().ComplexEMA
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
@@ -256,7 +256,7 @@ class TestComplexEMAParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling().ComplexEMA
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
@@ -513,7 +513,7 @@ class TestPrecisionPolicy:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling().ComplexEMA
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16

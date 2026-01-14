@@ -8,10 +8,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import MegalodonConfig as TorchMegalodonConfig
+from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
-from tests.torch_ref import megalodon as torch_megalodon
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -690,15 +691,11 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
-        torch_module = torch_megalodon()
-        TorchConfig = torch_module.MegalodonConfig
-        TorchMegalodonForCausalLM = torch_module.MegalodonForCausalLM
-
         config = parity_config
         batch, seq = 2, 32
 
         # Create PyTorch model
-        torch_config = TorchConfig(
+        torch_config = TorchMegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -760,17 +757,13 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
-        torch_module = torch_megalodon()
-        TorchConfig = torch_module.MegalodonConfig
-        TorchMegalodonForCausalLM = torch_module.MegalodonForCausalLM
-
         config = parity_config
         batch = 1
         prompt_len = 16
         gen_len = 4
 
         # Create PyTorch model
-        torch_config = TorchConfig(
+        torch_config = TorchMegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,

@@ -6,11 +6,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
-from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -147,7 +147,7 @@ class TestRMSNormParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_norm_cls = torch_modeling().RMSNorm
+        torch_norm_cls = torch_modeling.RMSNorm
 
         dim = 64
         eps = 1e-6
@@ -211,7 +211,7 @@ class TestRotaryEmbeddingParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_rope_cls = torch_modeling().RotaryEmbedding
+        torch_rope_cls = torch_modeling.RotaryEmbedding
 
         dim = 64
         base = 10000.0
@@ -254,7 +254,7 @@ class TestRotaryEmbeddingParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_rope_cls = torch_modeling().RotaryEmbedding
+        torch_rope_cls = torch_modeling.RotaryEmbedding
 
         dim = 64
         torch_rope = torch_rope_cls(dim)
@@ -309,7 +309,7 @@ class TestRotaryEmbeddingParity:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_rope_cls = torch_modeling().RotaryEmbedding
+        torch_rope_cls = torch_modeling.RotaryEmbedding
 
         dim = 64
         batch, seq, heads = 2, 8, 4

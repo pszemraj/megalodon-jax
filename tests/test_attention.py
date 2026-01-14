@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
+from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax.layers import (
     ChunkedAttention,
@@ -16,7 +17,6 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
-from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -455,9 +455,8 @@ class TestNormalizedFFN:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_module = torch_modeling()
-        TorchConfig = torch_module.MegalodonConfig
-        TorchFFN = torch_module.NormalizedFFN
+        TorchConfig = torch_modeling.MegalodonConfig
+        TorchFFN = torch_modeling.NormalizedFFN
 
         model_dim, ffn_dim = 64, 128
         batch, seq = 2, 16
@@ -1192,10 +1191,9 @@ class TestMegalodonAttentionParity:
 
         # Check if PyTorch reference is available
         try:
-            torch_module = torch_modeling()
-            TorchMegalodonAttention = torch_module.MegalodonAttention
-            TorchConfig = torch_module.MegalodonConfig
-        except (ImportError, RuntimeError):
+            TorchMegalodonAttention = torch_modeling.MegalodonAttention
+            TorchConfig = torch_modeling.MegalodonConfig
+        except ImportError:
             pytest.skip("PyTorch reference not available")
 
         # Config matching both implementations

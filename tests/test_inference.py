@@ -8,6 +8,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import MegalodonConfig as TorchMegalodonConfig
+from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
 from megalodon_jax import (
     MegalodonConfig,
@@ -19,7 +21,6 @@ from megalodon_jax import (
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token, trim_cache
 from megalodon_jax.types import AttentionCache, LayerCache, ModelCache
-from tests.torch_ref import megalodon as torch_megalodon
 
 
 def small_config() -> MegalodonConfig:
@@ -558,12 +559,11 @@ class TestConversion:
         path = tmp_path / "model.safetensors"
         save_safetensors(model, path)
 
-        torch_module = torch_megalodon()
         config_kwargs = asdict(config)
         config_kwargs["gradient_checkpointing"] = config.use_checkpoint
         config_kwargs.pop("use_checkpoint", None)
-        torch_config = torch_module.MegalodonConfig(**config_kwargs)
-        torch_model = torch_module.MegalodonForCausalLM(torch_config).eval()
+        torch_config = TorchMegalodonConfig(**config_kwargs)
+        torch_model = TorchMegalodonForCausalLM(torch_config).eval()
 
         from safetensors.torch import load_file
 
