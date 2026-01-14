@@ -14,6 +14,7 @@ from megalodon_jax import (
     MegalodonModel,
 )
 from megalodon_jax.convert import load_weights_from_torch
+from tests.torch_ref import megalodon as torch_megalodon
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -555,8 +556,9 @@ class TestParity:
 
     def test_causal_lm_forward_parity(self, random_seed, parity_config, torch_device):
         """Test that JAX MegalodonForCausalLM matches PyTorch reference."""
-        from megalodon import MegalodonConfig as TorchConfig
-        from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
+        torch_module = torch_megalodon()
+        TorchConfig = torch_module.MegalodonConfig
+        TorchMegalodonForCausalLM = torch_module.MegalodonForCausalLM
 
         config = parity_config
         batch, seq = 2, 32
@@ -613,8 +615,9 @@ class TestParity:
 
     def test_streaming_parity(self, random_seed, parity_config, torch_device):
         """Test that JAX streaming matches PyTorch streaming."""
-        from megalodon import MegalodonConfig as TorchConfig
-        from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
+        torch_module = torch_megalodon()
+        TorchConfig = torch_module.MegalodonConfig
+        TorchMegalodonForCausalLM = torch_module.MegalodonForCausalLM
 
         config = parity_config
         batch = 1

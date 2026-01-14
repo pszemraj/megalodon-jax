@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
+from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -27,14 +28,14 @@ class TestTimestepNormParity:
 
     def test_forward_parity(self, random_seed):
         """Test TimestepNorm forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import TimestepNorm as TorchTimestepNorm
+        torch_norm_cls = torch_modeling().TimestepNorm
 
         dim = 64
         num_groups = 8
         eps = 1e-5
 
         # Create both modules
-        torch_norm = TorchTimestepNorm(dim, num_groups, eps=eps)
+        torch_norm = torch_norm_cls(dim, num_groups, eps=eps)
         jax_norm = TimestepNorm(dim, num_groups, eps=eps)
 
         # Copy weights from PyTorch to JAX
@@ -148,12 +149,12 @@ class TestComplexEMAParity:
 
     def test_coefficients_parity(self, random_seed):
         """Test that coefficient computation matches PyTorch."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+        torch_ema_cls = torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -178,12 +179,12 @@ class TestComplexEMAParity:
 
     def test_fft_forward_parity(self, random_seed):
         """Test FFT path forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+        torch_ema_cls = torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -209,12 +210,12 @@ class TestComplexEMAParity:
 
     def test_sequential_forward_parity(self, random_seed):
         """Test sequential path forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+        torch_ema_cls = torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -424,12 +425,12 @@ class TestPrecisionPolicy:
 
     def test_complex_ema_bf16_forward(self, random_seed):
         """Test ComplexEMA forward pass with bf16 inputs."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+        torch_ema_cls = torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 

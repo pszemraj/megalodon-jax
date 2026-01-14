@@ -14,6 +14,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
+from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -388,8 +389,9 @@ class TestNormalizedFFN:
 
     def test_ffn_parity(self, random_seed):
         """Test NormalizedFFN parity with PyTorch reference."""
-        from megalodon.modeling_megalodon import MegalodonConfig as TorchConfig
-        from megalodon.modeling_megalodon import NormalizedFFN as TorchFFN
+        torch_module = torch_modeling()
+        TorchConfig = torch_module.MegalodonConfig
+        TorchFFN = torch_module.NormalizedFFN
 
         model_dim, ffn_dim = 64, 128
         batch, seq = 2, 16
@@ -1003,21 +1005,16 @@ class TestMegalodonAttentionParity:
 
     def test_megalodon_attention_forward_parity(self, random_seed, torch_device):
         """Test MegalodonAttention forward pass parity with PyTorch reference."""
-        from conftest import sync_and_clear_torch
+        from tests.conftest import sync_and_clear_torch
 
         pytest = __import__("pytest")
 
         # Check if PyTorch reference is available
         try:
-            import sys
-
-            sys.path.insert(
-                0,
-                "/home/pszemraj/workspace/LLM/experimental-arch/megalodon-2512/megalodon-jax/src",
-            )
-            from megalodon.modeling_megalodon import MegalodonAttention as TorchMegalodonAttention
-            from megalodon.modeling_megalodon import MegalodonConfig as TorchConfig
-        except ImportError:
+            torch_module = torch_modeling()
+            TorchMegalodonAttention = torch_module.MegalodonAttention
+            TorchConfig = torch_module.MegalodonConfig
+        except (ImportError, RuntimeError):
             pytest.skip("PyTorch reference not available")
 
         # Config matching both implementations

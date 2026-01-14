@@ -10,6 +10,7 @@ import torch
 from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
+from tests.torch_ref import modeling as torch_modeling
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
@@ -104,13 +105,13 @@ class TestRMSNormParity:
 
     def test_forward_parity(self, random_seed):
         """Test RMSNorm forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import RMSNorm as TorchRMSNorm
+        torch_norm_cls = torch_modeling().RMSNorm
 
         dim = 64
         eps = 1e-6
 
         # Create both modules
-        torch_norm = TorchRMSNorm(dim, eps=eps)
+        torch_norm = torch_norm_cls(dim, eps=eps)
         jax_norm = RMSNorm(dim, eps=eps)
 
         # Copy weights from PyTorch to JAX
@@ -155,13 +156,13 @@ class TestRotaryEmbeddingParity:
 
     def test_forward_parity(self, random_seed):
         """Test RotaryEmbedding forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import RotaryEmbedding as TorchRoPE
+        torch_rope_cls = torch_modeling().RotaryEmbedding
 
         dim = 64
         base = 10000.0
 
         # Create both modules
-        torch_rope = TorchRoPE(dim, base=base)
+        torch_rope = torch_rope_cls(dim, base=base)
         jax_rope = RotaryEmbedding(dim, base=base)
 
         # Verify inv_freq matches
@@ -194,10 +195,10 @@ class TestRotaryEmbeddingParity:
 
     def test_different_start_positions(self, random_seed):
         """Test RotaryEmbedding at various start positions."""
-        from megalodon.modeling_megalodon import RotaryEmbedding as TorchRoPE
+        torch_rope_cls = torch_modeling().RotaryEmbedding
 
         dim = 64
-        torch_rope = TorchRoPE(dim)
+        torch_rope = torch_rope_cls(dim)
         jax_rope = RotaryEmbedding(dim)
 
         batch, seq, heads = 2, 8, 4
@@ -242,7 +243,7 @@ class TestRotaryEmbeddingParity:
 
     def test_different_base_values(self, random_seed):
         """Test RotaryEmbedding with different base values."""
-        from megalodon.modeling_megalodon import RotaryEmbedding as TorchRoPE
+        torch_rope_cls = torch_modeling().RotaryEmbedding
 
         dim = 64
         batch, seq, heads = 2, 8, 4
@@ -252,7 +253,7 @@ class TestRotaryEmbeddingParity:
         k_jax = to_jax(k_torch)
 
         for base in [10000.0, 100000.0]:
-            torch_rope = TorchRoPE(dim, base=base)
+            torch_rope = torch_rope_cls(dim, base=base)
             jax_rope = RotaryEmbedding(dim, base=base)
 
             q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=0)
