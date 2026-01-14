@@ -135,7 +135,7 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
 - JIT stability: no retracing on repeated calls with same shapes
 - GPU/CPU coverage via pytest fixtures
-- PyTorch parity tests import `megalodon` from the external `megalodon-hf` package (dev dependency), not the local `src/megalodon` reference.
+- PyTorch parity tests import `megalodon` from the external `megalodon-hf` package (dev dependency), not any in-repo Torch code.
 
 ## Profiling
 

@@ -15,13 +15,14 @@ reference.
 
 The JAX version provides two numerically equivalent paths:
 
-1. **FFT path (training / no state)**  
+1. **FFT path (training / no state)**
    When no state is requested, ComplexEMA builds the EMA kernel and applies an
    FFT-based convolution (O(L log L)).
 
-2. **Sequential path (streaming)**  
+2. **Sequential path (streaming)**
    When `h_init` is provided or `return_state=True`, ComplexEMA runs the
-   recurrence with `jax.lax.scan` (O(L)) and returns the final complex state.
+   recurrence with `jax.lax.scan` (O(L)). The final complex state is returned
+   only when `return_state=True`.
 
 ### Path Selection
 

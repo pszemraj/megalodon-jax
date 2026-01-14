@@ -140,8 +140,6 @@ src/megalodon_jax/
 
 ## Current Status
 
-**Phase 5 Complete**:
-
 - Core components + streaming cache utilities
 - Sampling + `generate()` loop for text generation
 - PyTorch ↔ JAX conversion (SafeTensors via PyTorch state dicts)

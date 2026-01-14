@@ -1,7 +1,8 @@
 # JAX and PyTorch Interop
 
-This repo includes a JAX implementation alongside the PyTorch reference to keep
-training fast while preserving weight and behavior parity for export.
+This repo provides the JAX implementation. The PyTorch reference lives in
+[megalodon-hf](https://github.com/pszemraj/megalodon-hf) and is the target for
+deployment and parity checks.
 
 ## Why the JAX version exists
 
@@ -12,11 +13,13 @@ training fast while preserving weight and behavior parity for export.
 ## When to use which
 
 Use JAX for:
+
 - Training and large-scale ablations.
 - Research workflows where compile-time shape control matters.
 - Exporting checkpoints for downstream PyTorch use.
 
-Use PyTorch for:
+Use PyTorch (megalodon-hf) for:
+
 - HuggingFace integration and generation APIs.
 - Deployment and production inference.
 - Compatibility with existing PyTorch tooling and ecosystems.
@@ -36,6 +39,7 @@ save_safetensors(model, "model.safetensors")
 ```
 
 Notes:
+
 - `inner.rope.inv_freq` is not in the PyTorch state dict. The JAX exporter
   skips it by default. Use `include_rope_inv_freq=True` only if you need it
   for tooling (it will be an unexpected key under strict loading).
@@ -79,8 +83,8 @@ norm_affine, output_size, etc).
 - Loss masking uses `ignore_index=-100` and attention masks consistently, same
   as the PyTorch/HF convention.
 - Parity tests import the external `megalodon-hf` package (dev dependency)
-  through `tests/torch_ref.py`, which guards against accidentally using the
-  local `src/megalodon` reference copy.
+  through `tests/torch_ref.py`, which guards against accidentally using any
+  in-repo Torch stubs.
 
 ## Quick parity checklist
 
