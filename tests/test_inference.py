@@ -1,5 +1,7 @@
 """Phase 5 inference and conversion tests."""
 
+from dataclasses import asdict
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,6 +18,7 @@ from megalodon_jax import (
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token, trim_cache
 from megalodon_jax.types import AttentionCache, LayerCache, ModelCache
+from tests.torch_ref import megalodon as torch_megalodon
 
 
 def small_config() -> MegalodonConfig:
@@ -469,6 +472,35 @@ class TestConversion:
             rtol=1e-5,
             atol=1e-5,
         )
+
+    def test_export_loads_in_torch_strict(self, tmp_path):
+        """JAX export should load strictly into the PyTorch reference."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        path = tmp_path / "model.safetensors"
+        save_safetensors(model, path)
+
+        torch_module = torch_megalodon()
+        config_kwargs = asdict(config)
+        config_kwargs["gradient_checkpointing"] = config.use_checkpoint
+        config_kwargs.pop("use_checkpoint", None)
+        torch_config = torch_module.MegalodonConfig(**config_kwargs)
+        torch_model = torch_module.MegalodonForCausalLM(torch_config).eval()
+
+        from safetensors.torch import load_file
+
+        state_dict = load_file(str(path))
+        incompat = torch_model.load_state_dict(state_dict, strict=True)
+        assert not incompat.missing_keys
+        assert not incompat.unexpected_keys
+
+        input_ids = torch.randint(0, config.vocab_size, (2, 8))
+        with torch.no_grad():
+            out = torch_model(
+                input_ids=input_ids, attention_mask=None, use_cache=False, return_dict=True
+            )
+        assert not torch.isnan(out.logits).any()
 
     def test_load_weights_requires_lm_head_for_untied(self):
         config = MegalodonConfig(
