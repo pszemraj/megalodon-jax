@@ -51,6 +51,7 @@ def init_cache(
     value_head_dim = config.value_head_dim
 
     def make_attn_cache() -> AttentionCache | None:
+        """Build an AttentionCache when KV preallocation is requested."""
         if not allocate_kv:
             return None
         k = jnp.zeros((batch_size, cache_len, num_heads, head_dim), dtype=dtype)
@@ -58,6 +59,7 @@ def init_cache(
         return AttentionCache(k=k, v=v, count=jnp.array(0, dtype=jnp.int32))
 
     def make_norm_state() -> NormState:
+        """Create an initialized NormState for a batch."""
         return NormState(
             count=jnp.zeros((batch_size,), dtype=jnp.int32),
             mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=dtype),
@@ -65,6 +67,7 @@ def init_cache(
         )
 
     def make_ema_state() -> EMAState:
+        """Create an initialized EMAState for a batch."""
         h = jnp.zeros((batch_size, config.model_dim, config.cema_ndim), dtype=jnp.complex64)
         return EMAState(h=h)
 
@@ -92,6 +95,7 @@ def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
     """
 
     def trim_layer(layer_cache: LayerCache | None) -> LayerCache | None:
+        """Trim a layer cache to the newest max_len entries."""
         if layer_cache is None or layer_cache.attn is None:
             return layer_cache
         attn = layer_cache.attn
@@ -139,11 +143,13 @@ def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache
     """
 
     def index_array(x: Array | None) -> Array | None:
+        """Index a cache array along the batch dimension."""
         if x is None:
             return None
         return x[indices]
 
     def index_layer(layer_cache: LayerCache | None) -> LayerCache | None:
+        """Index a LayerCache along the batch dimension."""
         if layer_cache is None:
             return None
 
@@ -200,6 +206,7 @@ def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, batch]:
 def _apply_top_k(
     logits: Float[Array, "batch vocab"], top_k: int | None
 ) -> Float[Array, "batch vocab"]:
+    """Apply top-k filtering to logits."""
     if top_k is None or top_k <= 0:
         return logits
     k = int(min(top_k, logits.shape[-1]))
@@ -214,6 +221,7 @@ def _apply_top_p(
     *,
     top_k: int | None = None,
 ) -> Float[Array, "batch vocab"]:
+    """Apply nucleus (top-p) filtering to logits."""
     if top_p is None or top_p >= 1.0:
         return logits
 
@@ -287,6 +295,7 @@ def _sample_fn(
     top_k: int | None,
     top_p: float | None,
 ) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, batch]]:
+    """Build a sampler callable configured with temperature/top-k/top-p."""
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
     return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
@@ -381,11 +390,12 @@ def _generate_core(
 
         def scan_step(
             carry: tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
-            _,
+            _: None,
         ) -> tuple[
             tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
             Int[Array, batch],
         ]:
+            """Scan step for autoregressive decoding with RNG."""
             cached, last_token, rng, done = carry
 
             logits_step, new_cache = model(
@@ -409,11 +419,12 @@ def _generate_core(
 
         def scan_step(
             carry: tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
-            _,
+            _: None,
         ) -> tuple[
             tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
             Int[Array, batch],
         ]:
+            """Scan step for autoregressive decoding without RNG."""
             cached, last_token, done = carry
 
             logits_step, new_cache = model(

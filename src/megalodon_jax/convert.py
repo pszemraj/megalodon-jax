@@ -101,6 +101,7 @@ def convert_jax_to_torch(
     state_dict: StateDict = {}
 
     def to_torch(arr: Any) -> Any:
+        """Convert a JAX/NumPy array to a torch tensor with the export dtype."""
         return _to_torch_tensor(arr, dtype=dtype)
 
     state_dict["model.embed.weight"] = to_torch(model.model.embed.weight)
