@@ -30,6 +30,12 @@ def _checkpointed_layer(
 
     This function is defined at module level so the checkpoint transform is
     created once and reused inside the layer loop.
+
+    :param MegalodonBlock layer: Block to execute.
+    :param Float[Array, "batch seq dim"] x: Input activations.
+    :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
+    :param PRNGKeyArray | None key: Optional dropout key.
+    :return Float[Array, "batch seq dim"]: Output activations.
     """
     out, _ = layer(x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key)
     return out
@@ -40,6 +46,9 @@ def _stop_if_array(x: Any) -> Any:
 
     This is needed because cache pytrees may contain None leaves (e.g., when
     checkpointing is active), and jax.lax.stop_gradient only accepts arrays.
+
+    :param Any x: Pytree leaf value.
+    :return Any: Stopped-gradient array or original value.
     """
     return jax.lax.stop_gradient(x) if eqx.is_array(x) else x
 
@@ -75,10 +84,10 @@ class MegalodonBlock(eqx.Module):
     ):
         """Initialize block with attention and FFN sub-modules.
 
-        Args:
-            config: Model configuration.
-            layer_id: Index of this block (0-indexed) for rescaling.
-            key: PRNG key for initialization.
+        :param MegalodonConfig config: Model configuration.
+        :param int layer_id: Block index for residual rescaling.
+        :param PRNGKeyArray key: PRNG key for initialization.
+        :return None: None.
         """
         k1, k2 = jax.random.split(key)
         self.layer_id = layer_id
@@ -126,16 +135,13 @@ class MegalodonBlock(eqx.Module):
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Apply attention + FFN with two-hop residual.
 
-        Args:
-            x: Input tensor of shape (batch, seq, dim).
-            cache: Optional LayerCache from previous forward.
-            mask: Optional attention mask (True = valid token).
-            return_cache: Whether to return updated cache.
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Tuple of (output, updated_cache).
+        :param Float[Array, "batch seq dim"] x: Input activations.
+        :param LayerCache | None cache: Optional layer cache.
+        :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
+        :param bool return_cache: Whether to return updated cache.
+        :param bool deterministic: Whether to disable dropout.
+        :param PRNGKeyArray | None key: Optional dropout key.
+        :return tuple[Float[Array, "batch seq dim"], LayerCache | None]: Output and cache.
         """
         # CRITICAL: Two-hop residual - save BEFORE attention
         residual_base = x
@@ -197,9 +203,9 @@ class MegalodonModel(eqx.Module):
     ):
         """Initialize embeddings, layer stack, and final TimestepNorm.
 
-        Args:
-            config: Model configuration.
-            key: PRNG key for initialization.
+        :param MegalodonConfig config: Model configuration.
+        :param PRNGKeyArray key: PRNG key for initialization.
+        :return None: None.
         """
         self.config = config
         self.scale = float(jnp.sqrt(config.model_dim)) if config.scale_emb else 1.0
@@ -261,18 +267,15 @@ class MegalodonModel(eqx.Module):
     ) -> tuple[Float[Array, "batch seq dim"], ModelCache | None]:
         """Forward pass through embeddings, layers, and final norm.
 
-        Args:
-            input_ids: Token IDs of shape (batch, seq).
-            attention_mask: Optional mask (True = valid token).
-            cache: Optional ModelCache from previous forward.
-            return_cache: Whether to return updated cache. Defaults to False to
-                avoid the streaming path during training. For streaming inference,
-                set return_cache=True.
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Tuple of (hidden_states, updated_cache).
+        :param Int[Array, "batch seq"] input_ids: Token IDs.
+        :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param ModelCache | None cache: Optional model cache.
+        :param bool return_cache: Whether to return updated cache.
+        :param bool deterministic: Whether to disable dropout.
+        :param PRNGKeyArray | None key: Optional dropout key.
+        :raises ValueError: If dropout is enabled without a PRNG key.
+        :raises ValueError: If cache layer count does not match the model.
+        :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
         B, L = input_ids.shape
 
@@ -435,9 +438,9 @@ class MegalodonForCausalLM(eqx.Module):
     ):
         """Initialize model with optional LM head.
 
-        Args:
-            config: Model configuration.
-            key: PRNG key for initialization.
+        :param MegalodonConfig config: Model configuration.
+        :param PRNGKeyArray key: PRNG key for initialization.
+        :return None: None.
         """
         self.config = config
 
@@ -475,17 +478,13 @@ class MegalodonForCausalLM(eqx.Module):
     ) -> tuple[Float[Array, "batch seq vocab"], ModelCache | None]:
         """Forward pass returning logits.
 
-        Args:
-            input_ids: Token IDs of shape (batch, seq).
-            attention_mask: Optional mask (True = valid token).
-            cache: Optional ModelCache from previous forward.
-            return_cache: Whether to return updated cache. Defaults to False; set
-                True for streaming inference.
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Tuple of (logits, updated_cache).
+        :param Int[Array, "batch seq"] input_ids: Token IDs.
+        :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param ModelCache | None cache: Optional model cache.
+        :param bool return_cache: Whether to return updated cache.
+        :param bool deterministic: Whether to disable dropout.
+        :param PRNGKeyArray | None key: Optional dropout key.
+        :return tuple[Float[Array, "batch seq vocab"], ModelCache | None]: Logits and cache.
         """
         hidden, cache = self.model(
             input_ids,
@@ -525,19 +524,14 @@ class MegalodonForCausalLM(eqx.Module):
         computation, following HuggingFace Transformers convention. This allows
         padding tokens to be marked with -100 in the labels array.
 
-        Args:
-            input_ids: Input token IDs of shape (batch, seq).
-            labels: Target token IDs of shape (batch, seq). Positions with value
-                equal to ignore_index are excluded from loss computation.
-            attention_mask: Optional mask (True = valid token). Masked positions
-                are excluded from the loss to prevent gradient noise from padding.
-            ignore_index: Label value to ignore in loss computation. Default -100
-                matches HuggingFace Transformers convention.
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Scalar cross-entropy loss with dtype matching the model logits.
+        :param Int[Array, "batch seq"] input_ids: Input token IDs.
+        :param Int[Array, "batch seq"] labels: Target token IDs.
+        :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param int ignore_index: Label value to ignore in loss computation.
+        :param bool deterministic: Whether to disable dropout.
+        :param PRNGKeyArray | None key: Optional dropout key.
+        :raises ValueError: If dropout is enabled without a PRNG key.
+        :return Float[Array, ""]: Scalar cross-entropy loss.
         """
         # Validate PRNG key for dropout - prevent silent no-op when training
         if not deterministic and key is None:

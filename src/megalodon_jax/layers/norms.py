@@ -34,11 +34,11 @@ class RMSNorm(eqx.Module):
     ):
         """Initialize RMSNorm.
 
-        Args:
-            dim: Feature dimension.
-            eps: Small constant for numerical stability.
-            affine: Whether to include learnable scale parameter.
-            key: PRNG key (unused, for API consistency).
+        :param int dim: Feature dimension.
+        :param float eps: Numerical stability epsilon.
+        :param bool affine: Whether to include learnable scale.
+        :param PRNGKeyArray | None key: PRNG key (unused).
+        :return None: None.
         """
         del key  # unused
         self.dim = dim
@@ -52,11 +52,8 @@ class RMSNorm(eqx.Module):
     def __call__(self, x: Float[Array, "... dim"]) -> Float[Array, "... dim"]:
         """Apply RMS normalization.
 
-        Args:
-            x: Input tensor with feature dimension last.
-
-        Returns:
-            Normalized tensor with same shape as input.
+        :param Float[Array, "... dim"] x: Input tensor with feature dimension last.
+        :return Float[Array, "... dim"]: Normalized tensor.
         """
         # Compute RMS in fp32 to avoid bf16 overflow on x**2
         # (bf16 max ~65504, so values > ~256 would overflow when squared)
