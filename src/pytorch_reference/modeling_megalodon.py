@@ -47,10 +47,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import GenerationMixin, PreTrainedModel
-from transformers.modeling_outputs import (
-    BaseModelOutputWithPast,
-    CausalLMOutputWithPast,
-)
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 
 from .configuration_megalodon import InitMode, MegalodonConfig
 

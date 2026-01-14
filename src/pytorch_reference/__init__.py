@@ -18,12 +18,7 @@ from typing import Optional
 import torch
 
 from .configuration_megalodon import MegalodonConfig, MegalodonDefaults
-from .modeling_megalodon import (
-    AttentionCache,
-    LayerCache,
-    MegalodonForCausalLM,
-    MegalodonModel,
-)
+from .modeling_megalodon import AttentionCache, LayerCache, MegalodonForCausalLM, MegalodonModel
 
 
 def configure_precision(

@@ -9,12 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from megalodon_jax import (
-    MegalodonBlock,
-    MegalodonConfig,
-    MegalodonForCausalLM,
-    MegalodonModel,
-)
+from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
 from tests.torch_ref import megalodon as torch_megalodon
 
