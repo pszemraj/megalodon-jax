@@ -4,12 +4,12 @@ This note describes the JAX ComplexEMA implementation in this repo
 (`src/megalodon_jax/layers/complex_ema.py`) and how it relates to the upstream
 reference.
 
-## Upstream Reference (Context)
+## Reference Context
 
-- The output is computed via FFT-based convolution when no streaming state is
-  required.
-- The final streaming state is produced by a fused kernel to avoid Python-side
-  loops.
+- The original CUDA reference uses FFT-based convolution when no streaming
+  state is required.
+- The original CUDA reference uses a fused kernel to emit the final streaming
+  state; `megalodon-hf` uses a sequential PyTorch path instead.
 
 ## JAX Implementation
 
@@ -31,8 +31,8 @@ The JAX version provides two numerically equivalent paths:
 ### Mask Handling
 
 If a boolean `mask` is provided, masked positions are zeroed before the
-recurrence. This prevents padded tokens from contaminating the EMA state. This
-is intentionally more conservative than the upstream behavior.
+recurrence. This prevents padded tokens from contaminating the EMA state and
+matches the `megalodon-hf` reference behavior.
 
 ## Stability Notes
 

@@ -95,12 +95,17 @@ flowchart TD
 
 ## 5) Padding and Generation
 
-- Cached decoding does not support padding because cache validity is not tracked per position.
+- In this JAX implementation, cached decoding does not support padding because
+  cache validity is not tracked per position.
 - `generate()` handles left-padded batches by grouping prompts by length when `max_new_tokens > 1`.
 - Right padding or non-contiguous masks are rejected; padded batches cannot return a single cache.
 
 ## Defaults and Options
 
-- **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
+- **PyTorch reference (megalodon-hf):** default `max_cache_len = chunk_size` (chunk-local);
+  set `max_cache_len` above `chunk_size` for a sliding window; validates
+  `max_cache_len >= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable chunk resets (still fixed-size).
+- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set
+  `max_cache_len` above `chunk_size` for sliding-window attention; use
+  `cache_unbounded=True` to disable chunk resets (still fixed-size).

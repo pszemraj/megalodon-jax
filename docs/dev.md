@@ -129,7 +129,7 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Testing
 
-190+ tests covering:
+200+ tests covering:
 
 - Parity with the reference implementation (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
@@ -139,4 +139,4 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Profiling
 
-See `docs/profiling.md` for detailed timing analysis.
+See `scripts/profile_forward.py` and `scripts/profile_ops.py` for timing runs.

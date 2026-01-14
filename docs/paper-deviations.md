@@ -48,9 +48,5 @@ implementation relative to the Megalodon paper and upstream reference.
   factor in the affine scale. This is mathematically equivalent to L2
   normalization while matching the reference kernel.
 
-- **CEMA mask behavior.** When a mask is provided, the JAX implementation zeros
-  masked positions before the EMA recurrence to prevent state contamination.
-  This is more conservative than the upstream behavior.
-
 If you spot any additional divergence, please open an issue or PR with the
 corresponding paper equation and code pointer.
