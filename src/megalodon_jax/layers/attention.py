@@ -23,7 +23,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import InitMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
-from megalodon_jax.layers.norms import RMSNorm
+from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
@@ -1391,9 +1391,7 @@ class NormalizedFFN(eqx.Module):
 
         keys = jax.random.split(key, 3)
 
-        self.norm = eqx.nn.LayerNorm(
-            shape=model_dim, eps=norm_eps, use_weight=norm_affine, use_bias=norm_affine
-        )
+        self.norm = BatchedLayerNorm(model_dim, eps=norm_eps, affine=norm_affine)
         self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, key=keys[0])
         self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, key=keys[1])
 
