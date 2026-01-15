@@ -484,8 +484,19 @@ class MegalodonForCausalLM(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
+        :raises ValueError: If dropout is enabled without a PRNG key.
         :return tuple[Float[Array, "batch seq vocab"], ModelCache | None]: Logits and cache.
         """
+        if not deterministic and key is None:
+            if (
+                self.config.dropout > 0.0
+                or self.config.attention_dropout > 0.0
+                or self.config.hidden_dropout > 0.0
+            ):
+                raise ValueError(
+                    "PRNG key required when deterministic=False and dropout is enabled. "
+                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+                )
         hidden, cache = self.model(
             input_ids,
             attention_mask=attention_mask,
