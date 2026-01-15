@@ -819,6 +819,87 @@ class TestParity:
             f"Generated tokens differ: PyTorch={torch_generated}, JAX={jax_generated}"
         )
 
+    def test_streaming_parity_crosses_chunk_boundary(
+        self, random_seed: int, torch_device: torch.device
+    ) -> None:
+        """Test streaming parity when generation crosses a chunk boundary.
+
+        :param int random_seed: Random seed fixture.
+        :param torch.device torch_device: Torch device fixture.
+        :return None: None.
+        """
+        config = MegalodonConfig(
+            vocab_size=128,
+            model_dim=64,
+            num_layers=2,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            norm_affine=True,
+            dropout=0.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        batch = 1
+        prompt_len = config.chunk_size - 1
+        gen_len = 2
+
+        torch_config = TorchMegalodonConfig(
+            vocab_size=config.vocab_size,
+            model_dim=config.model_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            z_dim=config.z_dim,
+            value_dim=config.value_dim,
+            ffn_hidden_dim=config.ffn_hidden_dim,
+            cema_ndim=config.cema_ndim,
+            chunk_size=config.chunk_size,
+            norm_num_groups=config.norm_num_groups,
+            norm_affine=config.norm_affine,
+            dropout=0.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+
+        key = jax.random.PRNGKey(random_seed)
+        jax_model = MegalodonForCausalLM(config, key=key)
+        cpu_state_dict = {k: v.cpu() for k, v in torch_model.state_dict().items()}
+        jax_model = load_weights_from_torch(jax_model, cpu_state_dict)
+
+        torch.manual_seed(random_seed)
+        prompt_torch = torch.randint(0, config.vocab_size, (batch, prompt_len), device=torch_device)
+        prompt_jax = to_jax(prompt_torch.cpu())
+
+        torch_generated = []
+        with torch.no_grad():
+            torch_out = torch_model(prompt_torch, use_cache=True, return_dict=True)
+            torch_pkv = torch_out.past_key_values
+
+            for _ in range(gen_len):
+                next_token = torch_out.logits[:, -1:].argmax(dim=-1)
+                torch_generated.append(next_token.cpu().item())
+                torch_out = torch_model(
+                    next_token, past_key_values=torch_pkv, use_cache=True, return_dict=True
+                )
+                torch_pkv = torch_out.past_key_values
+
+        jax_generated = []
+        jax_logits, jax_cache = jax_model(prompt_jax, return_cache=True)
+        for _ in range(gen_len):
+            next_token = jnp.argmax(jax_logits[:, -1:], axis=-1)
+            jax_generated.append(int(next_token[0, 0]))
+            jax_logits, jax_cache = jax_model(next_token, cache=jax_cache, return_cache=True)
+
+        assert torch_generated == jax_generated, (
+            "Cross-boundary streaming tokens differ: "
+            f"PyTorch={torch_generated}, JAX={jax_generated}"
+        )
+
 
 # -----------------------------------------------------------------------------
 # Regression Tests for Phase 4 Fixes
