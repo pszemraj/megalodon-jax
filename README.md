@@ -8,9 +8,19 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
 - JAX pytree caches for JIT-compatible streaming inference
 - Weight conversion utilities for PyTorch ↔ JAX interop
-- 190+ tests covering parity with PyTorch reference
+- 200+ tests covering parity with the PyTorch reference
 
 ## Installation
+
+Install with pip+git for the latest version:
+
+```sh
+pip install "git+https://github.com/pszemraj/megalodon-jax.git"
+```
+
+### development install
+
+For development, clone the repository and install with the `[dev]` extras:
 
 ```bash
 git clone https://github.com/pszemraj/megalodon-jax.git
@@ -18,12 +28,13 @@ cd megalodon-jax
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.10+ with JAX 0.4.30+ (tested with 0.8.x), Equinox 0.11.9+.
+Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+.
 
 ## Quick Start
 
 ```python
 import jax
+import jax.numpy as jnp
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 
 key = jax.random.PRNGKey(0)
@@ -98,7 +109,7 @@ grads = loss_fn(model, input_ids, labels)
 
 4. **Two-Hop Residual**: FFN adds residual from block input, not post-attention activations.
 
-5. **Mask-Aware Loss**: Unlike PyTorch reference, padding tokens are correctly excluded from loss computation.
+5. **Mask-Aware Loss**: Padding tokens are excluded from loss computation (matches PyTorch/HF).
 
 ### Source Layout
 
@@ -129,8 +140,6 @@ src/megalodon_jax/
 
 ## Current Status
 
-**Phase 5 Complete**:
-
 - Core components + streaming cache utilities
 - Sampling + `generate()` loop for text generation
 - PyTorch ↔ JAX conversion (SafeTensors via PyTorch state dicts)
@@ -140,7 +149,7 @@ src/megalodon_jax/
 - Pure JAX implementation (no fused CUDA kernels)
 - Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
-- CEMA zeros masked positions before recurrence to avoid padding contamination (differs from PyTorch)
+- CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
 
 ## Testing
 

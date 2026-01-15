@@ -31,18 +31,13 @@ def init_cache(
 ) -> ModelCache:
     """Create an empty ModelCache for autoregressive generation.
 
-    Args:
-        config: Model configuration.
-        batch_size: Batch size for cached tensors.
-        dtype: Floating dtype for cached arrays.
-        allocate_kv: If True, pre-allocate KV buffers; otherwise, leave None so the
-            model allocates on first use (saves memory but changes shapes after
-            the first call).
-        allocate_norm: If True, pre-allocate per-layer TimestepNorm state.
-        allocate_ema: If True, pre-allocate per-layer ComplexEMA state.
-
-    Returns:
-        ModelCache with per-layer caches and final norm state.
+    :param MegalodonConfig config: Model configuration.
+    :param int batch_size: Batch size for cached tensors.
+    :param jnp.dtype dtype: Floating dtype for cached arrays.
+    :param bool allocate_kv: Whether to pre-allocate KV buffers.
+    :param bool allocate_norm: Whether to pre-allocate TimestepNorm state.
+    :param bool allocate_ema: Whether to pre-allocate ComplexEMA state.
+    :return ModelCache: Initialized cache with per-layer state.
     """
 
     cache_len = config.effective_max_cache_len
@@ -51,6 +46,10 @@ def init_cache(
     value_head_dim = config.value_head_dim
 
     def make_attn_cache() -> AttentionCache | None:
+        """Build an AttentionCache when KV preallocation is requested.
+
+        :return AttentionCache | None: Allocated cache or None.
+        """
         if not allocate_kv:
             return None
         k = jnp.zeros((batch_size, cache_len, num_heads, head_dim), dtype=dtype)
@@ -58,6 +57,10 @@ def init_cache(
         return AttentionCache(k=k, v=v, count=jnp.array(0, dtype=jnp.int32))
 
     def make_norm_state() -> NormState:
+        """Create an initialized NormState for a batch.
+
+        :return NormState: Initialized norm state.
+        """
         return NormState(
             count=jnp.zeros((batch_size,), dtype=jnp.int32),
             mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=dtype),
@@ -65,6 +68,10 @@ def init_cache(
         )
 
     def make_ema_state() -> EMAState:
+        """Create an initialized EMAState for a batch.
+
+        :return EMAState: Initialized EMA state.
+        """
         h = jnp.zeros((batch_size, config.model_dim, config.cema_ndim), dtype=jnp.complex64)
         return EMAState(h=h)
 
@@ -89,9 +96,18 @@ def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
 
     The cache is stored as a ring buffer; trimming preserves absolute positions
     by reindexing into a smaller ring when needed.
+
+    :param ModelCache cache: Cache to trim.
+    :param int max_len: Maximum number of tokens to retain.
+    :return ModelCache: Trimmed cache.
     """
 
     def trim_layer(layer_cache: LayerCache | None) -> LayerCache | None:
+        """Trim a layer cache to the newest max_len entries.
+
+        :param LayerCache | None layer_cache: Layer cache to trim.
+        :return LayerCache | None: Trimmed layer cache.
+        """
         if layer_cache is None or layer_cache.attn is None:
             return layer_cache
         attn = layer_cache.attn
@@ -136,14 +152,28 @@ def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache
 
     Note: cache position/count fields are shared scalars; this is only valid
     when all batch elements share the same history length.
+
+    :param ModelCache cache: Cache to slice.
+    :param Int[Array, new_batch] indices: Batch indices to select.
+    :return ModelCache: Sliced cache.
     """
 
     def index_array(x: Array | None) -> Array | None:
+        """Index a cache array along the batch dimension.
+
+        :param Array | None x: Cache array to index.
+        :return Array | None: Indexed array or None.
+        """
         if x is None:
             return None
         return x[indices]
 
     def index_layer(layer_cache: LayerCache | None) -> LayerCache | None:
+        """Index a LayerCache along the batch dimension.
+
+        :param LayerCache | None layer_cache: Layer cache to index.
+        :return LayerCache | None: Indexed layer cache.
+        """
         if layer_cache is None:
             return None
 
@@ -192,7 +222,11 @@ def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache
 
 
 def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, batch]:
-    """Deterministic argmax sampling."""
+    """Deterministic argmax sampling.
+
+    :param Float[Array, "batch vocab"] logits: Logits for sampling.
+    :return Int[Array, batch]: Selected token IDs.
+    """
 
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
@@ -200,6 +234,12 @@ def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, batch]:
 def _apply_top_k(
     logits: Float[Array, "batch vocab"], top_k: int | None
 ) -> Float[Array, "batch vocab"]:
+    """Apply top-k filtering to logits.
+
+    :param Float[Array, "batch vocab"] logits: Logits to filter.
+    :param int | None top_k: Top-k value.
+    :return Float[Array, "batch vocab"]: Filtered logits.
+    """
     if top_k is None or top_k <= 0:
         return logits
     k = int(min(top_k, logits.shape[-1]))
@@ -214,6 +254,13 @@ def _apply_top_p(
     *,
     top_k: int | None = None,
 ) -> Float[Array, "batch vocab"]:
+    """Apply nucleus (top-p) filtering to logits.
+
+    :param Float[Array, "batch vocab"] logits: Logits to filter.
+    :param float | None top_p: Nucleus probability threshold.
+    :param int | None top_k: Optional top-k prefilter.
+    :return Float[Array, "batch vocab"]: Filtered logits.
+    """
     if top_p is None or top_p >= 1.0:
         return logits
 
@@ -252,7 +299,16 @@ def sample_token(
     top_k: int | None = None,
     top_p: float | None = None,
 ) -> Int[Array, batch]:
-    """Sample next token with temperature, top-k, and top-p."""
+    """Sample next token with temperature, top-k, and top-p.
+
+    :param Float[Array, "batch vocab"] logits: Logits for sampling.
+    :param PRNGKeyArray key: PRNG key for sampling.
+    :param float temperature: Sampling temperature.
+    :param int | None top_k: Top-k filter.
+    :param float | None top_p: Top-p filter.
+    :raises ValueError: If temperature/top-k/top-p inputs are invalid.
+    :return Int[Array, batch]: Sampled token IDs.
+    """
 
     if temperature < 0.0:
         raise ValueError(f"temperature must be >= 0, got {temperature}")
@@ -287,6 +343,13 @@ def _sample_fn(
     top_k: int | None,
     top_p: float | None,
 ) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, batch]]:
+    """Build a sampler callable configured with temperature/top-k/top-p.
+
+    :param float temperature: Sampling temperature.
+    :param int | None top_k: Top-k filter.
+    :param float | None top_p: Top-p filter.
+    :return Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, batch]]: Sampler.
+    """
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
     return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
@@ -312,6 +375,21 @@ def _generate_core(
     If return_cache is True and max_new_tokens == 1, the cache is advanced to
     include the generated token. If sampling is enabled (temperature > 0),
     the returned key is the next key to use for subsequent sampling calls.
+
+    :param MegalodonForCausalLM model: Model to generate from.
+    :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
+    :param int max_new_tokens: Number of new tokens to generate.
+    :param PRNGKeyArray | None key: PRNG key for sampling.
+    :param float temperature: Sampling temperature.
+    :param int | None top_k: Top-k filter.
+    :param float | None top_p: Top-p filter.
+    :param int | None bos_token_id: Optional BOS token ID.
+    :param int | None eos_token_id: Optional EOS token ID.
+    :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
+    :param ModelCache | None cache: Optional cache state.
+    :param bool return_cache: Whether to return cache.
+    :raises ValueError: If inputs are invalid or missing required RNG.
+    :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
     """
 
     if max_new_tokens < 0:
@@ -381,11 +459,17 @@ def _generate_core(
 
         def scan_step(
             carry: tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
-            _,
+            _: None,
         ) -> tuple[
             tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
             Int[Array, batch],
         ]:
+            """Scan step for autoregressive decoding with RNG.
+
+            :param tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]] carry: Scan carry.
+            :param None _: Unused scan input.
+            :return tuple[tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]], Int[Array, batch]]: Carry and token.
+            """
             cached, last_token, rng, done = carry
 
             logits_step, new_cache = model(
@@ -409,11 +493,17 @@ def _generate_core(
 
         def scan_step(
             carry: tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
-            _,
+            _: None,
         ) -> tuple[
             tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
             Int[Array, batch],
         ]:
+            """Scan step for autoregressive decoding without RNG.
+
+            :param tuple[ModelCache, Int[Array, batch], Bool[Array, batch]] carry: Scan carry.
+            :param None _: Unused scan input.
+            :return tuple[tuple[ModelCache, Int[Array, batch], Bool[Array, batch]], Int[Array, batch]]: Carry and token.
+            """
             cached, last_token, done = carry
 
             logits_step, new_cache = model(
@@ -501,6 +591,22 @@ def generate(
 
     When attention_mask contains padding and max_new_tokens > 1, prompts are
     grouped by length (left padding only) and return_cache is disallowed.
+
+    :param MegalodonForCausalLM model: Model to generate from.
+    :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
+    :param int max_new_tokens: Number of new tokens to generate.
+    :param PRNGKeyArray | None key: PRNG key for sampling.
+    :param int | None seed: Seed for deterministic sampling.
+    :param float temperature: Sampling temperature.
+    :param int | None top_k: Top-k filter.
+    :param float | None top_p: Top-p filter.
+    :param int | None bos_token_id: Optional BOS token ID.
+    :param int | None eos_token_id: Optional EOS token ID.
+    :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
+    :param ModelCache | None cache: Optional cache.
+    :param bool return_cache: Whether to return cache.
+    :raises ValueError: If inputs are invalid or padding constraints are violated.
+    :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
     """
 
     if seed is not None and key is not None:

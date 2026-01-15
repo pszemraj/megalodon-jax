@@ -54,15 +54,13 @@ class TimestepNorm(eqx.Module):
     ):
         """Initialize TimestepNorm.
 
-        Args:
-            num_features: Total number of feature channels D.
-            num_groups: Number of groups for statistics computation.
-            eps: Numerical epsilon for variance stability.
-            affine: Whether to include learnable affine parameters.
-            key: PRNG key (unused, for API consistency).
-
-        Raises:
-            ValueError: If num_features is not divisible by num_groups.
+        :param int num_features: Total number of feature channels.
+        :param int num_groups: Number of groups for statistics computation.
+        :param float eps: Numerical epsilon for variance stability.
+        :param bool affine: Whether to include learnable affine parameters.
+        :param PRNGKeyArray | None key: PRNG key (unused).
+        :raises ValueError: If num_features is not divisible by num_groups.
+        :return None: None.
         """
         del key  # unused
         if num_features % num_groups != 0:
@@ -90,17 +88,12 @@ class TimestepNorm(eqx.Module):
     ) -> tuple[Float[Array, "batch seq dim"], NormState]:
         """Normalize x while carrying forward streaming statistics.
 
-        Args:
-            x: Input tensor of shape (batch, seq, dim).
-            state: Previous running statistics (count, mean, var per group).
-            mask: Boolean mask where True marks valid tokens.
-
-        Returns:
-            Tuple of (normalized tensor, updated NormState).
-
-        Raises:
-            ValueError: If input dimension doesn't match num_features.
-            TypeError: If input dtype is float16 (not supported for stability).
+        :param Float[Array, "batch seq dim"] x: Input tensor.
+        :param NormState | None state: Previous running statistics.
+        :param Bool[Array, "batch seq"] | None mask: Valid-token mask.
+        :raises ValueError: If input dimension doesn't match num_features.
+        :raises TypeError: If input dtype is float16.
+        :return tuple[Float[Array, "batch seq dim"], NormState]: Normalized output and state.
         """
         B, L, D = x.shape
         G = self.num_groups

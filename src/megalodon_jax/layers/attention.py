@@ -23,7 +23,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import InitMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
-from megalodon_jax.layers.norms import RMSNorm
+from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
@@ -37,7 +37,12 @@ from megalodon_jax.utils import reinit_linear_weights
 def _linear_3d(
     linear: eqx.nn.Linear, x: Float[Array, "batch seq in_dim"]
 ) -> Float[Array, "batch seq out_dim"]:
-    """Apply an Equinox Linear over a (batch, seq, dim) tensor."""
+    """Apply an Equinox Linear over a (batch, seq, dim) tensor.
+
+    :param eqx.nn.Linear linear: Linear module to apply.
+    :param jax.Array x: Input tensor of shape (batch, seq, in_dim).
+    :return jax.Array: Output tensor of shape (batch, seq, out_dim).
+    """
     y = jnp.matmul(x, linear.weight.T)
     if linear.bias is not None:
         y = y + linear.bias
@@ -54,24 +59,22 @@ def attention_single_chunk(
     deterministic: bool = True,
     key: PRNGKeyArray | None = None,
 ) -> Float[Array, "batch seq heads value_dim"]:
-    """Causal attention over a single chunk with NO temperature scaling.
+    """Causal attention over a single chunk with normalized scaling.
 
-    CRITICAL: This implements normalized attention (scale=1.0), NOT standard
-    scaled dot-product attention. The PyTorch reference explicitly sets
-    scale=1.0 in F.scaled_dot_product_attention.
+    This implements normalized attention (scale=1.0), not standard scaled
+    dot-product attention. The PyTorch reference explicitly sets scale=1.0 in
+    ``F.scaled_dot_product_attention``.
 
-    Args:
-        q: Query tensor of shape (batch, seq, heads, head_dim).
-        k: Key tensor of shape (batch, kv_seq, heads, head_dim).
-        v: Value tensor of shape (batch, kv_seq, heads, value_dim).
-        kv_mask: Optional key/value mask where True marks valid positions.
-        causal: Whether to apply causal masking (default True).
-        dropout_rate: Attention dropout rate.
-        deterministic: If True, skip dropout.
-        key: PRNG key for dropout (required if not deterministic).
-
-    Returns:
-        Output tensor of shape (batch, seq, heads, value_dim).
+    :param jax.Array q: Query tensor of shape (batch, seq, heads, head_dim).
+    :param jax.Array k: Key tensor of shape (batch, kv_seq, heads, head_dim).
+    :param jax.Array v: Value tensor of shape (batch, kv_seq, heads, value_dim).
+    :param jax.Array | None kv_mask: Optional mask where True marks valid positions.
+    :param bool causal: Whether to apply causal masking.
+    :param float dropout_rate: Attention dropout rate.
+    :param bool deterministic: If True, skip dropout.
+    :param PRNGKeyArray | None key: PRNG key for dropout when deterministic is False.
+    :raises ValueError: If dropout is enabled without a PRNG key.
+    :return jax.Array: Output tensor of shape (batch, seq, heads, value_dim).
     """
     B, L_q, H, Dh = q.shape
     L_kv = k.shape[1]
@@ -157,20 +160,17 @@ def attention_multi_chunk(
     per chunk. This enforces the block-diagonal structure where attention
     only operates within chunks - cross-chunk context flows through CEMA.
 
-    Args:
-        q: Query tensor of shape (batch, seq, heads, head_dim).
-        k: Key tensor of shape (batch, seq, heads, head_dim).
-        v: Value tensor of shape (batch, seq, heads, value_dim).
-        chunk_size: Size of each attention chunk.
-        start_index: Absolute position offset for RoPE (JAX scalar).
-        rotary: RotaryEmbedding module for position encoding.
-        mask: Optional mask where True marks valid positions.
-        dropout_rate: Attention dropout rate.
-        deterministic: If True, skip dropout.
-        key: PRNG key for dropout.
-
-    Returns:
-        Output tensor of shape (batch, seq, heads, value_dim).
+    :param jax.Array q: Query tensor of shape (batch, seq, heads, head_dim).
+    :param jax.Array k: Key tensor of shape (batch, seq, heads, head_dim).
+    :param jax.Array v: Value tensor of shape (batch, seq, heads, value_dim).
+    :param int chunk_size: Size of each attention chunk.
+    :param jax.Array start_index: Absolute position offset for RoPE (JAX scalar).
+    :param RotaryEmbedding rotary: RotaryEmbedding module for position encoding.
+    :param jax.Array | None mask: Optional mask where True marks valid positions.
+    :param float dropout_rate: Attention dropout rate.
+    :param bool deterministic: If True, skip dropout.
+    :param PRNGKeyArray | None key: PRNG key for dropout.
+    :return jax.Array: Output tensor of shape (batch, seq, heads, value_dim).
     """
     B, L, H, Dh = q.shape
     Dv = v.shape[-1]
@@ -300,18 +300,15 @@ class ChunkedAttention(eqx.Module):
     ):
         """Initialize ChunkedAttention.
 
-        Args:
-            num_heads: Number of attention heads.
-            head_dim: Dimension per head for queries/keys.
-            value_head_dim: Dimension per head for values.
-            chunk_size: Size of attention chunks.
-            rope_base: Base for rotary embeddings.
-            max_cache_len: Maximum cache length. None/-1 = chunk_size.
-                Values > chunk_size enable sliding window attention.
-            cache_unbounded: If True, disables chunk boundary resets. Cache
-                is still bounded by max_cache_len for JIT compatibility.
-            attention_dropout: Dropout rate for attention weights.
-            key: PRNG key for initialization.
+        :param int num_heads: Number of attention heads.
+        :param int head_dim: Dimension per head for queries/keys.
+        :param int value_head_dim: Dimension per head for values.
+        :param int chunk_size: Size of attention chunks.
+        :param float rope_base: Base for rotary embeddings.
+        :param int | None max_cache_len: Maximum cache length; None/-1 uses chunk_size; >chunk_size enables sliding window.
+        :param bool cache_unbounded: If True, disables chunk boundary resets while keeping a bounded buffer for JIT compatibility.
+        :param float attention_dropout: Dropout rate for attention weights.
+        :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -343,18 +340,15 @@ class ChunkedAttention(eqx.Module):
     ]:
         """Apply chunked attention with optional caching.
 
-        Args:
-            q: Query tensor (batch, seq, heads, head_dim).
-            k: Key tensor (batch, seq, heads, head_dim).
-            v: Value tensor (batch, seq, heads, value_dim).
-            cache: Optional cached K/V from previous tokens.
-            mask: Optional mask where True marks valid positions.
-            return_cache: Whether to return updated cache.
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Tuple of (output, updated_cache, new_position).
+        :param jax.Array q: Query tensor (batch, seq, heads, head_dim).
+        :param jax.Array k: Key tensor (batch, seq, heads, head_dim).
+        :param jax.Array v: Value tensor (batch, seq, heads, value_dim).
+        :param AttentionCache | None cache: Optional cached K/V from previous tokens.
+        :param jax.Array | None mask: Optional mask where True marks valid positions.
+        :param bool return_cache: Whether to return updated cache.
+        :param bool deterministic: If True, skip dropout.
+        :param PRNGKeyArray | None key: PRNG key for dropout.
+        :return tuple[jax.Array, AttentionCache | None, jax.Array | None]: Output, updated cache, and new position counter.
         """
         B, L, H, _ = q.shape
 
@@ -429,13 +423,22 @@ class ChunkedAttention(eqx.Module):
         cache_indices = jnp.arange(cache_size, dtype=jnp.int32)
 
         def current_valid_len(cur_pos: Int[Array, ""]) -> Int[Array, ""]:
-            """Return the valid cache length at the current position."""
+            """Return the valid cache length at the current position.
+
+            :param jax.Array cur_pos: Current streaming position.
+            :return jax.Array: Valid cache length for the current step.
+            """
             if faithful_chunk_local:
                 return jnp.minimum(cur_pos % self.chunk_size, cache_size)
             return jnp.minimum(cur_pos, cache_size)
 
         def cache_start(cur_pos: Int[Array, ""], valid_len: Int[Array, ""]) -> Int[Array, ""]:
-            """Oldest cache index for the current window."""
+            """Compute the oldest cache index for the current window.
+
+            :param jax.Array cur_pos: Current streaming position.
+            :param jax.Array valid_len: Number of valid cache entries.
+            :return jax.Array: Start index in the ring buffer.
+            """
             return jnp.mod(cur_pos - valid_len, cache_size)
 
         def ordered_cache(
@@ -447,20 +450,36 @@ class ChunkedAttention(eqx.Module):
             Float[Array, "batch cache_size heads head_dim"],
             Float[Array, "batch cache_size heads value_dim"],
         ]:
-            """Return cache K/V in chronological order for causal attention."""
+            """Return cache K/V in chronological order for causal attention.
+
+            :param jax.Array c_k: Cache keys in ring order.
+            :param jax.Array c_v: Cache values in ring order.
+            :param jax.Array cur_pos: Current streaming position.
+            :param jax.Array valid_len: Number of valid cache entries.
+            :return tuple[jax.Array, jax.Array]: Ordered (k, v) for attention.
+            """
             start = cache_start(cur_pos, valid_len)
             order = jnp.mod(start + cache_indices, cache_size)
             return jnp.take(c_k, order, axis=1), jnp.take(c_v, order, axis=1)
 
         def cache_mask_for(valid_len: Int[Array, ""]) -> Bool[Array, "batch cache_size"]:
-            """Build a broadcasted cache validity mask."""
+            """Build a broadcasted cache validity mask.
+
+            :param jax.Array valid_len: Number of valid cache entries.
+            :return jax.Array: Boolean mask with shape (batch, cache_size).
+            """
             mask_vec = cache_indices < valid_len
             return jnp.broadcast_to(mask_vec, (B, cache_size))
 
         def cache_mask_ring(
             cur_pos: Int[Array, ""], valid_len: Int[Array, ""]
         ) -> Bool[Array, "batch cache_size"]:
-            """Cache validity mask for ring-ordered buffers."""
+            """Build a cache validity mask for ring-ordered buffers.
+
+            :param jax.Array cur_pos: Current streaming position.
+            :param jax.Array valid_len: Number of valid cache entries.
+            :return jax.Array: Boolean mask with shape (batch, cache_size).
+            """
             start = cache_start(cur_pos, valid_len)
             age = jnp.mod(cache_indices - start, cache_size)
             mask_vec = age < valid_len
@@ -479,7 +498,16 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             Int[Array, ""],
         ]:
-            """Append a single token to the ring buffer."""
+            """Append a single token to the ring buffer.
+
+            :param jax.Array c_k: Cache keys in ring order.
+            :param jax.Array c_v: Cache values in ring order.
+            :param jax.Array k_tok: New key token of shape (batch, 1, heads, head_dim).
+            :param jax.Array v_tok: New value token of shape (batch, 1, heads, value_dim).
+            :param jax.Array cur_pos: Current streaming position.
+            :param jax.Array valid_len: Number of valid cache entries.
+            :return tuple[jax.Array, jax.Array, jax.Array, jax.Array]: Updated cache, write position, and new valid length.
+            """
             write_pos = jnp.mod(cur_pos, cache_size).astype(jnp.int32)
             new_k = c_k.at[:, write_pos].set(k_tok[:, 0])
             new_v = c_v.at[:, write_pos].set(v_tok[:, 0])
@@ -506,7 +534,12 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
-                """Process one token in the small-L streaming path."""
+                """Process one token in the small-L streaming path.
+
+                :param jax.Array i: Token index within the sequence.
+                :param tuple state: Streaming state tuple.
+                :return tuple: Updated streaming state tuple.
+                """
                 out_step, c_k_step, c_v_step, pos_step, rng_step = state
 
                 q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
@@ -579,7 +612,15 @@ class ChunkedAttention(eqx.Module):
                 Float[Array, "batch cache_size heads head_dim"],
                 Float[Array, "batch cache_size heads value_dim"],
             ]:
-                """Append a full chunk, keeping only the most recent cache_size tokens."""
+                """Append a full chunk, keeping only the most recent cache_size tokens.
+
+                :param jax.Array c_k: Cache keys in ring order.
+                :param jax.Array c_v: Cache values in ring order.
+                :param jax.Array k_blk: Chunk keys of shape (batch, chunk_size, heads, head_dim).
+                :param jax.Array v_blk: Chunk values of shape (batch, chunk_size, heads, value_dim).
+                :param jax.Array cur_pos: Current streaming position.
+                :return tuple[jax.Array, jax.Array]: Updated cache buffers.
+                """
                 tail_offset = self.chunk_size - cache_size
                 k_keep = k_blk[:, tail_offset:]
                 v_keep = v_blk[:, tail_offset:]
@@ -601,7 +642,15 @@ class ChunkedAttention(eqx.Module):
                 Float[Array, "batch cache_size heads head_dim"],
                 Float[Array, "batch cache_size heads value_dim"],
             ]:
-                """Append a full chunk to the ring buffer."""
+                """Append a full chunk to the ring buffer.
+
+                :param jax.Array c_k: Cache keys in ring order.
+                :param jax.Array c_v: Cache values in ring order.
+                :param jax.Array k_blk: Chunk keys of shape (batch, chunk_size, heads, head_dim).
+                :param jax.Array v_blk: Chunk values of shape (batch, chunk_size, heads, value_dim).
+                :param jax.Array cur_pos: Current streaming position.
+                :return tuple[jax.Array, jax.Array]: Updated cache buffers.
+                """
                 write_pos = jnp.mod(cur_pos, cache_size)
                 offsets = cache_indices[: self.chunk_size]
                 write_idx = jnp.mod(write_pos + offsets, cache_size)
@@ -623,7 +672,16 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             PRNGKeyArray | None,
         ]:
-            """Process a full chunk with cache and update the streaming state."""
+            """Process a full chunk with cache and update the streaming state.
+
+            :param jax.Array offset: Starting index for the chunk.
+            :param jax.Array out_buf: Output buffer to update in-place.
+            :param jax.Array c_k: Cache keys in ring order.
+            :param jax.Array c_v: Cache values in ring order.
+            :param jax.Array cur_pos: Current streaming position.
+            :param PRNGKeyArray | None rng: PRNG key for dropout.
+            :return tuple: Updated (out_buf, cache_k, cache_v, position, rng).
+            """
             q_blk = jax.lax.dynamic_slice(
                 q_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
             )
@@ -651,7 +709,11 @@ class ChunkedAttention(eqx.Module):
                 step_rng = None
 
             def attend_with_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
-                """Attend with cache concatenated to the current chunk."""
+                """Attend with cache concatenated to the current chunk.
+
+                :param None _: Unused placeholder for ``jax.lax.cond``.
+                :return jax.Array: Attention output for the current chunk.
+                """
                 ordered_k, ordered_v = ordered_cache(c_k, c_v, cur_pos, valid_len)
                 k_cat = jnp.concatenate([ordered_k, k_rot], axis=1)
                 v_cat = jnp.concatenate([ordered_v, v_blk], axis=1)
@@ -667,7 +729,11 @@ class ChunkedAttention(eqx.Module):
                 )
 
             def attend_no_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
-                """Attend within the current chunk only."""
+                """Attend within the current chunk only.
+
+                :param None _: Unused placeholder for ``jax.lax.cond``.
+                :return jax.Array: Attention output for the current chunk.
+                """
                 return attention_single_chunk(
                     q_rot,
                     k_rot,
@@ -706,7 +772,17 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             PRNGKeyArray | None,
         ]:
-            """Process a partial chunk token-by-token."""
+            """Process a partial chunk token-by-token.
+
+            :param jax.Array offset: Starting index for the partial chunk.
+            :param jax.Array chunk_len: Length of the partial chunk.
+            :param jax.Array out_buf: Output buffer to update in-place.
+            :param jax.Array c_k: Cache keys in ring order.
+            :param jax.Array c_v: Cache values in ring order.
+            :param jax.Array cur_pos: Current streaming position.
+            :param PRNGKeyArray | None rng: PRNG key for dropout.
+            :return tuple: Updated (out_buf, cache_k, cache_v, position, rng).
+            """
 
             def token_body(
                 i: Int[Array, ""],
@@ -724,7 +800,12 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
-                """Process one token in a partial chunk."""
+                """Process one token in a partial chunk.
+
+                :param jax.Array i: Token index within the partial chunk.
+                :param tuple state: Streaming state tuple.
+                :return tuple: Updated streaming state tuple.
+                """
                 out_step, c_k_step, c_v_step, pos_step, rng_step = state
                 idx = offset + i
 
@@ -775,7 +856,11 @@ class ChunkedAttention(eqx.Module):
         def loop_cond(
             state: tuple[Int[Array, ""], Array, Array, Array, Int[Array, ""], PRNGKeyArray | None],
         ) -> Bool[Array, ""]:
-            """Continue streaming loop while offset is within sequence length."""
+            """Continue streaming loop while offset is within sequence length.
+
+            :param tuple state: Streaming loop state tuple.
+            :return jax.Array: Boolean flag to continue the loop.
+            """
             offset = state[0]
             return offset < L
 
@@ -796,7 +881,11 @@ class ChunkedAttention(eqx.Module):
             Int[Array, ""],
             PRNGKeyArray | None,
         ]:
-            """Streaming loop body that dispatches full vs partial chunk processing."""
+            """Streaming loop body that dispatches full vs partial chunk processing.
+
+            :param tuple state: Streaming loop state tuple.
+            :return tuple: Updated streaming loop state tuple.
+            """
             offset, out_buf, c_k, c_v, cur_pos, rng = state
             remaining = L - offset
             if faithful_chunk_local:
@@ -825,7 +914,11 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
-                """Branch for processing a full chunk."""
+                """Branch for processing a full chunk.
+
+                :param tuple branch_state: Current branch state tuple.
+                :return tuple: Updated branch state tuple.
+                """
                 offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
                 out_b, k_b, v_b, pos_b, rng_b = process_full_chunk(
                     offset_b, out_b, k_b, v_b, pos_b, rng_b
@@ -850,7 +943,11 @@ class ChunkedAttention(eqx.Module):
                 Int[Array, ""],
                 PRNGKeyArray | None,
             ]:
-                """Branch for processing a partial chunk."""
+                """Branch for processing a partial chunk.
+
+                :param tuple branch_state: Current branch state tuple.
+                :return tuple: Updated branch state tuple.
+                """
                 offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
                 out_b, k_b, v_b, pos_b, rng_b = process_partial_chunk(
                     offset_b, chunk_len, out_b, k_b, v_b, pos_b, rng_b
@@ -960,23 +1057,22 @@ class MegalodonAttention(eqx.Module):
     ):
         """Initialize MegalodonAttention.
 
-        Args:
-            model_dim: Model hidden dimension D.
-            z_dim: Shared Q/K dimension.
-            value_dim: Value dimension.
-            num_heads: Number of attention heads.
-            cema_ndim: Number of EMA orders for ComplexEMA.
-            chunk_size: Attention chunk size.
-            norm_num_groups: Number of groups for TimestepNorm.
-            norm_eps: Epsilon for normalization.
-            norm_affine: Whether normalization layers include affine parameters.
-            rope_base: Base for rotary embeddings.
-            max_cache_len: Max KV cache length. None/-1 = chunk_size.
-            cache_unbounded: If True, never clamp cache length.
-            dropout: Output dropout rate.
-            attention_dropout: Attention weight dropout rate.
-            hidden_dropout: Hidden layer dropout rate.
-            key: PRNG key for initialization.
+        :param int model_dim: Model hidden dimension D.
+        :param int z_dim: Shared Q/K dimension.
+        :param int value_dim: Value dimension.
+        :param int num_heads: Number of attention heads.
+        :param int cema_ndim: Number of EMA orders for ComplexEMA.
+        :param int chunk_size: Attention chunk size.
+        :param int norm_num_groups: Number of groups for TimestepNorm.
+        :param float norm_eps: Epsilon for normalization.
+        :param bool norm_affine: Whether normalization layers include affine parameters.
+        :param float rope_base: Base for rotary embeddings.
+        :param int | None max_cache_len: Max KV cache length. None/-1 = chunk_size.
+        :param bool cache_unbounded: If True, never clamp cache length.
+        :param float dropout: Output dropout rate.
+        :param float attention_dropout: Attention weight dropout rate.
+        :param float hidden_dropout: Hidden layer dropout rate.
+        :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.model_dim = model_dim
         self.z_dim = z_dim
@@ -1031,16 +1127,13 @@ class MegalodonAttention(eqx.Module):
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Forward pass through the attention block.
 
-        Args:
-            x: Input tensor of shape (batch, seq, dim).
-            cache: Optional layer cache from previous tokens.
-            mask: Optional mask where True marks valid positions.
-            return_cache: Whether to return updated cache.
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Tuple of (output, updated_cache).
+        :param jax.Array x: Input tensor of shape (batch, seq, dim).
+        :param LayerCache | None cache: Optional layer cache from previous tokens.
+        :param jax.Array | None mask: Optional mask where True marks valid positions.
+        :param bool return_cache: Whether to return updated cache.
+        :param bool deterministic: If True, skip dropout.
+        :param PRNGKeyArray | None key: PRNG key for dropout.
+        :return tuple[jax.Array, LayerCache | None]: Output tensor and updated cache.
         """
         B, L, D = x.shape
         H = self.num_heads
@@ -1187,18 +1280,24 @@ class MegalodonAttention(eqx.Module):
         custom initialization modes. Creates the module with default init,
         then reinitializes all Linear weights according to init_mode.
 
-        Args:
-            Same as __init__, plus:
-            init_mode: Initialization mode for Linear weights. One of:
-                - "gaussian": Truncated normal with stddev=1/sqrt(dim) when dim is set,
-                  or stddev=1.0 when dim is None (PyTorch parity)
-                - "xavier": Glorot uniform (Equinox default)
-                - "he": He normal (for ReLU networks)
-                - "bert": Normal with stddev=0.02
-                - "none": Skip reinitialization (use Equinox default)
-
-        Returns:
-            MegalodonAttention instance with reinitialized weights.
+        :param int model_dim: Model hidden dimension D.
+        :param int z_dim: Shared Q/K dimension.
+        :param int value_dim: Value dimension.
+        :param int num_heads: Number of attention heads.
+        :param int cema_ndim: Number of EMA orders for ComplexEMA.
+        :param int chunk_size: Attention chunk size.
+        :param int norm_num_groups: Number of groups for TimestepNorm.
+        :param float norm_eps: Epsilon for normalization.
+        :param bool norm_affine: Whether normalization layers include affine parameters.
+        :param float rope_base: Base for rotary embeddings.
+        :param int | None max_cache_len: Max KV cache length. None/-1 = chunk_size.
+        :param bool cache_unbounded: If True, never clamp cache length.
+        :param float dropout: Output dropout rate.
+        :param float attention_dropout: Attention weight dropout rate.
+        :param float hidden_dropout: Hidden layer dropout rate.
+        :param InitMode init_mode: Initialization mode for Linear weights.
+        :param PRNGKeyArray key: PRNG key for initialization.
+        :return MegalodonAttention: Instance with reinitialized weights.
         """
         key1, key2 = jax.random.split(key)
         instance = cls(
@@ -1271,17 +1370,16 @@ class NormalizedFFN(eqx.Module):
     ):
         """Initialize NormalizedFFN.
 
-        Args:
-            model_dim: Model hidden dimension.
-            ffn_hidden_dim: FFN intermediate dimension.
-            norm_eps: Epsilon for layer normalization.
-            norm_affine: Whether normalization includes affine parameters.
-            swiglu: Whether to use SwiGLU activation.
-            rescale: Whether to apply residual rescaling (rescale_nffn).
-            layer_id: Layer index for computing rescale factor (0-indexed).
-            hidden_dropout: Dropout after hidden layer.
-            dropout: Dropout after output projection.
-            key: PRNG key for initialization.
+        :param int model_dim: Model hidden dimension.
+        :param int ffn_hidden_dim: FFN intermediate dimension.
+        :param float norm_eps: Epsilon for layer normalization.
+        :param bool norm_affine: Whether normalization includes affine parameters.
+        :param bool swiglu: Whether to use SwiGLU activation.
+        :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
+        :param int layer_id: Layer index for computing rescale factor (0-indexed).
+        :param float hidden_dropout: Dropout after hidden layer.
+        :param float dropout: Dropout after output projection.
+        :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.model_dim = model_dim
         self.ffn_hidden_dim = ffn_hidden_dim
@@ -1293,9 +1391,7 @@ class NormalizedFFN(eqx.Module):
 
         keys = jax.random.split(key, 3)
 
-        self.norm = eqx.nn.LayerNorm(
-            shape=model_dim, eps=norm_eps, use_weight=norm_affine, use_bias=norm_affine
-        )
+        self.norm = BatchedLayerNorm(model_dim, eps=norm_eps, affine=norm_affine)
         self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, key=keys[0])
         self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, key=keys[1])
 
@@ -1313,14 +1409,11 @@ class NormalizedFFN(eqx.Module):
     ) -> Float[Array, "batch seq dim"]:
         """Forward pass through the FFN.
 
-        Args:
-            x: Input tensor of shape (batch, seq, dim).
-            residual_base: Optional tensor to use as residual base (two-hop).
-            deterministic: If True, skip dropout.
-            key: PRNG key for dropout.
-
-        Returns:
-            Output tensor of shape (batch, seq, dim).
+        :param jax.Array x: Input tensor of shape (batch, seq, dim).
+        :param jax.Array | None residual_base: Optional tensor for two-hop residuals.
+        :param bool deterministic: If True, skip dropout.
+        :param PRNGKeyArray | None key: PRNG key for dropout.
+        :return jax.Array: Output tensor of shape (batch, seq, dim).
         """
         residual = x if residual_base is None else residual_base
 
@@ -1384,18 +1477,18 @@ class NormalizedFFN(eqx.Module):
         custom initialization modes. Creates the module with default init,
         then reinitializes all Linear weights according to init_mode.
 
-        Args:
-            Same as __init__, plus:
-            init_mode: Initialization mode for Linear weights. One of:
-                - "gaussian": Truncated normal with stddev=1/sqrt(dim) when dim is set,
-                  or stddev=1.0 when dim is None (PyTorch parity)
-                - "xavier": Glorot uniform (Equinox default)
-                - "he": He normal (for ReLU networks)
-                - "bert": Normal with stddev=0.02
-                - "none": Skip reinitialization (use Equinox default)
-
-        Returns:
-            NormalizedFFN instance with reinitialized weights.
+        :param int model_dim: Model hidden dimension.
+        :param int ffn_hidden_dim: FFN intermediate dimension.
+        :param float norm_eps: Epsilon for layer normalization.
+        :param bool norm_affine: Whether normalization includes affine parameters.
+        :param bool swiglu: Whether to use SwiGLU activation.
+        :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
+        :param int layer_id: Layer index for computing rescale factor (0-indexed).
+        :param float hidden_dropout: Dropout after hidden layer.
+        :param float dropout: Dropout after output projection.
+        :param InitMode init_mode: Initialization mode for Linear weights.
+        :param PRNGKeyArray key: PRNG key for initialization.
+        :return NormalizedFFN: Instance with reinitialized weights.
         """
         key1, key2 = jax.random.split(key)
         instance = cls(

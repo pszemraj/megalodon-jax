@@ -1,33 +1,43 @@
 """Phase 4 Model Assembly tests - MegalodonBlock, MegalodonModel, MegalodonForCausalLM."""
 
+from typing import Any
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import MegalodonConfig as TorchMegalodonConfig
+from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
-from megalodon_jax import (
-    MegalodonBlock,
-    MegalodonConfig,
-    MegalodonForCausalLM,
-    MegalodonModel,
-)
+from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert PyTorch tensor to JAX array."""
+    """Convert a PyTorch tensor to a JAX array.
+
+    :param torch.Tensor t: Input PyTorch tensor.
+    :return jnp.ndarray: JAX array on the default device.
+    """
     return jnp.array(t.detach().cpu().numpy())
 
 
 def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert JAX array to PyTorch tensor."""
+    """Convert a JAX array to a PyTorch tensor.
+
+    :param jnp.ndarray a: Input JAX array.
+    :return torch.Tensor: Torch tensor on CPU.
+    """
     return torch.from_numpy(np.array(a))
 
 
 def small_config() -> MegalodonConfig:
-    """Create a small config for fast testing."""
+    """Create a small config for fast testing.
+
+    :return MegalodonConfig: Minimal model configuration for tests.
+    """
     return MegalodonConfig(
         vocab_size=256,
         model_dim=64,
@@ -50,8 +60,12 @@ def small_config() -> MegalodonConfig:
 class TestMegalodonBlock:
     """Tests for MegalodonBlock decoder layer."""
 
-    def test_forward_shapes(self, random_seed):
-        """Test that MegalodonBlock produces correct output shapes."""
+    def test_forward_shapes(self, random_seed: int) -> None:
+        """Test that MegalodonBlock produces correct output shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 32
 
@@ -69,8 +83,12 @@ class TestMegalodonBlock:
         assert cache.norm is not None
         assert cache.ema is not None
 
-    def test_forward_no_cache(self, random_seed):
-        """Test forward pass without returning cache."""
+    def test_forward_no_cache(self, random_seed: int) -> None:
+        """Test forward pass without returning cache.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 32
 
@@ -85,8 +103,12 @@ class TestMegalodonBlock:
         assert out.shape == (batch, seq, config.model_dim)
         assert cache is None
 
-    def test_streaming_with_cache(self, random_seed):
-        """Test that streaming with cache produces consistent outputs."""
+    def test_streaming_with_cache(self, random_seed: int) -> None:
+        """Test that streaming with cache produces consistent outputs.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 1, 32
 
@@ -115,8 +137,12 @@ class TestMegalodonBlock:
             err_msg="Streaming output differs from batch output",
         )
 
-    def test_different_layer_ids(self, random_seed):
-        """Test that different layer IDs produce different rescaling."""
+    def test_different_layer_ids(self, random_seed: int) -> None:
+        """Test that different layer IDs produce different rescaling.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -154,8 +180,12 @@ class TestMegalodonBlock:
 class TestMegalodonModel:
     """Tests for MegalodonModel decoder stack."""
 
-    def test_forward_shapes(self, random_seed):
-        """Test that MegalodonModel produces correct output shapes."""
+    def test_forward_shapes(self, random_seed: int) -> None:
+        """Test that MegalodonModel produces correct output shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 32
 
@@ -170,8 +200,12 @@ class TestMegalodonModel:
         assert len(cache.layer_caches) == config.num_layers
         assert cache.final_norm is not None
 
-    def test_embedding_scale(self, random_seed):
-        """Test that embedding scaling works correctly."""
+    def test_embedding_scale(self, random_seed: int) -> None:
+        """Test that embedding scaling works correctly.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config_scaled = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -208,8 +242,12 @@ class TestMegalodonModel:
         assert model_scaled.scale == float(jnp.sqrt(64))
         assert model_unscaled.scale == 1.0
 
-    def test_cache_threading(self, random_seed):
-        """Test that cache is properly threaded through layers."""
+    def test_cache_threading(self, random_seed: int) -> None:
+        """Test that cache is properly threaded through layers.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 1, 16
 
@@ -232,8 +270,12 @@ class TestMegalodonModel:
             if layer_cache is not None and layer_cache.attn is not None:
                 assert layer_cache.attn.count > 0
 
-    def test_attention_mask(self, random_seed):
-        """Test that attention mask is properly applied."""
+    def test_attention_mask(self, random_seed: int) -> None:
+        """Test that attention mask is properly applied.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 16
 
@@ -263,8 +305,12 @@ class TestMegalodonModel:
 class TestMegalodonForCausalLM:
     """Tests for MegalodonForCausalLM with tied LM head."""
 
-    def test_forward_shapes(self, random_seed):
-        """Test that MegalodonForCausalLM produces correct logit shapes."""
+    def test_forward_shapes(self, random_seed: int) -> None:
+        """Test that MegalodonForCausalLM produces correct logit shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 32
 
@@ -277,8 +323,12 @@ class TestMegalodonForCausalLM:
         assert logits.shape == (batch, seq, config.vocab_size)
         assert cache is not None
 
-    def test_weight_tying(self, random_seed):
-        """Test that LM head is tied to input embeddings."""
+    def test_weight_tying(self, random_seed: int) -> None:
+        """Test that LM head is tied to input embeddings.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
 
         key = jax.random.PRNGKey(random_seed)
@@ -305,8 +355,12 @@ class TestMegalodonForCausalLM:
             err_msg="Weight tying is not working correctly",
         )
 
-    def test_compute_loss(self, random_seed):
-        """Test that loss computation works correctly."""
+    def test_compute_loss(self, random_seed: int) -> None:
+        """Test that loss computation works correctly.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 16
 
@@ -324,8 +378,12 @@ class TestMegalodonForCausalLM:
         assert jnp.isfinite(loss)
         assert loss > 0
 
-    def test_streaming_generation(self, random_seed):
-        """Test streaming token-by-token generation."""
+    def test_streaming_generation(self, random_seed: int) -> None:
+        """Test streaming token-by-token generation.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch = 1
 
@@ -361,8 +419,12 @@ class TestMegalodonForCausalLM:
 class TestJIT:
     """Tests for JIT compilation and tracing behavior."""
 
-    def test_model_jit_compilation(self, random_seed):
-        """Test that model compiles without errors."""
+    def test_model_jit_compilation(self, random_seed: int) -> None:
+        """Test that model compiles without errors.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 16
 
@@ -370,7 +432,16 @@ class TestJIT:
         model = MegalodonForCausalLM(config, key=key)
 
         @eqx.filter_jit
-        def forward(model, input_ids):
+        def forward(
+            model: MegalodonForCausalLM,
+            input_ids: jnp.ndarray,
+        ) -> tuple[jnp.ndarray, Any]:
+            """Run a JIT-compiled forward pass.
+
+            :param MegalodonForCausalLM model: Model under test.
+            :param jnp.ndarray input_ids: Token IDs.
+            :return tuple[jnp.ndarray, Any]: Logits and cache.
+            """
             return model(input_ids, return_cache=False)
 
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
@@ -387,8 +458,12 @@ class TestJIT:
             err_msg="JIT compilation produced different results",
         )
 
-    def test_no_recompilation_on_cache_update(self, random_seed):
-        """Test that streaming with cache doesn't cause recompilation."""
+    def test_no_recompilation_on_cache_update(self, random_seed: int) -> None:
+        """Test that streaming with cache doesn't cause recompilation.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch = 1
 
@@ -396,7 +471,18 @@ class TestJIT:
         model = MegalodonForCausalLM(config, key=key)
 
         @eqx.filter_jit
-        def step(model, input_ids, cache):
+        def step(
+            model: MegalodonForCausalLM,
+            input_ids: jnp.ndarray,
+            cache: Any,
+        ) -> tuple[jnp.ndarray, Any]:
+            """Run a streaming step with cache.
+
+            :param MegalodonForCausalLM model: Model under test.
+            :param jnp.ndarray input_ids: Token IDs.
+            :param Any cache: Optional cache.
+            :return tuple[jnp.ndarray, Any]: Logits and updated cache.
+            """
             return model(input_ids, cache=cache, return_cache=True)
 
         # Initial prompt
@@ -422,8 +508,12 @@ class TestJIT:
 class TestGradients:
     """Tests for gradient computation and flow."""
 
-    def test_gradient_flow_all_params(self, random_seed):
-        """Test that gradients flow to all trainable parameters."""
+    def test_gradient_flow_all_params(self, random_seed: int) -> None:
+        """Test that gradients flow to all trainable parameters.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 16
 
@@ -433,14 +523,24 @@ class TestGradients:
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
         labels = input_ids  # Self-supervision
 
-        def loss_fn(model):
+        def loss_fn(model: MegalodonForCausalLM) -> jnp.ndarray:
+            """Compute a scalar loss for gradient checks.
+
+            :param MegalodonForCausalLM model: Model under test.
+            :return jnp.ndarray: Scalar loss value.
+            """
             return model.compute_loss(input_ids, labels)
 
         # Compute gradients
         grads = eqx.filter_grad(loss_fn)(model)
 
         # Check that gradients exist and are finite
-        def check_grad(x):
+        def check_grad(x: Any) -> bool:
+            """Validate a gradient leaf for finiteness.
+
+            :param Any x: Gradient leaf to validate.
+            :return bool: True if the leaf is a finite array.
+            """
             if eqx.is_array(x):
                 assert jnp.all(jnp.isfinite(x)), "Gradient contains NaN or Inf"
                 return True
@@ -455,8 +555,12 @@ class TestGradients:
         for leaf in grad_leaves:
             assert jnp.all(jnp.isfinite(leaf)), "Gradient contains NaN or Inf"
 
-    def test_gradient_flow_embedding(self, random_seed):
-        """Test that gradients flow to embedding weights."""
+    def test_gradient_flow_embedding(self, random_seed: int) -> None:
+        """Test that gradients flow to embedding weights.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 2, 8
 
@@ -466,7 +570,12 @@ class TestGradients:
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
         labels = input_ids
 
-        def loss_fn(model):
+        def loss_fn(model: MegalodonForCausalLM) -> jnp.ndarray:
+            """Compute a scalar loss for embedding gradient checks.
+
+            :param MegalodonForCausalLM model: Model under test.
+            :return jnp.ndarray: Scalar loss value.
+            """
             return model.compute_loss(input_ids, labels)
 
         grads = eqx.filter_grad(loss_fn)(model)
@@ -487,8 +596,12 @@ class TestGradients:
 class TestModelCache:
     """Tests for ModelCache pytree registration and behavior."""
 
-    def test_cache_is_pytree(self, random_seed):
-        """Test that ModelCache is properly registered as a pytree."""
+    def test_cache_is_pytree(self, random_seed: int) -> None:
+        """Test that ModelCache is properly registered as a pytree.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 1, 8
 
@@ -503,7 +616,12 @@ class TestModelCache:
         assert len(leaves) > 0
 
         # Should be able to map over cache
-        def double(x):
+        def double(x: Any) -> Any:
+            """Double numeric cache leaves for pytree mapping.
+
+            :param Any x: Leaf value to transform.
+            :return Any: Doubled numeric leaf or original value.
+            """
             if isinstance(x, jnp.ndarray):
                 return x * 2
             return x
@@ -511,8 +629,12 @@ class TestModelCache:
         doubled = jax.tree_util.tree_map(double, cache)
         assert doubled is not None
 
-    def test_cache_tuple_immutability(self, random_seed):
-        """Test that layer_caches is a tuple (not list) for JAX compatibility."""
+    def test_cache_tuple_immutability(self, random_seed: int) -> None:
+        """Test that layer_caches is a tuple (not list) for JAX compatibility.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = small_config()
         batch, seq = 1, 8
 
@@ -534,8 +656,11 @@ class TestParity:
     """Tests comparing JAX implementation to PyTorch reference."""
 
     @pytest.fixture
-    def parity_config(self):
-        """Config for parity testing - matches PyTorch defaults."""
+    def parity_config(self) -> MegalodonConfig:
+        """Config for parity testing - matches PyTorch defaults.
+
+        :return MegalodonConfig: Parity test configuration.
+        """
         return MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -553,16 +678,24 @@ class TestParity:
             hidden_dropout=0.0,
         )
 
-    def test_causal_lm_forward_parity(self, random_seed, parity_config, torch_device):
-        """Test that JAX MegalodonForCausalLM matches PyTorch reference."""
-        from megalodon import MegalodonConfig as TorchConfig
-        from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
+    def test_causal_lm_forward_parity(
+        self,
+        random_seed: int,
+        parity_config: MegalodonConfig,
+        torch_device: torch.device,
+    ) -> None:
+        """Test that JAX MegalodonForCausalLM matches PyTorch reference.
 
+        :param int random_seed: Random seed fixture.
+        :param MegalodonConfig parity_config: Parity config fixture.
+        :param torch.device torch_device: Torch device fixture.
+        :return None: None.
+        """
         config = parity_config
         batch, seq = 2, 32
 
         # Create PyTorch model
-        torch_config = TorchConfig(
+        torch_config = TorchMegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -611,18 +744,26 @@ class TestParity:
             err_msg="JAX logits differ from PyTorch reference",
         )
 
-    def test_streaming_parity(self, random_seed, parity_config, torch_device):
-        """Test that JAX streaming matches PyTorch streaming."""
-        from megalodon import MegalodonConfig as TorchConfig
-        from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
+    def test_streaming_parity(
+        self,
+        random_seed: int,
+        parity_config: MegalodonConfig,
+        torch_device: torch.device,
+    ) -> None:
+        """Test that JAX streaming matches PyTorch streaming.
 
+        :param int random_seed: Random seed fixture.
+        :param MegalodonConfig parity_config: Parity config fixture.
+        :param torch.device torch_device: Torch device fixture.
+        :return None: None.
+        """
         config = parity_config
         batch = 1
         prompt_len = 16
         gen_len = 4
 
         # Create PyTorch model
-        torch_config = TorchConfig(
+        torch_config = TorchMegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -678,6 +819,87 @@ class TestParity:
             f"Generated tokens differ: PyTorch={torch_generated}, JAX={jax_generated}"
         )
 
+    def test_streaming_parity_crosses_chunk_boundary(
+        self, random_seed: int, torch_device: torch.device
+    ) -> None:
+        """Test streaming parity when generation crosses a chunk boundary.
+
+        :param int random_seed: Random seed fixture.
+        :param torch.device torch_device: Torch device fixture.
+        :return None: None.
+        """
+        config = MegalodonConfig(
+            vocab_size=128,
+            model_dim=64,
+            num_layers=2,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            norm_affine=True,
+            dropout=0.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        batch = 1
+        prompt_len = config.chunk_size - 1
+        gen_len = 2
+
+        torch_config = TorchMegalodonConfig(
+            vocab_size=config.vocab_size,
+            model_dim=config.model_dim,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            z_dim=config.z_dim,
+            value_dim=config.value_dim,
+            ffn_hidden_dim=config.ffn_hidden_dim,
+            cema_ndim=config.cema_ndim,
+            chunk_size=config.chunk_size,
+            norm_num_groups=config.norm_num_groups,
+            norm_affine=config.norm_affine,
+            dropout=0.0,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+
+        key = jax.random.PRNGKey(random_seed)
+        jax_model = MegalodonForCausalLM(config, key=key)
+        cpu_state_dict = {k: v.cpu() for k, v in torch_model.state_dict().items()}
+        jax_model = load_weights_from_torch(jax_model, cpu_state_dict)
+
+        torch.manual_seed(random_seed)
+        prompt_torch = torch.randint(0, config.vocab_size, (batch, prompt_len), device=torch_device)
+        prompt_jax = to_jax(prompt_torch.cpu())
+
+        torch_generated = []
+        with torch.no_grad():
+            torch_out = torch_model(prompt_torch, use_cache=True, return_dict=True)
+            torch_pkv = torch_out.past_key_values
+
+            for _ in range(gen_len):
+                next_token = torch_out.logits[:, -1:].argmax(dim=-1)
+                torch_generated.append(next_token.cpu().item())
+                torch_out = torch_model(
+                    next_token, past_key_values=torch_pkv, use_cache=True, return_dict=True
+                )
+                torch_pkv = torch_out.past_key_values
+
+        jax_generated = []
+        jax_logits, jax_cache = jax_model(prompt_jax, return_cache=True)
+        for _ in range(gen_len):
+            next_token = jnp.argmax(jax_logits[:, -1:], axis=-1)
+            jax_generated.append(int(next_token[0, 0]))
+            jax_logits, jax_cache = jax_model(next_token, cache=jax_cache, return_cache=True)
+
+        assert torch_generated == jax_generated, (
+            "Cross-boundary streaming tokens differ: "
+            f"PyTorch={torch_generated}, JAX={jax_generated}"
+        )
+
 
 # -----------------------------------------------------------------------------
 # Regression Tests for Phase 4 Fixes
@@ -687,8 +909,12 @@ class TestParity:
 class TestFix1GradientCheckpointing:
     """Tests for gradient checkpointing (Fix 1)."""
 
-    def test_checkpointing_disables_cache_during_training(self, random_seed):
-        """Test that use_checkpoint=True produces None caches during training."""
+    def test_checkpointing_disables_cache_during_training(self, random_seed: int) -> None:
+        """Test that use_checkpoint=True produces None caches during training.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -718,8 +944,12 @@ class TestFix1GradientCheckpointing:
         for layer_cache in cache.layer_caches:
             assert layer_cache is None, "Layer cache should be None when checkpointing"
 
-    def test_checkpointing_disabled_returns_cache(self, random_seed):
-        """Test that use_checkpoint=False returns caches normally."""
+    def test_checkpointing_disabled_returns_cache(self, random_seed: int) -> None:
+        """Test that use_checkpoint=False returns caches normally.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -751,8 +981,12 @@ class TestFix1GradientCheckpointing:
 class TestFix2PadTokenMasking:
     """Tests for pad token masking (Fix 2)."""
 
-    def test_pad_token_embeddings_are_zeroed(self, random_seed):
-        """Test that pad tokens produce zero embeddings."""
+    def test_pad_token_embeddings_are_zeroed(self, random_seed: int) -> None:
+        """Test that pad tokens produce zero embeddings.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -793,8 +1027,12 @@ class TestFix2PadTokenMasking:
             err_msg="Pad token at position 3 should have zero embedding",
         )
 
-    def test_pad_masking_preserves_bf16_dtype(self, random_seed):
-        """Test that pad token masking preserves bf16 dtype (no upcast to float32)."""
+    def test_pad_masking_preserves_bf16_dtype(self, random_seed: int) -> None:
+        """Test that pad token masking preserves bf16 dtype (no upcast to float32).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -813,7 +1051,12 @@ class TestFix2PadTokenMasking:
         model = MegalodonModel(config, key=key)
 
         # Cast model to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
@@ -834,8 +1077,12 @@ class TestFix2PadTokenMasking:
 class TestFix3UntiedLMHead:
     """Tests for untied LM head support (Fix 3)."""
 
-    def test_tied_head_when_output_size_matches_vocab(self, random_seed):
-        """Test that LM head is tied when output_size equals vocab_size."""
+    def test_tied_head_when_output_size_matches_vocab(self, random_seed: int) -> None:
+        """Test that LM head is tied when output_size equals vocab_size.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -856,8 +1103,12 @@ class TestFix3UntiedLMHead:
         assert model.tied is True
         assert model.lm_head is None
 
-    def test_untied_head_when_output_size_differs(self, random_seed):
-        """Test that separate LM head is created when output_size != vocab_size."""
+    def test_untied_head_when_output_size_differs(self, random_seed: int) -> None:
+        """Test that separate LM head is created when output_size != vocab_size.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -879,8 +1130,12 @@ class TestFix3UntiedLMHead:
         assert model.lm_head is not None
         assert model.lm_head.weight.shape == (512, 64)  # (output_size, model_dim)
 
-    def test_untied_head_forward_shapes(self, random_seed):
-        """Test that untied LM head produces correct output shapes."""
+    def test_untied_head_forward_shapes(self, random_seed: int) -> None:
+        """Test that untied LM head produces correct output shapes.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -909,8 +1164,12 @@ class TestFix3UntiedLMHead:
 class TestFix4CacheValidation:
     """Tests for cache length validation (Fix 4)."""
 
-    def test_cache_length_mismatch_raises(self, random_seed):
-        """Test that mismatched cache length raises ValueError."""
+    def test_cache_length_mismatch_raises(self, random_seed: int) -> None:
+        """Test that mismatched cache length raises ValueError.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         from megalodon_jax import ModelCache
 
         config = MegalodonConfig(
@@ -942,8 +1201,12 @@ class TestFix4CacheValidation:
 class TestFix6InitMode:
     """Tests for init_mode initialization (Fix 6)."""
 
-    def test_gaussian_linear_init_uses_unit_scale(self, random_seed):
-        """Test that gaussian init for Linear layers uses std ~ 1.0 (dim=None)."""
+    def test_gaussian_linear_init_uses_unit_scale(self, random_seed: int) -> None:
+        """Test that gaussian init for Linear layers uses std ~ 1.0 (dim=None).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -966,8 +1229,12 @@ class TestFix6InitMode:
         var = jnp.var(linear_weight)
         assert var > 0.2, f"Gaussian Linear init variance too small: {var}"
 
-    def test_he_init_applied(self, random_seed):
-        """Test that He initialization is applied when init_mode='he'."""
+    def test_he_init_applied(self, random_seed: int) -> None:
+        """Test that He initialization is applied when init_mode='he'.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -992,8 +1259,12 @@ class TestFix6InitMode:
         var = jnp.var(embed_weight)
         assert var > 0.001, "Embedding weights should have non-trivial variance"
 
-    def test_none_init_keeps_defaults(self, random_seed):
-        """Test that init_mode='none' doesn't reinitialize weights."""
+    def test_none_init_keeps_defaults(self, random_seed: int) -> None:
+        """Test that init_mode='none' doesn't reinitialize weights.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1014,8 +1285,12 @@ class TestFix6InitMode:
         # Weights should exist
         assert model.model.embed.weight is not None
 
-    def test_different_init_modes_produce_different_weights(self, random_seed):
-        """Test that different init modes produce different weight distributions."""
+    def test_different_init_modes_produce_different_weights(self, random_seed: int) -> None:
+        """Test that different init modes produce different weight distributions.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         base_config = dict(
             vocab_size=256,
             model_dim=64,
@@ -1041,18 +1316,24 @@ class TestFix6InitMode:
         # BERT init has stddev=0.02, which should have much smaller variance than He
         bert_var = jnp.var(model_bert.model.embed.weight)
         he_var = jnp.var(model_he.model.embed.weight)
+        xavier_var = jnp.var(model_xavier.model.embed.weight)
 
         # BERT has fixed small stddev, He scales with dimensions
         # BERT std=0.02 means var ~0.0004
         assert bert_var < 0.01, f"BERT init variance {bert_var} should be small"
-        assert he_var != bert_var, "Different init modes should produce different weights"
+        assert xavier_var > bert_var, "Xavier init variance should exceed BERT variance"
+        assert he_var > xavier_var, "He init variance should exceed Xavier variance"
 
 
 class TestComputeLossMasking:
     """Tests for compute_loss attention mask handling."""
 
-    def test_masked_positions_excluded_from_loss(self, random_seed):
-        """Test that masked positions don't contribute to loss."""
+    def test_masked_positions_excluded_from_loss(self, random_seed: int) -> None:
+        """Test that masked positions don't contribute to loss.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1087,8 +1368,12 @@ class TestComputeLossMasking:
             "Masked and unmasked loss should differ"
         )
 
-    def test_all_masked_returns_zero_loss(self, random_seed):
-        """Test that fully masked input returns zero loss (no valid positions)."""
+    def test_all_masked_returns_zero_loss(self, random_seed: int) -> None:
+        """Test that fully masked input returns zero loss (no valid positions).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1117,8 +1402,12 @@ class TestComputeLossMasking:
         # With all positions masked, loss should be 0 (sum of 0 / max(0,1) = 0)
         assert loss == 0.0, f"Fully masked loss should be 0, got {loss}"
 
-    def test_ignore_index_excludes_positions(self, random_seed):
-        """Test that labels with ignore_index are excluded from loss."""
+    def test_ignore_index_excludes_positions(self, random_seed: int) -> None:
+        """Test that labels with ignore_index are excluded from loss.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1151,8 +1440,12 @@ class TestComputeLossMasking:
         loss_all_ignored = model.compute_loss(input_ids, all_ignored)
         assert loss_all_ignored == 0.0, f"All ignored should be 0 loss, got {loss_all_ignored}"
 
-    def test_custom_ignore_index(self, random_seed):
-        """Test that custom ignore_index value works."""
+    def test_custom_ignore_index(self, random_seed: int) -> None:
+        """Test that custom ignore_index value works.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1176,10 +1469,14 @@ class TestComputeLossMasking:
         # Use -1 as ignore index instead of -100
         labels_custom = labels.at[:, -4:].set(-1)
         loss = model.compute_loss(input_ids, labels_custom, ignore_index=-1)
-        assert jnp.isfinite(loss), f"Loss should be finite with custom ignore_index"
+        assert jnp.isfinite(loss), "Loss should be finite with custom ignore_index"
 
-    def test_bounds_check_only_on_valid_labels(self, random_seed):
-        """Test that bounds check only applies to non-ignored labels."""
+    def test_bounds_check_only_on_valid_labels(self, random_seed: int) -> None:
+        """Test that bounds check only applies to non-ignored labels.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1214,8 +1511,12 @@ class TestComputeLossMasking:
 class TestUntiedHeadInit:
     """Tests for untied LM head initialization."""
 
-    def test_untied_head_gaussian_uses_output_dim_scale(self, random_seed):
-        """Test that untied LM head with gaussian init uses std=1/sqrt(output_size)."""
+    def test_untied_head_gaussian_uses_output_dim_scale(self, random_seed: int) -> None:
+        """Test that untied LM head with gaussian init uses std=1/sqrt(output_size).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1253,8 +1554,12 @@ class TestUntiedHeadInit:
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
 
-    def test_compute_loss_empty_sequence_seq0(self, random_seed):
-        """Test compute_loss returns 0.0 for empty sequences (seq=0)."""
+    def test_compute_loss_empty_sequence_seq0(self, random_seed: int) -> None:
+        """Test compute_loss returns 0.0 for empty sequences (seq=0).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1281,10 +1586,13 @@ class TestEdgeCases:
         assert loss == 0.0, f"Empty sequence loss should be 0.0, got {loss}"
         assert not jnp.isnan(loss), "Empty sequence loss should not be NaN"
 
-    def test_compute_loss_single_token_seq1(self, random_seed):
+    def test_compute_loss_single_token_seq1(self, random_seed: int) -> None:
         """Test compute_loss returns 0.0 for single-token sequences (seq=1).
 
         After shifting, a single-token sequence becomes empty (no predictions to make).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
         """
         config = MegalodonConfig(
             vocab_size=256,
@@ -1312,11 +1620,14 @@ class TestEdgeCases:
         assert loss == 0.0, f"Single-token sequence loss should be 0.0, got {loss}"
         assert not jnp.isnan(loss), "Single-token sequence loss should not be NaN"
 
-    def test_cache_with_padding_raises_error(self, random_seed):
+    def test_cache_with_padding_raises_error(self, random_seed: int) -> None:
         """Test that building cache with padded attention_mask raises an error.
 
         Caching with padding is unsupported because ComplexEMA doesn't handle masks,
         leading to hidden state contamination from padded positions.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
         """
         config = MegalodonConfig(
             vocab_size=256,
@@ -1346,8 +1657,12 @@ class TestEdgeCases:
         with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
             model(input_ids, attention_mask=attention_mask, return_cache=True)
 
-    def test_cache_without_padding_succeeds(self, random_seed):
-        """Test that building cache without padding works correctly."""
+    def test_cache_without_padding_succeeds(self, random_seed: int) -> None:
+        """Test that building cache without padding works correctly.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1375,8 +1690,12 @@ class TestEdgeCases:
         assert logits.shape == (batch, seq, config.vocab_size)
         assert cache is not None
 
-    def test_no_mask_with_cache_succeeds(self, random_seed):
-        """Test that building cache without any mask works correctly."""
+    def test_no_mask_with_cache_succeeds(self, random_seed: int) -> None:
+        """Test that building cache without any mask works correctly.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1402,8 +1721,12 @@ class TestEdgeCases:
         assert logits.shape == (batch, seq, config.vocab_size)
         assert cache is not None
 
-    def test_empty_batch_handling(self, random_seed):
-        """Test that empty batch (B=0) is handled gracefully."""
+    def test_empty_batch_handling(self, random_seed: int) -> None:
+        """Test that empty batch (B=0) is handled gracefully.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1429,8 +1752,12 @@ class TestEdgeCases:
         assert cache is not None
         assert len(cache.layer_caches) == config.num_layers
 
-    def test_empty_sequence_handling(self, random_seed):
-        """Test that empty sequence (L=0) is handled gracefully."""
+    def test_empty_sequence_handling(self, random_seed: int) -> None:
+        """Test that empty sequence (L=0) is handled gracefully.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1456,8 +1783,12 @@ class TestEdgeCases:
         assert cache is not None
         assert len(cache.layer_caches) == config.num_layers
 
-    def test_empty_input_dtype_matches_model(self, random_seed):
-        """Empty input should return output with same dtype as model (not hardcoded float32)."""
+    def test_empty_input_dtype_matches_model(self, random_seed: int) -> None:
+        """Empty input should return output with same dtype as model (not hardcoded float32).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1475,7 +1806,12 @@ class TestEdgeCases:
         model = MegalodonForCausalLM(config, key=key)
 
         # Cast model to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
@@ -1492,8 +1828,12 @@ class TestEdgeCases:
         logits_l0, _ = model_bf16(empty_seq, return_cache=False)
         assert logits_l0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_l0.dtype}"
 
-    def test_vocab_bounds_input_ids_raises(self, random_seed):
-        """Test that out-of-bounds input_ids raises an error."""
+    def test_vocab_bounds_input_ids_raises(self, random_seed: int) -> None:
+        """Test that out-of-bounds input_ids raises an error.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1516,8 +1856,12 @@ class TestEdgeCases:
         with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
             model(bad_input_ids, return_cache=False)
 
-    def test_vocab_bounds_labels_raises(self, random_seed):
-        """Test that out-of-bounds labels in compute_loss raises an error."""
+    def test_vocab_bounds_labels_raises(self, random_seed: int) -> None:
+        """Test that out-of-bounds labels in compute_loss raises an error.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1540,8 +1884,12 @@ class TestEdgeCases:
         with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
             model.compute_loss(input_ids, bad_labels)
 
-    def test_loss_dtype_matches_model_bf16(self, random_seed):
-        """Test that empty sequence loss returns correct dtype when model is bf16."""
+    def test_loss_dtype_matches_model_bf16(self, random_seed: int) -> None:
+        """Test that empty sequence loss returns correct dtype when model is bf16.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         config = MegalodonConfig(
             vocab_size=256,
             model_dim=64,
@@ -1559,7 +1907,12 @@ class TestEdgeCases:
         model = MegalodonForCausalLM(config, key=key)
 
         # Cast model to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
@@ -1580,13 +1933,16 @@ class TestEdgeCases:
 class TestComplexEMAMask:
     """Tests for ComplexEMA mask handling."""
 
-    def test_mask_prevents_state_contamination(self, random_seed):
+    def test_mask_prevents_state_contamination(self, random_seed: int) -> None:
         """Test that masked positions don't contaminate EMA hidden state.
 
         When masked positions have large values, masking them out should prevent
         those values from affecting the final hidden state. Without masking, the
         large values would propagate through the EMA and cause a very different
         final state.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
         """
         from megalodon_jax.layers import ComplexEMA
 
@@ -1628,11 +1984,14 @@ class TestComplexEMAMask:
             np.array(h_masked_contaminated), np.array(h_unmasked_contaminated)
         ), "Without mask, contamination should cause different hidden state"
 
-    def test_mask_zeros_contribution_from_masked_positions(self, random_seed):
+    def test_mask_zeros_contribution_from_masked_positions(self, random_seed: int) -> None:
         """Test that masked positions contribute zero to EMA state.
 
         The EMA output at masked positions is NOT zero (due to causal convolution),
         but the CONTRIBUTION from masked positions to the state should be zero.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
         """
         from megalodon_jax.layers import ComplexEMA
 
@@ -1675,12 +2034,14 @@ class TestComplexEMAMask:
 class TestAttentionMasking:
     """Tests for attention masking edge cases."""
 
-    def test_fully_masked_query_outputs_zeros(self):
+    def test_fully_masked_query_outputs_zeros(self) -> None:
         """Fully masked queries (all keys invalid) should output zeros, not value averages.
 
         Regression test for bug where using finfo.min instead of -inf caused
         softmax to produce uniform distribution instead of NaN, so fully masked
         queries returned an average of values rather than zeros.
+
+        :return None: None.
         """
         from megalodon_jax.layers.attention import attention_single_chunk
 
@@ -1713,8 +2074,11 @@ class TestAttentionMasking:
         # Batch 1 should be non-zero (has valid keys)
         assert jnp.any(out[1] != 0), "Partially masked batch should have non-zero output"
 
-    def test_first_position_causal_mask_outputs_valid(self):
-        """First position in causal attention should attend to itself only."""
+    def test_first_position_causal_mask_outputs_valid(self) -> None:
+        """First position in causal attention should attend to itself only.
+
+        :return None: None.
+        """
         from megalodon_jax.layers.attention import attention_single_chunk
 
         B, L, H, Dh, Dv = 1, 4, 1, 8, 8

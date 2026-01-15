@@ -1,6 +1,7 @@
 """Pytest configuration and fixtures for megalodon-jax tests."""
 
 import os
+from collections.abc import Iterator
 
 # Configure JAX memory BEFORE importing JAX
 # Disable preallocation to avoid conflicts with PyTorch GPU memory
@@ -19,8 +20,12 @@ _JAX_GPU_AVAILABLE = jax.default_backend() == "gpu"
 _TORCH_CUDA_AVAILABLE = torch.cuda.is_available()
 
 
-def pytest_sessionstart(session):
-    """Print device info at test session start."""
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Print device info at test session start.
+
+    :param pytest.Session session: Pytest session object.
+    :return None: None.
+    """
     jax_device = jax.devices()[0]
     jax_backend = jax.default_backend()
     torch_device = "cuda" if _TORCH_CUDA_AVAILABLE else "cpu"
@@ -44,38 +49,58 @@ requires_gpu = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="session")
-def has_gpu():
-    """Session-scoped fixture indicating GPU availability."""
+def has_gpu() -> bool:
+    """Report GPU availability for the session.
+
+    :return bool: True if a JAX GPU backend is available.
+    """
     return _JAX_GPU_AVAILABLE
 
 
 @pytest.fixture(scope="session")
-def jax_device():
-    """Session-scoped fixture returning the primary JAX device."""
+def jax_device() -> jax.Device:
+    """Provide the primary JAX device.
+
+    :return jax.Device: Primary JAX device for the session.
+    """
     return jax.devices()[0]
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert PyTorch tensor to JAX array."""
+    """Convert a PyTorch tensor to a JAX array.
+
+    :param torch.Tensor t: Input PyTorch tensor.
+    :return jnp.ndarray: JAX array on the default device.
+    """
     return jnp.array(t.detach().cpu().numpy())
 
 
 def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert JAX array to PyTorch tensor."""
+    """Convert a JAX array to a PyTorch tensor.
+
+    :param jnp.ndarray a: Input JAX array.
+    :return torch.Tensor: Torch tensor on CPU.
+    """
     return torch.from_numpy(np.array(a))
 
 
 @pytest.fixture
-def random_seed():
-    """Set random seeds for reproducibility."""
+def random_seed() -> int:
+    """Seed numpy and torch RNGs for reproducibility.
+
+    :return int: Seed value used for the session.
+    """
     torch.manual_seed(42)
     np.random.seed(42)
     return 42
 
 
 @pytest.fixture(autouse=True)
-def clear_gpu_caches():
-    """Clear GPU caches before and after each test to prevent OOM."""
+def clear_gpu_caches() -> Iterator[None]:
+    """Clear GPU caches before and after each test to prevent OOM.
+
+    :return Iterator[None]: Context that clears GPU caches around each test.
+    """
     import gc
 
     # Clear before test
@@ -94,12 +119,14 @@ def clear_gpu_caches():
 
 
 @pytest.fixture
-def force_fp32_matmul():
+def force_fp32_matmul() -> Iterator[None]:
     """Force float32 matmuls for precision-sensitive parity tests.
 
     GPU matmuls use TensorFloat-32 by default on Ampere+ GPUs, which truncates
     mantissa from 23 to 10 bits. This causes ~1e-3 differences vs fp32.
     Use this fixture when exact parity with PyTorch CPU is required.
+
+    :return Iterator[None]: Context that forces float32 matmul precision.
     """
     import jax
 
@@ -110,10 +137,12 @@ def force_fp32_matmul():
 
 
 @pytest.fixture
-def torch_device():
+def torch_device() -> torch.device:
     """Get the appropriate torch device and ensure TF32 settings match JAX.
 
     Both PyTorch and JAX should use the same precision mode (TF32 on GPU).
+
+    :return torch.device: Selected torch device for the session.
     """
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -125,8 +154,11 @@ def torch_device():
     return device
 
 
-def sync_and_clear_torch():
-    """Synchronize and clear PyTorch GPU memory before switching to JAX."""
+def sync_and_clear_torch() -> None:
+    """Synchronize and clear PyTorch GPU memory before switching to JAX.
+
+    :return None: None.
+    """
     import gc
 
     gc.collect()
@@ -135,8 +167,11 @@ def sync_and_clear_torch():
         torch.cuda.empty_cache()
 
 
-def sync_and_clear_jax():
-    """Synchronize and clear JAX GPU memory before switching to PyTorch."""
+def sync_and_clear_jax() -> None:
+    """Synchronize and clear JAX GPU memory before switching to PyTorch.
+
+    :return None: None.
+    """
     import gc
 
     import jax

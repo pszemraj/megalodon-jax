@@ -1,40 +1,55 @@
 """Phase 2 Core Layers tests - TimestepNorm, ComplexEMA parity."""
 
+from typing import Any
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert PyTorch tensor to JAX array."""
+    """Convert a PyTorch tensor to a JAX array.
+
+    :param torch.Tensor t: Input PyTorch tensor.
+    :return jnp.ndarray: JAX array on the default device.
+    """
     if t.is_complex():
         return jnp.array(t.detach().cpu().numpy())
     return jnp.array(t.detach().cpu().numpy())
 
 
 def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert JAX array to PyTorch tensor."""
+    """Convert a JAX array to a PyTorch tensor.
+
+    :param jnp.ndarray a: Input JAX array.
+    :return torch.Tensor: Torch tensor on CPU.
+    """
     return torch.from_numpy(np.array(a))
 
 
 class TestTimestepNormParity:
     """Parity tests for TimestepNorm against PyTorch reference."""
 
-    def test_forward_parity(self, random_seed):
-        """Test TimestepNorm forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import TimestepNorm as TorchTimestepNorm
+    def test_forward_parity(self, random_seed: int) -> None:
+        """Test TimestepNorm forward pass matches PyTorch.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_norm_cls = torch_modeling.TimestepNorm
 
         dim = 64
         num_groups = 8
         eps = 1e-5
 
         # Create both modules
-        torch_norm = TorchTimestepNorm(dim, num_groups, eps=eps)
+        torch_norm = torch_norm_cls(dim, num_groups, eps=eps)
         jax_norm = TimestepNorm(dim, num_groups, eps=eps)
 
         # Copy weights from PyTorch to JAX
@@ -61,8 +76,12 @@ class TestTimestepNormParity:
             atol=1e-5,
         )
 
-    def test_streaming_state_continuity(self, random_seed):
-        """Test that processing in chunks matches full sequence."""
+    def test_streaming_state_continuity(self, random_seed: int) -> None:
+        """Test that processing in chunks matches full sequence.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
 
@@ -89,14 +108,20 @@ class TestTimestepNormParity:
             err_msg="Chunked processing should match full sequence",
         )
 
-    def test_weight_initialization(self):
-        """Test that weight and bias are initialized to zeros."""
+    def test_weight_initialization(self) -> None:
+        """Test that weight and bias are initialized to zeros.
+
+        :return None: None.
+        """
         norm = TimestepNorm(64, 8)
         np.testing.assert_array_equal(np.array(norm.weight), np.zeros(64))
         np.testing.assert_array_equal(np.array(norm.bias), np.zeros(64))
 
-    def test_effective_scale_is_one(self):
-        """Test that effective scale is 1.0 with zero weight."""
+    def test_effective_scale_is_one(self) -> None:
+        """Test that effective scale is 1.0 with zero weight.
+
+        :return None: None.
+        """
         norm = TimestepNorm(64, 8)
         # Effective scale = weight + 1.0 = 1.0
         x = jnp.ones((2, 16, 64))
@@ -104,8 +129,12 @@ class TestTimestepNormParity:
         # Output should be normalized (mean~0, var~1 per group, then scaled by 1.0)
         assert y.shape == x.shape
 
-    def test_mask_handling(self, random_seed):
-        """Test that padding mask correctly excludes positions from statistics."""
+    def test_mask_handling(self, random_seed: int) -> None:
+        """Test that padding mask correctly excludes positions from statistics.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
 
@@ -129,13 +158,19 @@ class TestTimestepNormParity:
         # Count should be 8 for all batch elements
         np.testing.assert_array_equal(np.array(state_masked.count), np.array([8, 8]))
 
-    def test_divisibility_validation(self):
-        """Test that num_features must be divisible by num_groups."""
+    def test_divisibility_validation(self) -> None:
+        """Test that num_features must be divisible by num_groups.
+
+        :return None: None.
+        """
         with pytest.raises(ValueError, match="divisible by"):
             TimestepNorm(63, 8)
 
-    def test_different_shapes(self):
-        """Test TimestepNorm works with various input shapes."""
+    def test_different_shapes(self) -> None:
+        """Test TimestepNorm works with various input shapes.
+
+        :return None: None.
+        """
         norm = TimestepNorm(128, 16)
         for shape in [(1, 10, 128), (4, 32, 128), (2, 1, 128)]:
             x = jnp.ones(shape)
@@ -146,14 +181,18 @@ class TestTimestepNormParity:
 class TestComplexEMAParity:
     """Parity tests for ComplexEMA against PyTorch reference."""
 
-    def test_coefficients_parity(self, random_seed):
-        """Test that coefficient computation matches PyTorch."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+    def test_coefficients_parity(self, random_seed: int) -> None:
+        """Test that coefficient computation matches PyTorch.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -176,14 +215,18 @@ class TestComplexEMAParity:
             np.array(gamma_jax), gamma_torch.detach().numpy(), rtol=1e-5, atol=1e-6
         )
 
-    def test_fft_forward_parity(self, random_seed):
-        """Test FFT path forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+    def test_fft_forward_parity(self, random_seed: int) -> None:
+        """Test FFT path forward pass matches PyTorch.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -207,14 +250,18 @@ class TestComplexEMAParity:
         # Compare outputs
         np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
-    def test_sequential_forward_parity(self, random_seed):
-        """Test sequential path forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+    def test_sequential_forward_parity(self, random_seed: int) -> None:
+        """Test sequential path forward pass matches PyTorch.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -241,8 +288,12 @@ class TestComplexEMAParity:
         # Compare final state
         np.testing.assert_allclose(np.array(h_jax), h_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
-    def test_fft_vs_sequential_equivalence(self, random_seed):
-        """Test that FFT and sequential paths produce equivalent outputs."""
+    def test_fft_vs_sequential_equivalence(self, random_seed: int) -> None:
+        """Test that FFT and sequential paths produce equivalent outputs.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         ndim = 16
 
@@ -270,8 +321,12 @@ class TestComplexEMAParity:
             err_msg="FFT and sequential paths should produce equivalent outputs",
         )
 
-    def test_state_continuity(self, random_seed):
-        """Test that chunked processing with state matches full sequence."""
+    def test_state_continuity(self, random_seed: int) -> None:
+        """Test that chunked processing with state matches full sequence.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         ndim = 16
 
@@ -301,8 +356,12 @@ class TestComplexEMAParity:
             err_msg="Chunked processing should match full sequence",
         )
 
-    def test_q_magnitude_bounded(self, random_seed):
-        """Test that |q| < 1 by construction (ensures decaying impulse response)."""
+    def test_q_magnitude_bounded(self, random_seed: int) -> None:
+        """Test that |q| < 1 by construction (ensures decaying impulse response).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         ndim = 16
 
@@ -315,8 +374,12 @@ class TestComplexEMAParity:
         # All magnitudes should be strictly less than 1
         assert jnp.all(q_magnitude < 1.0), "q magnitude must be < 1 for stability"
 
-    def test_jit_compilation(self, random_seed):
-        """Test that ComplexEMA works with JIT compilation."""
+    def test_jit_compilation(self, random_seed: int) -> None:
+        """Test that ComplexEMA works with JIT compilation.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         ndim = 16
 
@@ -327,7 +390,13 @@ class TestComplexEMAParity:
 
         # JIT the forward pass
         @eqx.filter_jit
-        def forward(ema, x):
+        def forward(ema: ComplexEMA, x: jnp.ndarray) -> tuple[jnp.ndarray, Any]:
+            """Run a JIT-compiled ComplexEMA forward pass.
+
+            :param ComplexEMA ema: EMA module under test.
+            :param jnp.ndarray x: Input sequence tensor.
+            :return tuple[jnp.ndarray, Any]: Output and optional state.
+            """
             return ema(x, return_state=False)
 
         x = jax.random.normal(k2, (2, dim, 32))
@@ -343,8 +412,12 @@ class TestComplexEMAParity:
 class TestPrecisionPolicy:
     """Tests for bf16/fp16 precision handling."""
 
-    def test_timestep_norm_bf16_input(self, random_seed):
-        """Test TimestepNorm works correctly with bf16 inputs."""
+    def test_timestep_norm_bf16_input(self, random_seed: int) -> None:
+        """Test TimestepNorm works correctly with bf16 inputs.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
 
@@ -373,8 +446,11 @@ class TestPrecisionPolicy:
             err_msg="bf16 output should be close to fp32 output",
         )
 
-    def test_timestep_norm_fp16_rejected(self):
-        """Test TimestepNorm rejects fp16 inputs for stability."""
+    def test_timestep_norm_fp16_rejected(self) -> None:
+        """Test TimestepNorm rejects fp16 inputs for stability.
+
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
 
@@ -384,8 +460,12 @@ class TestPrecisionPolicy:
         with pytest.raises(TypeError, match="float16"):
             jax_norm(x_fp16)
 
-    def test_complex_ema_bf16_params(self, random_seed):
-        """Test ComplexEMA computes coefficients in fp32 even with bf16 params."""
+    def test_complex_ema_bf16_params(self, random_seed: int) -> None:
+        """Test ComplexEMA computes coefficients in fp32 even with bf16 params.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         ndim = 16
 
@@ -393,7 +473,12 @@ class TestPrecisionPolicy:
         ema_f32 = ComplexEMA(dim, ndim, key=key)
 
         # Cast parameters to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if eqx.is_array(x) and x.dtype == jnp.float32:
                 return x.astype(jnp.bfloat16)
             return x
@@ -422,14 +507,18 @@ class TestPrecisionPolicy:
             err_msg="bf16 params should produce fp32 coefficients close to fp32 params",
         )
 
-    def test_complex_ema_bf16_forward(self, random_seed):
-        """Test ComplexEMA forward pass with bf16 inputs."""
-        from megalodon.modeling_megalodon import ComplexEMA as TorchComplexEMA
+    def test_complex_ema_bf16_forward(self, random_seed: int) -> None:
+        """Test ComplexEMA forward pass with bf16 inputs.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_ema_cls = torch_modeling.ComplexEMA
 
         dim = 64
         ndim = 16
 
-        torch_ema = TorchComplexEMA(dim, ndim)
+        torch_ema = torch_ema_cls(dim, ndim)
         key = jax.random.PRNGKey(random_seed)
         jax_ema = ComplexEMA(dim, ndim, key=key)
 
@@ -442,7 +531,12 @@ class TestPrecisionPolicy:
         jax_ema = eqx.tree_at(lambda m: m.omega, jax_ema, to_jax(torch_ema.omega))
 
         # Cast JAX model to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if eqx.is_array(x) and x.dtype == jnp.float32:
                 return x.astype(jnp.bfloat16)
             return x
@@ -473,8 +567,12 @@ class TestPrecisionPolicy:
             err_msg="bf16 forward should be close to PyTorch fp32 reference",
         )
 
-    def test_complex_ema_fft_vs_sequential_bf16(self, random_seed):
-        """Test FFT and sequential paths produce equivalent results in bf16."""
+    def test_complex_ema_fft_vs_sequential_bf16(self, random_seed: int) -> None:
+        """Test FFT and sequential paths produce equivalent results in bf16.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         ndim = 16
 
@@ -484,7 +582,12 @@ class TestPrecisionPolicy:
         jax_ema = ComplexEMA(dim, ndim, key=k1)
 
         # Cast to bf16
-        def to_bf16(x):
+        def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16 for precision tests.
+
+            :param Any x: Input value to cast if it is a floating array.
+            :return Any: Casted value or original input.
+            """
             if eqx.is_array(x) and x.dtype == jnp.float32:
                 return x.astype(jnp.bfloat16)
             return x
@@ -518,8 +621,12 @@ class TestPrecisionPolicy:
 class TestIntegration:
     """Integration tests for Phase 2 layers."""
 
-    def test_timestep_norm_to_complex_ema_flow(self, random_seed):
-        """Test data flow from TimestepNorm to ComplexEMA."""
+    def test_timestep_norm_to_complex_ema_flow(self, random_seed: int) -> None:
+        """Test data flow from TimestepNorm to ComplexEMA.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
         ndim = 16
@@ -545,8 +652,12 @@ class TestIntegration:
         assert y_ema.shape == (2, dim, 32)
         assert ema_state.shape == (2, dim, ndim)
 
-    def test_gradient_flow(self, random_seed):
-        """Test that gradients flow through both layers."""
+    def test_gradient_flow(self, random_seed: int) -> None:
+        """Test that gradients flow through both layers.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
         ndim = 16
@@ -557,7 +668,13 @@ class TestIntegration:
         norm = TimestepNorm(dim, num_groups)
         ema = ComplexEMA(dim, ndim, key=k1)
 
-        def loss_fn(models, x):
+        def loss_fn(models: tuple[TimestepNorm, ComplexEMA], x: jnp.ndarray) -> jnp.ndarray:
+            """Compute a simple squared loss for gradient checks.
+
+            :param tuple[TimestepNorm, ComplexEMA] models: Norm and EMA modules.
+            :param jnp.ndarray x: Input activations.
+            :return jnp.ndarray: Scalar loss value.
+            """
             norm, ema = models
             x_normed, _ = norm(x)
             x_ema = jnp.transpose(x_normed, (0, 2, 1))
@@ -581,8 +698,12 @@ class TestIntegration:
         assert not jnp.any(jnp.isnan(ema_grads.gamma_real))
         assert not jnp.any(jnp.isnan(ema_grads.gamma_imag))
 
-    def test_jit_no_recompilation(self, random_seed):
-        """Test that JIT doesn't recompile on different inputs."""
+    def test_jit_no_recompilation(self, random_seed: int) -> None:
+        """Test that JIT doesn't recompile on different inputs.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
         dim = 64
         num_groups = 8
         ndim = 16
@@ -594,7 +715,18 @@ class TestIntegration:
         ema = ComplexEMA(dim, ndim, key=k1)
 
         @eqx.filter_jit
-        def forward(norm, ema, x):
+        def forward(
+            norm: TimestepNorm,
+            ema: ComplexEMA,
+            x: jnp.ndarray,
+        ) -> jnp.ndarray:
+            """Run a JIT-compiled norm + EMA forward pass.
+
+            :param TimestepNorm norm: TimestepNorm module under test.
+            :param ComplexEMA ema: ComplexEMA module under test.
+            :param jnp.ndarray x: Input activations.
+            :return jnp.ndarray: EMA output activations.
+            """
             x_normed, _ = norm(x)
             x_ema = jnp.transpose(x_normed, (0, 2, 1))
             y, _ = ema(x_ema)

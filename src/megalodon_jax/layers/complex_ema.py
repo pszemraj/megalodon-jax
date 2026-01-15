@@ -56,10 +56,10 @@ class ComplexEMA(eqx.Module):
     def __init__(self, embed_dim: int, ndim: int, *, key: PRNGKeyArray):
         """Initialize ComplexEMA with learnable parameters.
 
-        Args:
-            embed_dim: Hidden dimension D of the input tensor.
-            ndim: Number of EMA orders tracked per hidden unit.
-            key: PRNG key for random initialization.
+        :param int embed_dim: Hidden dimension of the input tensor.
+        :param int ndim: Number of EMA orders per hidden unit.
+        :param PRNGKeyArray key: PRNG key for initialization.
+        :return None: None.
         """
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -100,11 +100,7 @@ class ComplexEMA(eqx.Module):
         regardless of the parameter dtype. This matches the PyTorch reference
         behavior and prevents precision loss when the model is cast to bf16.
 
-        Returns:
-            Tuple of (p, q, gamma) where:
-            - p: Real input coefficient (D, N), dtype float32
-            - q: Complex recurrence coefficient with |q| < 1 (D, N), dtype complex64
-            - gamma: Complex output projection (D, N), dtype complex64
+        :return tuple[Float[Array, "dim ndim"], Complex[Array, "dim ndim"], Complex[Array, "dim ndim"]]: Tuple of (p, q, gamma) with float32/complex64 dtypes.
         """
         N = self.ndim
 
@@ -142,6 +138,10 @@ class ComplexEMA(eqx.Module):
         """Compute real part of complex product efficiently.
 
         Re(a * b) = a.real * b.real - a.imag * b.imag
+
+        :param Complex[Array, "..."] a: Complex tensor input.
+        :param Complex[Array, "..."] b: Complex tensor input.
+        :return Float[Array, "..."]: Real part of the product.
         """
         return a.real * b.real - a.imag * b.imag
 
@@ -150,11 +150,8 @@ class ComplexEMA(eqx.Module):
 
         Uses O(L log L) FFT convolution when no streaming state is needed.
 
-        Args:
-            x: Input tensor of shape (batch, dim, seq).
-
-        Returns:
-            Output tensor of shape (batch, dim, seq).
+        :param Float[Array, "batch dim seq"] x: Input tensor.
+        :return Float[Array, "batch dim seq"]: Output tensor.
         """
         B, D, L = x.shape
 
@@ -178,12 +175,9 @@ class ComplexEMA(eqx.Module):
             Computes q^j for j in [start, end) where q = magnitude * exp(i*phi).
             Uses magnitude/phase representation for numerical stability.
 
-            Args:
-                start: Starting position index (inclusive).
-                end: Ending position index (exclusive).
-
-            Returns:
-                Complex kernel slice of shape (dim, end-start).
+            :param int start: Starting position index (inclusive).
+            :param int end: Ending position index (exclusive).
+            :return Complex[Array, "dim chunk"]: Complex kernel slice.
             """
             j = jnp.arange(start, end, dtype=jnp.float32)  # (chunk,)
             # q^j = radius^j * exp(i * phi * j)
@@ -230,13 +224,9 @@ class ComplexEMA(eqx.Module):
         Computes the EMA recurrence h[t] = q * h[t-1] + p * x[t] using
         jax.lax.scan for efficiency.
 
-        Args:
-            x: Input tensor of shape (batch, dim, seq).
-            h_init: Optional initial complex state of shape (batch, dim, ndim).
-
-        Returns:
-            Tuple of (output, final_state) where output has shape (batch, dim, seq)
-            and final_state has shape (batch, dim, ndim).
+        :param Float[Array, "batch dim seq"] x: Input tensor.
+        :param Complex[Array, "batch dim ndim"] | None h_init: Initial EMA state.
+        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output tensor and final EMA state.
         """
         B, D, L = x.shape
         N = self.ndim
@@ -255,7 +245,12 @@ class ComplexEMA(eqx.Module):
         def step(
             h: Complex[Array, "batch dim ndim"], x_t: Float[Array, "batch dim"]
         ) -> tuple[Complex[Array, "batch dim ndim"], Float[Array, "batch dim"]]:
-            """Single EMA step."""
+            """Single EMA step.
+
+            :param Complex[Array, "batch dim ndim"] h: Previous EMA state.
+            :param Float[Array, "batch dim"] x_t: Input for the timestep.
+            :return tuple[Complex[Array, "batch dim ndim"], Float[Array, "batch dim"]]: Updated state and output.
+            """
             x_t_c = x_t[:, :, None].astype(jnp.complex64)  # (B, D, 1)
             h_new = q_b * h + p_b * x_t_c  # (B, D, N)
             y_t = self._real_of_product(h_new, gamma_b).sum(axis=-1)  # (B, D)
@@ -281,18 +276,11 @@ class ComplexEMA(eqx.Module):
         Automatically selects FFT path (faster) when no state is needed,
         or sequential path when streaming.
 
-        Args:
-            x: Input tensor of shape (batch, dim, seq).
-            h_init: Optional initial EMA state for streaming inference.
-            return_state: Whether to return the final complex state.
-            mask: Optional boolean mask of shape (batch, seq) where True marks
-                valid tokens. Masked positions (False) have their input zeroed
-                to prevent new information from entering the hidden state.
-                Output at masked positions will reflect decayed prior state.
-
-        Returns:
-            Tuple of (output, state) where state is None unless return_state=True
-            or h_init was provided.
+        :param Float[Array, "batch dim seq"] x: Input tensor.
+        :param Complex[Array, "batch dim ndim"] | None h_init: Initial EMA state.
+        :param bool return_state: Whether to return the final complex state.
+        :param Bool[Array, "batch seq"] | None mask: Optional validity mask.
+        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]: Output and optional final state.
         """
         # Store input dtype for output cast
         input_dtype = x.dtype
@@ -300,7 +288,7 @@ class ComplexEMA(eqx.Module):
         # Zero masked positions to prevent new information from padding entering state.
         # Note: Masked positions still produce output based on decayed prior state
         # (h[t] = q*h[t-1] when x[t]=0), but no new information is added.
-        # Divergence: PyTorch reference does not apply this mask in CEMA.
+        # Matches PyTorch reference: zero masked positions to avoid padding contamination.
         if mask is not None:
             # mask: (batch, seq) -> (batch, 1, seq) for broadcasting with x: (batch, dim, seq)
             # Use dtype-matched zero to preserve bf16

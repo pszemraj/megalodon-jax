@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
@@ -13,20 +14,31 @@ from megalodon_jax.types import AttentionCache, LayerCache, NormState
 
 
 def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert PyTorch tensor to JAX array."""
+    """Convert a PyTorch tensor to a JAX array.
+
+    :param torch.Tensor t: Input PyTorch tensor.
+    :return jnp.ndarray: JAX array on the default device.
+    """
     return jnp.array(t.detach().cpu().numpy())
 
 
 def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert JAX array to PyTorch tensor."""
+    """Convert a JAX array to a PyTorch tensor.
+
+    :param jnp.ndarray a: Input JAX array.
+    :return torch.Tensor: Torch tensor on CPU.
+    """
     return torch.from_numpy(np.array(a))
 
 
 class TestMegalodonConfig:
     """Tests for MegalodonConfig dataclass."""
 
-    def test_default_values(self):
-        """Test default configuration values."""
+    def test_default_values(self) -> None:
+        """Test default configuration values.
+
+        :return None: None.
+        """
         cfg = MegalodonConfig()
         assert cfg.vocab_size == 32_000
         assert cfg.model_dim == 1024
@@ -38,18 +50,27 @@ class TestMegalodonConfig:
         assert cfg.cema_ndim == 16
         assert cfg.chunk_size == 2048
 
-    def test_head_dim_property(self):
-        """Test head_dim computed property."""
+    def test_head_dim_property(self) -> None:
+        """Test head_dim computed property.
+
+        :return None: None.
+        """
         cfg = MegalodonConfig()
         assert cfg.head_dim == 256  # z_dim / num_heads
 
-    def test_value_head_dim_property(self):
-        """Test value_head_dim computed property."""
+    def test_value_head_dim_property(self) -> None:
+        """Test value_head_dim computed property.
+
+        :return None: None.
+        """
         cfg = MegalodonConfig()
         assert cfg.value_head_dim == 2048  # value_dim / num_heads
 
-    def test_7b_preset(self):
-        """Test 7B configuration preset."""
+    def test_7b_preset(self) -> None:
+        """Test 7B configuration preset.
+
+        :return None: None.
+        """
         cfg = MegalodonConfig.from_7b()
         assert cfg.model_dim == 4096
         assert cfg.num_layers == 32
@@ -62,29 +83,56 @@ class TestMegalodonConfig:
         assert cfg.rope_base == 100_000.0
         assert cfg.swiglu is True
 
-    def test_z_dim_divisibility_validation(self):
-        """Test z_dim must be divisible by num_heads."""
+    def test_z_dim_divisibility_validation(self) -> None:
+        """Test z_dim must be divisible by num_heads.
+
+        :return None: None.
+        """
         with pytest.raises(ValueError, match="z_dim.*divisible by num_heads"):
             MegalodonConfig(z_dim=255, num_heads=2)
 
-    def test_value_dim_divisibility_validation(self):
-        """Test value_dim must be divisible by num_heads."""
+    def test_value_dim_divisibility_validation(self) -> None:
+        """Test value_dim must be divisible by num_heads.
+
+        :return None: None.
+        """
         with pytest.raises(ValueError, match="value_dim.*divisible by num_heads"):
             MegalodonConfig(value_dim=2047, num_heads=2)
 
-    def test_model_dim_divisibility_validation(self):
-        """Test model_dim must be divisible by norm_num_groups."""
+    def test_model_dim_divisibility_validation(self) -> None:
+        """Test model_dim must be divisible by norm_num_groups.
+
+        :return None: None.
+        """
         with pytest.raises(ValueError, match="model_dim.*divisible by.*norm_num_groups"):
             MegalodonConfig(model_dim=1000, norm_num_groups=32)
 
-    def test_config_is_frozen(self):
-        """Test that config is immutable."""
+    def test_max_cache_len_validation(self) -> None:
+        """Test max_cache_len must be positive and >= chunk_size when provided.
+
+        :return None: None.
+        """
+        with pytest.raises(ValueError, match="max_cache_len.*positive"):
+            MegalodonConfig(chunk_size=8, max_cache_len=0)
+        with pytest.raises(ValueError, match="max_cache_len.*positive"):
+            MegalodonConfig(chunk_size=8, max_cache_len=-1)
+        with pytest.raises(ValueError, match="max_cache_len.*chunk_size"):
+            MegalodonConfig(chunk_size=8, max_cache_len=4)
+
+    def test_config_is_frozen(self) -> None:
+        """Test that config is immutable.
+
+        :return None: None.
+        """
         cfg = MegalodonConfig()
         with pytest.raises(Exception):  # FrozenInstanceError
             cfg.model_dim = 2048
 
-    def test_config_is_hashable(self):
-        """Test that config can be used as dict key."""
+    def test_config_is_hashable(self) -> None:
+        """Test that config can be used as dict key.
+
+        :return None: None.
+        """
         cfg = MegalodonConfig()
         d = {cfg: "test"}
         assert d[cfg] == "test"
@@ -93,15 +141,19 @@ class TestMegalodonConfig:
 class TestRMSNormParity:
     """Parity tests for RMSNorm against PyTorch reference."""
 
-    def test_forward_parity(self, random_seed):
-        """Test RMSNorm forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import RMSNorm as TorchRMSNorm
+    def test_forward_parity(self, random_seed: int) -> None:
+        """Test RMSNorm forward pass matches PyTorch.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_norm_cls = torch_modeling.RMSNorm
 
         dim = 64
         eps = 1e-6
 
         # Create both modules
-        torch_norm = TorchRMSNorm(dim, eps=eps)
+        torch_norm = torch_norm_cls(dim, eps=eps)
         jax_norm = RMSNorm(dim, eps=eps)
 
         # Copy weights from PyTorch to JAX
@@ -118,13 +170,19 @@ class TestRMSNormParity:
         # Compare
         np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-5, atol=1e-5)
 
-    def test_gamma_initialization(self):
-        """Test that gamma is initialized to zeros."""
+    def test_gamma_initialization(self) -> None:
+        """Test that gamma is initialized to zeros.
+
+        :return None: None.
+        """
         norm = RMSNorm(64)
         np.testing.assert_array_equal(np.array(norm.gamma), np.zeros(64))
 
-    def test_effective_scale_is_one(self):
-        """Test that effective scale is 1.0 with zero gamma."""
+    def test_effective_scale_is_one(self) -> None:
+        """Test that effective scale is 1.0 with zero gamma.
+
+        :return None: None.
+        """
         norm = RMSNorm(64)
         x = jnp.ones((2, 16, 64))
         y = norm(x)
@@ -132,8 +190,11 @@ class TestRMSNormParity:
         # RMS of ones is 1.0, so output should be 1.0 * 1.0 = 1.0
         np.testing.assert_allclose(np.array(y), 1.0, rtol=1e-5)
 
-    def test_different_shapes(self):
-        """Test RMSNorm works with various input shapes."""
+    def test_different_shapes(self) -> None:
+        """Test RMSNorm works with various input shapes.
+
+        :return None: None.
+        """
         norm = RMSNorm(128)
         for shape in [(1, 10, 128), (4, 32, 128), (2, 1, 128)]:
             x = jnp.ones(shape)
@@ -144,15 +205,19 @@ class TestRMSNormParity:
 class TestRotaryEmbeddingParity:
     """Parity tests for RotaryEmbedding against PyTorch reference."""
 
-    def test_forward_parity(self, random_seed):
-        """Test RotaryEmbedding forward pass matches PyTorch."""
-        from megalodon.modeling_megalodon import RotaryEmbedding as TorchRoPE
+    def test_forward_parity(self, random_seed: int) -> None:
+        """Test RotaryEmbedding forward pass matches PyTorch.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_rope_cls = torch_modeling.RotaryEmbedding
 
         dim = 64
         base = 10000.0
 
         # Create both modules
-        torch_rope = TorchRoPE(dim, base=base)
+        torch_rope = torch_rope_cls(dim, base=base)
         jax_rope = RotaryEmbedding(dim, base=base)
 
         # Verify inv_freq matches
@@ -183,12 +248,16 @@ class TestRotaryEmbeddingParity:
             np.array(k_rot_jax), k_rot_torch.detach().numpy(), rtol=1e-5, atol=1e-5
         )
 
-    def test_different_start_positions(self, random_seed):
-        """Test RotaryEmbedding at various start positions."""
-        from megalodon.modeling_megalodon import RotaryEmbedding as TorchRoPE
+    def test_different_start_positions(self, random_seed: int) -> None:
+        """Test RotaryEmbedding at various start positions.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_rope_cls = torch_modeling.RotaryEmbedding
 
         dim = 64
-        torch_rope = TorchRoPE(dim)
+        torch_rope = torch_rope_cls(dim)
         jax_rope = RotaryEmbedding(dim)
 
         batch, seq, heads = 2, 8, 4
@@ -226,14 +295,21 @@ class TestRotaryEmbeddingParity:
                 err_msg=f"K mismatch at start_index={start_index}",
             )
 
-    def test_even_dim_required(self):
-        """Test that odd dimension raises ValueError."""
+    def test_even_dim_required(self) -> None:
+        """Test that odd dimension raises ValueError.
+
+        :return None: None.
+        """
         with pytest.raises(ValueError, match="even head dimension"):
             RotaryEmbedding(63)
 
-    def test_different_base_values(self, random_seed):
-        """Test RotaryEmbedding with different base values."""
-        from megalodon.modeling_megalodon import RotaryEmbedding as TorchRoPE
+    def test_different_base_values(self, random_seed: int) -> None:
+        """Test RotaryEmbedding with different base values.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        torch_rope_cls = torch_modeling.RotaryEmbedding
 
         dim = 64
         batch, seq, heads = 2, 8, 4
@@ -243,7 +319,7 @@ class TestRotaryEmbeddingParity:
         k_jax = to_jax(k_torch)
 
         for base in [10000.0, 100000.0]:
-            torch_rope = TorchRoPE(dim, base=base)
+            torch_rope = torch_rope_cls(dim, base=base)
             jax_rope = RotaryEmbedding(dim, base=base)
 
             q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=0)
@@ -261,8 +337,11 @@ class TestRotaryEmbeddingParity:
 class TestCacheTypes:
     """Tests for cache/state type definitions."""
 
-    def test_attention_cache_structure(self):
-        """Test AttentionCache fields and structure."""
+    def test_attention_cache_structure(self) -> None:
+        """Test AttentionCache fields and structure.
+
+        :return None: None.
+        """
         k = jnp.zeros((2, 16, 4, 64))
         v = jnp.zeros((2, 16, 4, 128))
         count = jnp.array(16, dtype=jnp.int32)
@@ -275,18 +354,29 @@ class TestCacheTypes:
         # Buffer capacity available via shape (not properties - see types.py docstring)
         assert cache.k.shape[1] == 16
 
-    def test_layer_cache_default_position(self):
-        """Test LayerCache has JAX scalar position by default."""
+    def test_layer_cache_default_position(self) -> None:
+        """Test LayerCache has JAX scalar position by default.
+
+        :return None: None.
+        """
         cache = LayerCache()
         assert cache.position.dtype == jnp.int32
         assert cache.position.shape == ()
         assert cache.position == 0
 
-    def test_jax_scalar_counters_jit_compatible(self):
-        """Test that JAX scalar counters work in JIT without recompilation."""
+    def test_jax_scalar_counters_jit_compatible(self) -> None:
+        """Test that JAX scalar counters work in JIT without recompilation.
+
+        :return None: None.
+        """
 
         @jax.jit
         def increment_position(cache: LayerCache) -> LayerCache:
+            """Increment the layer cache position counter.
+
+            :param LayerCache cache: Cache with position counter to advance.
+            :return LayerCache: Updated cache with incremented position.
+            """
             return LayerCache(
                 attn=cache.attn,
                 norm=cache.norm,
@@ -299,8 +389,11 @@ class TestCacheTypes:
             cache = increment_position(cache)
             assert cache.position == i + 1
 
-    def test_norm_state_shapes(self):
-        """Test NormState shape handling."""
+    def test_norm_state_shapes(self) -> None:
+        """Test NormState shape handling.
+
+        :return None: None.
+        """
         count = jnp.zeros((4,), dtype=jnp.int32)
         mean = jnp.zeros((4, 32))
         var = jnp.ones((4, 32))

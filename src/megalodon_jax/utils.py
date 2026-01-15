@@ -19,11 +19,8 @@ def _is_linear(x: Any) -> bool:
     Used as a leaf predicate for JAX tree traversal to identify
     layers that should have their weights reinitialized.
 
-    Args:
-        x: Any pytree node to check.
-
-    Returns:
-        True if x is an eqx.nn.Linear instance, False otherwise.
+    :param Any x: Pytree node to check.
+    :return bool: True if x is an eqx.nn.Linear instance.
     """
     return isinstance(x, eqx.nn.Linear)
 
@@ -33,18 +30,12 @@ def get_initializer(
 ) -> Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]:
     """Get a JAX-compatible weight initializer.
 
-    Args:
-        mode: Initialization mode. One of:
-            - "none": Zero initialization
-            - "he": He normal (variance scaling for ReLU)
-            - "xavier": Xavier uniform (Glorot)
-            - "bert": Normal with stddev=0.02
-            - "gaussian": Truncated normal with stddev=1/sqrt(dim) when dim is set,
-              or stddev=1.0 when dim is None (PyTorch parity).
-        dim: Dimension for computing stddev in "gaussian" mode; if None uses stddev=1.0.
+    :param InitMode mode: Initialization mode.
+    :param int | None dim: Dimension for gaussian stddev; None uses stddev=1.0.
+    :return Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]: Initializer.
 
-    Returns:
-        Callable that takes (key, shape, dtype) and returns an array.
+    Modes: none (zeros), he (He normal), xavier (Glorot uniform), bert (std=0.02),
+    gaussian (truncated normal with std=1/sqrt(dim) or 1.0 when dim is None).
     """
     if mode == "none":
         return lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype)
@@ -82,19 +73,11 @@ def reinit_linear_weights(
     This function traverses the Equinox module tree and replaces all Linear layer
     weights with freshly initialized values. Biases are reset to zeros.
 
-    Args:
-        model: Equinox module to reinitialize.
-        mode: Initialization mode for weights.
-        key: PRNG key for random initialization.
-        dim: Dimension for "gaussian" mode (optional; None uses stddev=1.0).
-
-    Returns:
-        New model with reinitialized Linear weights.
-
-    Example:
-        >>> key = jax.random.PRNGKey(42)
-        >>> model = MegalodonAttention(...)
-        >>> model = reinit_linear_weights(model, "he", key)
+    :param T model: Equinox module to reinitialize.
+    :param InitMode mode: Initialization mode for weights.
+    :param PRNGKeyArray key: PRNG key for random initialization.
+    :param int | None dim: Dimension for gaussian stddev; None uses stddev=1.0.
+    :return T: Model with reinitialized Linear weights.
     """
     if mode == "none":
         return model  # Skip reinitialization

@@ -69,6 +69,9 @@ Training uses FFT automatically (`return_state=False`). Sequential path is only 
 - **Scan-loop token fallback:** The streaming token fallback could be rewritten as a `lax.scan` with strict masking. This is optional and should be validated with streaming/parity tests because it can introduce small numerical drift.
 - **Fused SDPA path (dropout=0):** JAX `dot_product_attention` can use the cuDNN backend for faster chunk attention when masks are simple. This matches the PyTorch SDPA fast path (scale=1.0) but needs careful gating for cache/prefix masks and for any dropout use; keep the manual path as a fallback and validate parity on streaming/batch tests.
 - **Mixed-precision attention accumulation:** Replace explicit fp32 casts in attention matmuls with `precision` + `preferred_element_type` to keep bf16 inputs while accumulating in fp32. This is closer to SDPA behavior on accelerators and may improve throughput, but it can shift numerics slightly; validate against PyTorch parity tests.
+- **Vectorized prefill with cache:** Add a fast prefill path for `return_cache=True` when `L <= chunk_size` to avoid token-by-token cache construction; keep the current path as fallback and validate boundary parity.
+- **Layer stack scan:** Consider a `lax.scan` over layers to reduce HLO size and compile time for deep models; requires careful static/dynamic argument handling in Equinox.
+- **Export metadata sidecar:** Save config + git SHA + dtype policy alongside weights to prevent accidental mismatched loads.
 
 ## Numerical Stability
 
@@ -111,6 +114,9 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 
 - Exports all weights including `lm_head.weight` for tied models (PyTorch strict loading compatibility)
 - Uses `.clone()` on tied weights to avoid SafeTensors shared memory errors
+- Skips `inner.rope.inv_freq` by default because it is non-persistent in PyTorch; opt in with `include_rope_inv_freq=True`
+- Supports `dtype=` for exported tensors; floats are normalized to fp32 before optional casting
+- CEMA `gamma_{real,imag}` is exported in fp32 for stability
 - Compatible with `safetensors.torch.save_file`
 
 **PyTorch → JAX** (`load_weights_from_torch`):
@@ -126,13 +132,17 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Testing
 
-190+ tests covering:
+200+ tests covering:
 
 - Parity with the reference implementation (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
 - JIT stability: no retracing on repeated calls with same shapes
 - GPU/CPU coverage via pytest fixtures
+- PyTorch parity tests import `megalodon` from the external `megalodon-hf` package (dev dependency), not any in-repo Torch code.
+- PyTorch parity dependency is pinned to commit [`f85a4784`](https://github.com/pszemraj/megalodon-hf/commit/f85a47849d07d52982a2e6e4cf0297c2621e9916) to avoid drift.
+- Non-deterministic runs require a PRNG key when any dropout is enabled (enforced in `MegalodonForCausalLM.__call__` and `compute_loss`).
 
 ## Profiling
 
-See `docs/profiling.md` for detailed timing analysis.
+This repo no longer ships profiling scripts. For the PyTorch reference timing helpers,
+use [megalodon-hf/scripts](https://github.com/pszemraj/megalodon-hf/tree/f85a47849d07d52982a2e6e4cf0297c2621e9916/scripts).

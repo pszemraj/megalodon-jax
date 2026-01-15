@@ -27,13 +27,11 @@ class RotaryEmbedding(eqx.Module):
     def __init__(self, dim: int, base: float = 10000.0, *, key: PRNGKeyArray | None = None):
         """Initialize RotaryEmbedding.
 
-        Args:
-            dim: Per-head dimensionality (must be even).
-            base: Exponential base for frequency computation.
-            key: PRNG key (unused, for API consistency).
-
-        Raises:
-            ValueError: If dim is not even.
+        :param int dim: Per-head dimensionality (must be even).
+        :param float base: Exponential base for frequency computation.
+        :param PRNGKeyArray | None key: PRNG key (unused).
+        :raises ValueError: If dim is not even.
+        :return None: None.
         """
         del key  # unused
         if dim % 2 != 0:
@@ -55,13 +53,10 @@ class RotaryEmbedding(eqx.Module):
     ) -> tuple[Float[Array, "batch seq heads dim"], Float[Array, "batch seq heads dim"]]:
         """Apply rotary embedding to query and key tensors.
 
-        Args:
-            q: Query tensor of shape (batch, seq, heads, dim).
-            k: Key tensor of shape (batch, seq, heads, dim).
-            start_index: Absolute position offset (must be JAX array scalar).
-
-        Returns:
-            Tuple of rotated (q, k) tensors with same shapes.
+        :param Float[Array, "batch seq heads dim"] q: Query tensor.
+        :param Float[Array, "batch seq heads dim"] k: Key tensor.
+        :param Int[Array, ""] start_index: Absolute position offset (JAX scalar).
+        :return tuple[Float[Array, "batch seq heads dim"], Float[Array, "batch seq heads dim"]]: Rotated query and key tensors.
         """
         seq_len = q.shape[1]
 

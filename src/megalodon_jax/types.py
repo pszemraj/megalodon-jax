@@ -22,22 +22,15 @@ def _register_pytree(cls: type[T]) -> type[T]:
     This decorator enables JAX transformations (jit, vmap, scan) to work with
     the decorated dataclass by defining how to flatten and unflatten it.
 
-    Args:
-        cls: A dataclass type to register.
-
-    Returns:
-        The same class, now registered as a pytree node.
+    :param type[T] cls: Dataclass type to register.
+    :return type[T]: The class registered as a pytree node.
     """
 
     def flatten(obj: T) -> tuple[tuple[Any, ...], None]:
         """Flatten dataclass to (children, aux_data).
 
-        Args:
-            obj: Dataclass instance to flatten.
-
-        Returns:
-            Tuple of (field_values, None). aux_data is None since all
-            reconstruction info is in the class type itself.
+        :param T obj: Dataclass instance to flatten.
+        :return tuple[tuple[Any, ...], None]: Field values and empty aux data.
         """
         children = tuple(getattr(obj, f.name) for f in fields(obj))
         return children, None
@@ -45,12 +38,9 @@ def _register_pytree(cls: type[T]) -> type[T]:
     def unflatten(aux_data: None, children: tuple[Any, ...]) -> T:
         """Reconstruct dataclass from children.
 
-        Args:
-            aux_data: Unused auxiliary data (always None).
-            children: Tuple of field values in declaration order.
-
-        Returns:
-            Reconstructed dataclass instance.
+        :param None aux_data: Unused auxiliary data (always None).
+        :param tuple[Any, ...] children: Field values in declaration order.
+        :return T: Reconstructed dataclass instance.
         """
         return cls(*children)
 
@@ -106,7 +96,10 @@ class EMAState:
 
 
 def _default_position() -> Int[Array, ""]:
-    """Create default position counter as JAX scalar."""
+    """Create default position counter as JAX scalar.
+
+    :return Int[Array, ""]: JAX scalar position counter initialized to zero.
+    """
     return jnp.array(0, dtype=jnp.int32)
 
 
