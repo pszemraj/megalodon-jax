@@ -1171,14 +1171,8 @@ class TestMegalodonAttentionParity:
         """
         from tests.conftest import sync_and_clear_torch
 
-        pytest = __import__("pytest")
-
-        # Check if PyTorch reference is available
-        try:
-            TorchMegalodonAttention = torch_modeling.MegalodonAttention
-            TorchConfig = torch_modeling.MegalodonConfig
-        except ImportError:
-            pytest.skip("PyTorch reference not available")
+        TorchMegalodonAttention = torch_modeling.MegalodonAttention
+        TorchConfig = torch_modeling.MegalodonConfig
 
         # Config matching both implementations
         batch, seq_len = 1, 8
