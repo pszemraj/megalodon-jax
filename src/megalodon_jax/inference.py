@@ -147,14 +147,14 @@ def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
     return ModelCache(layer_caches=trimmed_layers, final_norm=cache.final_norm)
 
 
-def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache:
+def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCache:
     """Select batch elements from a ModelCache.
 
     Note: cache position/count fields are shared scalars; this is only valid
     when all batch elements share the same history length.
 
     :param ModelCache cache: Cache to slice.
-    :param Int[Array, new_batch] indices: Batch indices to select.
+    :param Int[Array, "new_batch"] indices: Batch indices to select.
     :return ModelCache: Sliced cache.
     """
 
@@ -221,11 +221,11 @@ def index_cache(cache: ModelCache, indices: Int[Array, new_batch]) -> ModelCache
 # ---------------------------------------------------------------------------
 
 
-def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, batch]:
+def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, "batch"]:
     """Deterministic argmax sampling.
 
     :param Float[Array, "batch vocab"] logits: Logits for sampling.
-    :return Int[Array, batch]: Selected token IDs.
+    :return Int[Array, "batch"]: Selected token IDs.
     """
 
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
@@ -298,7 +298,7 @@ def sample_token(
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
-) -> Int[Array, batch]:
+) -> Int[Array, "batch"]:
     """Sample next token with temperature, top-k, and top-p.
 
     :param Float[Array, "batch vocab"] logits: Logits for sampling.
@@ -307,7 +307,7 @@ def sample_token(
     :param int | None top_k: Top-k filter.
     :param float | None top_p: Top-p filter.
     :raises ValueError: If temperature/top-k/top-p inputs are invalid.
-    :return Int[Array, batch]: Sampled token IDs.
+    :return Int[Array, "batch"]: Sampled token IDs.
     """
 
     if temperature < 0.0:
@@ -342,13 +342,13 @@ def _sample_fn(
     temperature: float,
     top_k: int | None,
     top_p: float | None,
-) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, batch]]:
+) -> Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, "batch"]]:
     """Build a sampler callable configured with temperature/top-k/top-p.
 
     :param float temperature: Sampling temperature.
     :param int | None top_k: Top-k filter.
     :param float | None top_p: Top-p filter.
-    :return Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, batch]]: Sampler.
+    :return Callable[[Float[Array, "batch vocab"], PRNGKeyArray | None], Int[Array, "batch"]]: Sampler.
     """
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
@@ -458,17 +458,17 @@ def _generate_core(
     if needs_rng:
 
         def scan_step(
-            carry: tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
+            carry: tuple[ModelCache, Int[Array, "batch"], PRNGKeyArray, Bool[Array, "batch"]],
             _: None,
         ) -> tuple[
-            tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]],
-            Int[Array, batch],
+            tuple[ModelCache, Int[Array, "batch"], PRNGKeyArray, Bool[Array, "batch"]],
+            Int[Array, "batch"],
         ]:
             """Scan step for autoregressive decoding with RNG.
 
-            :param tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]] carry: Scan carry.
+            :param tuple[ModelCache, Int[Array, "batch"], PRNGKeyArray, Bool[Array, "batch"]] carry: Scan carry.
             :param None _: Unused scan input.
-            :return tuple[tuple[ModelCache, Int[Array, batch], PRNGKeyArray, Bool[Array, batch]], Int[Array, batch]]: Carry and token.
+            :return tuple[tuple[ModelCache, Int[Array, "batch"], PRNGKeyArray, Bool[Array, "batch"]], Int[Array, "batch"]]: Carry and token.
             """
             cached, last_token, rng, done = carry
 
@@ -492,17 +492,17 @@ def _generate_core(
     else:
 
         def scan_step(
-            carry: tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
+            carry: tuple[ModelCache, Int[Array, "batch"], Bool[Array, "batch"]],
             _: None,
         ) -> tuple[
-            tuple[ModelCache, Int[Array, batch], Bool[Array, batch]],
-            Int[Array, batch],
+            tuple[ModelCache, Int[Array, "batch"], Bool[Array, "batch"]],
+            Int[Array, "batch"],
         ]:
             """Scan step for autoregressive decoding without RNG.
 
-            :param tuple[ModelCache, Int[Array, batch], Bool[Array, batch]] carry: Scan carry.
+            :param tuple[ModelCache, Int[Array, "batch"], Bool[Array, "batch"]] carry: Scan carry.
             :param None _: Unused scan input.
-            :return tuple[tuple[ModelCache, Int[Array, batch], Bool[Array, batch]], Int[Array, batch]]: Carry and token.
+            :return tuple[tuple[ModelCache, Int[Array, "batch"], Bool[Array, "batch"]], Int[Array, "batch"]]: Carry and token.
             """
             cached, last_token, done = carry
 

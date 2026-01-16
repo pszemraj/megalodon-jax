@@ -512,8 +512,6 @@ class MegalodonForCausalLM(eqx.Module):
         else:
             # Separate LM head
             logits = jnp.matmul(hidden, self.lm_head.weight.T)
-            if self.lm_head.bias is not None:
-                logits = logits + self.lm_head.bias
 
         return logits, cache
 

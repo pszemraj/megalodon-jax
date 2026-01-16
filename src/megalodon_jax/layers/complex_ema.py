@@ -22,9 +22,6 @@ from jaxtyping import Array, Bool, Complex, Float, PRNGKeyArray
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
 
-# Warn if sequence length exceeds this threshold
-FFT_LENGTH_WARN_THRESHOLD = 16_384
-
 
 class ComplexEMA(eqx.Module):
     """Complex exponential moving average with FFT/sequential dispatch.

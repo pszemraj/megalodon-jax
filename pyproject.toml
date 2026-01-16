@@ -73,13 +73,14 @@ markers = [
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
 # F722: jaxtyping uses string annotations that ruff doesn't understand
 # F821: jaxtyping dimension names in strings
-ignore = ["E501", "F722", "F821"]
+# UP037: quoted jaxtyping dimension names must remain strings
+ignore = ["E501", "F722", "F821", "UP037"]
 
 [tool.ruff.lint.per-file-ignores]
 # Ignore unused imports in __init__.py files
