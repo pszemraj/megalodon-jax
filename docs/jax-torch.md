@@ -64,6 +64,11 @@ model = load_from_pretrained(
 Make sure the JAX config matches the PyTorch config (dims, layer count, swiglu,
 norm_affine, output_size, etc).
 
+Notes:
+
+- `.safetensors` loads without torch (via `safetensors.numpy`).
+- `.pt`/`.bin` checkpoints require torch for `torch.load`.
+
 ## Functional differences (current)
 
 - **Cache + padding**: JAX does not support streaming cache with padded inputs.

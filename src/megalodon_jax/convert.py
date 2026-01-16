@@ -470,6 +470,9 @@ def load_from_pretrained(
 ) -> MegalodonForCausalLM:
     """Load a MegalodonForCausalLM from a PyTorch checkpoint.
 
+    `.safetensors` files load without torch (via `safetensors.numpy`);
+    other formats require torch for `torch.load`.
+
     :param str | Path path: Path to checkpoint file.
     :param MegalodonConfig | None config: Model configuration.
     :param jnp.dtype dtype: Target dtype for parameters.
@@ -478,18 +481,18 @@ def load_from_pretrained(
     :raises ValueError: If config is None and cannot be inferred.
     :return MegalodonForCausalLM: Model with loaded weights.
     """
-    import torch
-
     path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
     # Load state dict
     if path.suffix == ".safetensors":
-        from safetensors.torch import load_file
+        from safetensors.numpy import load_file
 
         state_dict = load_file(path)
     else:
+        import torch
+
         state_dict = torch.load(path, map_location="cpu", weights_only=True)
 
     # Handle nested state dict (e.g., from checkpoint with optimizer state)
