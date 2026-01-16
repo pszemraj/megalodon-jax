@@ -3,6 +3,7 @@
 This module provides functions to load PyTorch Megalodon weights into JAX models.
 """
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -21,6 +22,28 @@ StateDict = dict[str, Any]
 
 if TYPE_CHECKING:
     import torch
+else:
+    try:
+        import torch  # type: ignore[assignment]
+    except ModuleNotFoundError:  # pragma: no cover - optional dependency
+        torch = None  # type: ignore[assignment]
+
+
+def _require_torch() -> "torch":
+    """Return the torch module or raise a helpful error if unavailable."""
+    if torch is None:
+        raise ModuleNotFoundError(
+            "torch is required for PyTorch interop. "
+            "Install megalodon-jax with the dev extra or add torch manually."
+        )
+    return torch
+
+
+def _is_torch_tensor(tensor: Any) -> bool:
+    """Check whether a value is a torch.Tensor without hard requiring torch."""
+    if torch is None:
+        return False
+    return isinstance(tensor, torch.Tensor)
 
 
 def _to_jax(tensor: Any) -> Array:
@@ -29,9 +52,7 @@ def _to_jax(tensor: Any) -> Array:
     :param Any tensor: Torch tensor or array-like input.
     :return Array: JAX array on the default device.
     """
-    import torch
-
-    if isinstance(tensor, torch.Tensor):
+    if _is_torch_tensor(tensor):
         return jnp.array(tensor.detach().cpu().numpy())
     return jnp.array(tensor)
 
@@ -76,17 +97,126 @@ def _to_torch_tensor(x: Any, *, dtype: "torch.dtype | None" = None) -> "torch.Te
     :param torch.dtype | None dtype: Optional target dtype for the tensor.
     :return torch.Tensor: Torch tensor on CPU.
     """
-    import torch
+    torch_mod = _require_torch()
 
     arr = _jax_to_numpy(x)
     if np.issubdtype(arr.dtype, np.floating):
         arr = arr.astype(np.float32, copy=False)
     if not arr.flags.writeable:
         arr = arr.copy()
-    tensor = torch.from_numpy(arr)
+    tensor = torch_mod.from_numpy(arr)
     if dtype is not None:
         tensor = tensor.to(dtype)
     return tensor
+
+
+def _to_numpy_array(x: Any, *, dtype: np.dtype | None = None) -> np.ndarray:
+    """Convert an array-like object into a numpy array with safe dtype handling."""
+    arr = _jax_to_numpy(x)
+    if np.issubdtype(arr.dtype, np.floating):
+        arr = arr.astype(np.float32, copy=False)
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    if not arr.flags.writeable:
+        arr = arr.copy()
+    return arr
+
+
+def _export_state_dict(
+    model: MegalodonForCausalLM,
+    *,
+    to_array: Callable[[Any, Any | None], Any],
+    dtype: Any | None,
+    include_rope_inv_freq: bool,
+    gamma_dtype: Any,
+    clone_array: Callable[[Any], Any],
+) -> StateDict:
+    """Build a PyTorch-style state dict using a configurable array converter."""
+
+    def convert(arr: Any, *, dtype_override: Any | None = None) -> Any:
+        """Convert a leaf array with optional dtype override."""
+        use_dtype = dtype_override if dtype_override is not None else dtype
+        return to_array(arr, use_dtype)
+
+    state_dict: StateDict = {}
+
+    state_dict["model.embed.weight"] = convert(model.model.embed.weight)
+
+    for i, layer in enumerate(model.model.layers):
+        attn_prefix = f"model.layers.{i}.attn"
+        ffn_prefix = f"model.layers.{i}.ffn"
+
+        # TimestepNorm
+        if layer.attn.timenorm.weight is not None:
+            state_dict[f"{attn_prefix}.timenorm.weight"] = convert(layer.attn.timenorm.weight)
+        if layer.attn.timenorm.bias is not None:
+            state_dict[f"{attn_prefix}.timenorm.bias"] = convert(layer.attn.timenorm.bias)
+
+        # CEMA
+        state_dict[f"{attn_prefix}.cema.alpha"] = convert(layer.attn.cema.alpha)
+        state_dict[f"{attn_prefix}.cema.delta"] = convert(layer.attn.cema.delta)
+        state_dict[f"{attn_prefix}.cema.theta"] = convert(layer.attn.cema.theta)
+        state_dict[f"{attn_prefix}.cema.gamma_real"] = convert(
+            layer.attn.cema.gamma_real,
+            dtype_override=gamma_dtype,
+        )
+        state_dict[f"{attn_prefix}.cema.gamma_imag"] = convert(
+            layer.attn.cema.gamma_imag,
+            dtype_override=gamma_dtype,
+        )
+        state_dict[f"{attn_prefix}.cema.omega"] = convert(layer.attn.cema.omega)
+
+        # RMSNorm
+        if layer.attn.rmsnorm.gamma is not None:
+            state_dict[f"{attn_prefix}.rmsnorm.gamma"] = convert(layer.attn.rmsnorm.gamma)
+
+        # Linear projections
+        for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
+            proj = getattr(layer.attn, proj_name)
+            state_dict[f"{attn_prefix}.{proj_name}.weight"] = convert(proj.weight)
+            if proj.bias is not None:
+                state_dict[f"{attn_prefix}.{proj_name}.bias"] = convert(proj.bias)
+
+        state_dict[f"{attn_prefix}.gamma"] = convert(layer.attn.gamma)
+        state_dict[f"{attn_prefix}.beta"] = convert(layer.attn.beta)
+
+        # Rotary embedding (inv_freq is not a persistent buffer in PyTorch)
+        if include_rope_inv_freq:
+            state_dict[f"{attn_prefix}.inner.rope.inv_freq"] = convert(
+                layer.attn.inner.rotary.inv_freq
+            )
+
+        # FFN norms
+        if layer.ffn.norm.weight is not None:
+            state_dict[f"{ffn_prefix}.norm.weight"] = convert(layer.ffn.norm.weight)
+        if layer.ffn.norm.bias is not None:
+            state_dict[f"{ffn_prefix}.norm.bias"] = convert(layer.ffn.norm.bias)
+
+        # FFN linear layers
+        for fc_name in ["fc1", "fc2", "fc3"]:
+            fc = getattr(layer.ffn, fc_name, None)
+            if fc is None:
+                continue
+            state_dict[f"{ffn_prefix}.{fc_name}.weight"] = convert(fc.weight)
+            if fc.bias is not None:
+                state_dict[f"{ffn_prefix}.{fc_name}.bias"] = convert(fc.bias)
+
+    # Final norm
+    if model.model.norm.weight is not None:
+        state_dict["model.norm.weight"] = convert(model.model.norm.weight)
+    if model.model.norm.bias is not None:
+        state_dict["model.norm.bias"] = convert(model.model.norm.bias)
+
+    # LM head - always emit for PyTorch strict loading compatibility
+    if not model.tied and model.lm_head is not None:
+        # Untied: use separate lm_head weights
+        state_dict["lm_head.weight"] = convert(model.lm_head.weight)
+    elif model.tied:
+        # Tied: emit embed weight as lm_head.weight for PyTorch compatibility
+        # Use clone to avoid SafeTensors shared memory error when saving
+        state_dict["lm_head.weight"] = clone_array(convert(model.model.embed.weight))
+
+    return state_dict
 
 
 def convert_jax_to_torch(
@@ -97,99 +227,27 @@ def convert_jax_to_torch(
 ) -> StateDict:
     """Convert a JAX Megalodon model to a PyTorch-style state dict.
 
+    Requires torch to be installed.
+
     :param MegalodonForCausalLM model: JAX MegalodonForCausalLM to export.
     :param torch.dtype | None dtype: Optional dtype for floating tensors.
     :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
     :return StateDict: PyTorch-style state dict for export.
     """
-    import torch
+    torch_mod = _require_torch()
 
-    state_dict: StateDict = {}
+    def to_torch(arr: Any, dtype_override: Any | None) -> Any:
+        """Convert a JAX/NumPy array to a torch tensor with the export dtype."""
+        return _to_torch_tensor(arr, dtype=dtype_override)
 
-    def to_torch(arr: Any) -> Any:
-        """Convert a JAX/NumPy array to a torch tensor with the export dtype.
-
-        :param Any arr: Array-like input.
-        :return Any: Torch tensor with optional dtype cast.
-        """
-        return _to_torch_tensor(arr, dtype=dtype)
-
-    state_dict["model.embed.weight"] = to_torch(model.model.embed.weight)
-
-    for i, layer in enumerate(model.model.layers):
-        attn_prefix = f"model.layers.{i}.attn"
-        ffn_prefix = f"model.layers.{i}.ffn"
-
-        # TimestepNorm
-        if layer.attn.timenorm.weight is not None:
-            state_dict[f"{attn_prefix}.timenorm.weight"] = to_torch(layer.attn.timenorm.weight)
-        if layer.attn.timenorm.bias is not None:
-            state_dict[f"{attn_prefix}.timenorm.bias"] = to_torch(layer.attn.timenorm.bias)
-
-        # CEMA
-        state_dict[f"{attn_prefix}.cema.alpha"] = to_torch(layer.attn.cema.alpha)
-        state_dict[f"{attn_prefix}.cema.delta"] = to_torch(layer.attn.cema.delta)
-        state_dict[f"{attn_prefix}.cema.theta"] = to_torch(layer.attn.cema.theta)
-        state_dict[f"{attn_prefix}.cema.gamma_real"] = _to_torch_tensor(
-            layer.attn.cema.gamma_real, dtype=torch.float32
-        )
-        state_dict[f"{attn_prefix}.cema.gamma_imag"] = _to_torch_tensor(
-            layer.attn.cema.gamma_imag, dtype=torch.float32
-        )
-        state_dict[f"{attn_prefix}.cema.omega"] = to_torch(layer.attn.cema.omega)
-
-        # RMSNorm
-        if layer.attn.rmsnorm.gamma is not None:
-            state_dict[f"{attn_prefix}.rmsnorm.gamma"] = to_torch(layer.attn.rmsnorm.gamma)
-
-        # Linear projections
-        for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
-            proj = getattr(layer.attn, proj_name)
-            state_dict[f"{attn_prefix}.{proj_name}.weight"] = to_torch(proj.weight)
-            if proj.bias is not None:
-                state_dict[f"{attn_prefix}.{proj_name}.bias"] = to_torch(proj.bias)
-
-        state_dict[f"{attn_prefix}.gamma"] = to_torch(layer.attn.gamma)
-        state_dict[f"{attn_prefix}.beta"] = to_torch(layer.attn.beta)
-
-        # Rotary embedding (inv_freq is not a persistent buffer in PyTorch)
-        if include_rope_inv_freq:
-            state_dict[f"{attn_prefix}.inner.rope.inv_freq"] = to_torch(
-                layer.attn.inner.rotary.inv_freq
-            )
-
-        # FFN norms
-        if layer.ffn.norm.weight is not None:
-            state_dict[f"{ffn_prefix}.norm.weight"] = to_torch(layer.ffn.norm.weight)
-        if layer.ffn.norm.bias is not None:
-            state_dict[f"{ffn_prefix}.norm.bias"] = to_torch(layer.ffn.norm.bias)
-
-        # FFN linear layers
-        for fc_name in ["fc1", "fc2", "fc3"]:
-            fc = getattr(layer.ffn, fc_name, None)
-            if fc is None:
-                continue
-            state_dict[f"{ffn_prefix}.{fc_name}.weight"] = to_torch(fc.weight)
-            if fc.bias is not None:
-                state_dict[f"{ffn_prefix}.{fc_name}.bias"] = to_torch(fc.bias)
-
-    # Final norm
-    if model.model.norm.weight is not None:
-        state_dict["model.norm.weight"] = to_torch(model.model.norm.weight)
-    if model.model.norm.bias is not None:
-        state_dict["model.norm.bias"] = to_torch(model.model.norm.bias)
-
-    # LM head - always emit for PyTorch strict loading compatibility
-    if not model.tied and model.lm_head is not None:
-        # Untied: use separate lm_head weights
-        state_dict["lm_head.weight"] = to_torch(model.lm_head.weight)
-    elif model.tied:
-        # Tied: emit embed weight as lm_head.weight for PyTorch compatibility
-        # PyTorch MegalodonForCausalLM always has lm_head param (aliased when tied)
-        # Use .clone() to avoid SafeTensors shared memory error when saving
-        state_dict["lm_head.weight"] = to_torch(model.model.embed.weight).clone()
-
-    return state_dict
+    return _export_state_dict(
+        model,
+        to_array=to_torch,
+        dtype=dtype,
+        include_rope_inv_freq=include_rope_inv_freq,
+        gamma_dtype=torch_mod.float32,
+        clone_array=lambda tensor: tensor.clone(),
+    )
 
 
 def load_weights_from_torch(
@@ -491,9 +549,8 @@ def load_from_pretrained(
 
         state_dict = load_file(path)
     else:
-        import torch
-
-        state_dict = torch.load(path, map_location="cpu", weights_only=True)
+        torch_mod = _require_torch()
+        state_dict = torch_mod.load(path, map_location="cpu", weights_only=True)
 
     # Handle nested state dict (e.g., from checkpoint with optimizer state)
     if "state_dict" in state_dict:
@@ -538,12 +595,33 @@ def save_safetensors(
 ) -> None:
     """Save a MegalodonForCausalLM to SafeTensors (PyTorch format).
 
+    Uses the torch backend when available. Falls back to `safetensors.numpy`
+    when torch is not installed; dtype overrides require torch.
+
     :param MegalodonForCausalLM model: JAX model to export.
     :param str | Path path: Output path for the .safetensors file.
     :param torch.dtype | None dtype: Optional dtype for exported tensors.
     :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
     :return None: None.
     """
+    if torch is None:
+        if dtype is not None:
+            raise ModuleNotFoundError(
+                "torch is required to use dtype overrides when saving safetensors."
+            )
+        from safetensors.numpy import save_file
+
+        state_dict = _export_state_dict(
+            model,
+            to_array=lambda arr, dtype_override: _to_numpy_array(arr, dtype=dtype_override),
+            dtype=None,
+            include_rope_inv_freq=include_rope_inv_freq,
+            gamma_dtype=np.float32,
+            clone_array=lambda array: np.array(array, copy=True),
+        )
+        save_file(state_dict, str(path))
+        return
+
     from safetensors.torch import save_file
 
     state_dict = convert_jax_to_torch(

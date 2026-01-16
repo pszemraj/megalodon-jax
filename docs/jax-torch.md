@@ -45,6 +45,8 @@ Notes:
   for tooling (it will be an unexpected key under strict loading).
 - Use `dtype=` to export bf16 checkpoints (fp32 is the default and recommended).
 - CEMA `gamma_{real,imag}` is exported in fp32 for stability.
+- `save_safetensors` uses `safetensors.numpy` when torch is not installed;
+  dtype overrides require torch.
 
 ### PyTorch -> JAX
 
