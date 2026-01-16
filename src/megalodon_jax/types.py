@@ -53,11 +53,11 @@ def _register_pytree(cls: type[T]) -> type[T]:
 class AttentionCache:
     """Cache for streaming attention.
 
-    Stores key/value tensors in fixed-capacity buffers with masked validity.
+    Stores key/value tensors in fixed-capacity buffers.
     Use `count` for the total tokens processed (absolute position after last token).
-    Buffer capacity is `k.shape[1]`; valid entries are masked internally.
-    The buffer is treated as a circular ring indexed by absolute position modulo
-    the cache capacity.
+    Buffer capacity is `k.shape[1]`; validity is inferred from `count` and ring
+    indexing rather than an explicit mask. The buffer is treated as a circular
+    ring indexed by absolute position modulo the cache capacity.
 
     Note: Unlike the PyTorch reference, this cache does not expose length/start_index
     properties because they would be misleading. In JAX, caches use fixed-size buffers
@@ -75,7 +75,8 @@ class NormState:
     """Running statistics for TimestepNorm (Welford's algorithm).
 
     Tracks cumulative count, mean, and variance per group for streaming
-    normalization that only uses past context.
+    normalization that only uses past context. Mean/variance are stored in
+    float32 for numerical stability, regardless of activation dtype.
     """
 
     count: Int[Array, "batch"]  # tokens seen per batch element

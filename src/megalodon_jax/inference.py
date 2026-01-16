@@ -63,8 +63,8 @@ def init_cache(
         """
         return NormState(
             count=jnp.zeros((batch_size,), dtype=jnp.int32),
-            mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=dtype),
-            var=jnp.ones((batch_size, config.norm_num_groups), dtype=dtype),
+            mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=jnp.float32),
+            var=jnp.ones((batch_size, config.norm_num_groups), dtype=jnp.float32),
         )
 
     def make_ema_state() -> EMAState:

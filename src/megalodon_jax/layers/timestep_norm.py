@@ -15,9 +15,6 @@ from megalodon_jax.types import NormState
 # Variance floor to prevent division instability in early training
 VARIANCE_FLOOR = 1e-6
 
-# Supported input dtypes (fp16 rejected for numerical stability)
-_SUPPORTED_DTYPES = (jnp.float32, jnp.bfloat16)
-
 
 class TimestepNorm(eqx.Module):
     """Streaming group-wise normalization across time with optional state.
@@ -119,8 +116,8 @@ class TimestepNorm(eqx.Module):
             prev_var = jnp.ones((B, G), dtype=jnp.float32)
         else:
             prev_count = state.count
-            prev_mean = state.mean
-            prev_var = state.var
+            prev_mean = state.mean.astype(jnp.float32)
+            prev_var = state.var.astype(jnp.float32)
 
         # Default mask: all valid
         if mask is None:
@@ -130,8 +127,8 @@ class TimestepNorm(eqx.Module):
         if L == 0:
             new_state = NormState(
                 count=prev_count,
-                mean=prev_mean.astype(x.dtype),
-                var=prev_var.astype(x.dtype),
+                mean=prev_mean,
+                var=prev_var,
             )
             return x, new_state
 
@@ -206,8 +203,8 @@ class TimestepNorm(eqx.Module):
 
         # Output state from final position
         new_count = prev_count + mask.astype(jnp.int32).sum(axis=1)
-        mean_out = mean_t[:, -1, :].astype(x.dtype)
-        var_out = var_t[:, -1, :].astype(x.dtype)
+        mean_out = mean_t[:, -1, :]
+        var_out = var_t[:, -1, :]
 
         new_state = NormState(count=new_count, mean=mean_out, var=var_out)
         return y, new_state

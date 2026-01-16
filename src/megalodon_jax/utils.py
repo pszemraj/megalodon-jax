@@ -34,11 +34,11 @@ def get_initializer(
     :param int | None dim: Dimension for gaussian stddev; None uses stddev=1.0.
     :return Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]: Initializer.
 
-    Modes: none (zeros), he (He normal), xavier (Glorot uniform), bert (std=0.02),
+    Modes: he (He normal), xavier (Glorot uniform), bert (std=0.02),
     gaussian (truncated normal with std=1/sqrt(dim) or 1.0 when dim is None).
     """
     if mode == "none":
-        return lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype)
+        raise ValueError("Init mode 'none' skips reinitialization and has no initializer.")
 
     if mode == "he":
         return jax.nn.initializers.he_normal()

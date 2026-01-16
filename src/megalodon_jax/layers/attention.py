@@ -1342,7 +1342,7 @@ class NormalizedFFN(eqx.Module):
     Supports optional residual rescaling (rescale_nffn) for training stability.
     """
 
-    norm: eqx.nn.LayerNorm
+    norm: BatchedLayerNorm
     fc1: eqx.nn.Linear
     fc2: eqx.nn.Linear
     fc3: eqx.nn.Linear | None  # Only for SwiGLU
@@ -1417,9 +1417,8 @@ class NormalizedFFN(eqx.Module):
         """
         residual = x if residual_base is None else residual_base
 
-        # Layer norm
-        # eqx.nn.LayerNorm expects per-example inputs, so vmap over batch/seq.
-        h = jax.vmap(jax.vmap(self.norm))(x)
+        # Layer norm (BatchedLayerNorm handles leading dims).
+        h = self.norm(x)
 
         # Hidden layer with activation
         if self.swiglu:

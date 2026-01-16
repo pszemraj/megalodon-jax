@@ -8,7 +8,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
 - JAX pytree caches for JIT-compatible streaming inference
 - Weight conversion utilities for PyTorch ↔ JAX interop
-- 200+ tests covering parity with the PyTorch reference
+- 150+ tests (200+ cases via parametrization) covering parity with the PyTorch reference
 
 ## Installation
 
@@ -29,6 +29,7 @@ pip install -e ".[dev]"
 ```
 
 Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+.
+PyTorch + megalodon-hf are optional; install `.[dev]` for conversion and parity tests.
 
 ## Quick Start
 
@@ -131,7 +132,7 @@ src/megalodon_jax/
 ## Precision
 
 - Float32 for numerical stability
-- BFloat16 compatible via JAX autocast
+- BFloat16 compatible via explicit bf16 parameters with fp32 accumulators where required
 - **Never use float16** (EMA/FFT overflow)
 
 ## Performance
@@ -149,13 +150,15 @@ src/megalodon_jax/
 - Pure JAX implementation (no fused CUDA kernels)
 - Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
+- Cached decoding does not support padded batches; left-padding grouping is only for `return_cache=False`
 - CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
 
 ## Testing
 
 ```bash
 pytest                          # All CPU tests
-pytest -m torch_ref             # PyTorch reference parity tests
+pytest -m "not torch_ref"       # JAX-only tests
+pytest -m torch_ref             # PyTorch reference parity tests (requires torch + megalodon-hf)
 pytest tests/test_model.py -v   # Single file
 ```
 
