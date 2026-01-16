@@ -29,7 +29,8 @@ pip install -e ".[dev]"
 ```
 
 Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+.
-PyTorch + megalodon-hf are optional; install `.[dev]` for conversion and parity tests.
+PyTorch is optional; install `.[convert]` for conversion utilities and `.[dev]` for
+conversion plus parity tests and dev tooling.
 
 ## Quick Start
 

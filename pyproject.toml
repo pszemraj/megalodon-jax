@@ -44,10 +44,13 @@ Homepage = "https://github.com/pszemraj/megalodon-jax"
 Repository = "https://github.com/pszemraj/megalodon-jax"
 
 [project.optional-dependencies]
+convert = [
+  "torch>=2.6",
+]
 dev = [
   "pytest>=7.0",
-  "torch>=2.6",
   "megalodon-hf @ git+https://github.com/pszemraj/megalodon-hf.git@f85a47849d07d52982a2e6e4cf0297c2621e9916",
+  "torch>=2.6",
   "ruff>=0.5",
 ]
 

@@ -1,49 +1,26 @@
 """Weight conversion utilities for PyTorch ↔ JAX.
 
-This module provides functions to load PyTorch Megalodon weights into JAX models.
+This module requires torch. Install with:
+    pip install megalodon-jax[convert]
+
+Usage:
+    from megalodon_jax.convert import load_from_pretrained, save_safetensors
 """
 
-from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 from jaxtyping import Array
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
 
-# Type alias for state dict
 StateDict = dict[str, Any]
-
-
-if TYPE_CHECKING:
-    import torch
-else:
-    try:
-        import torch  # type: ignore[assignment]
-    except ModuleNotFoundError:  # pragma: no cover - optional dependency
-        torch = None  # type: ignore[assignment]
-
-
-def _require_torch() -> "torch":
-    """Return the torch module or raise a helpful error if unavailable."""
-    if torch is None:
-        raise ModuleNotFoundError(
-            "torch is required for PyTorch interop. "
-            "Install megalodon-jax with the dev extra or add torch manually."
-        )
-    return torch
-
-
-def _is_torch_tensor(tensor: Any) -> bool:
-    """Check whether a value is a torch.Tensor without hard requiring torch."""
-    if torch is None:
-        return False
-    return isinstance(tensor, torch.Tensor)
 
 
 def _to_jax(tensor: Any) -> Array:
@@ -52,7 +29,7 @@ def _to_jax(tensor: Any) -> Array:
     :param Any tensor: Torch tensor or array-like input.
     :return Array: JAX array on the default device.
     """
-    if _is_torch_tensor(tensor):
+    if isinstance(tensor, torch.Tensor):
         return jnp.array(tensor.detach().cpu().numpy())
     return jnp.array(tensor)
 
@@ -75,68 +52,46 @@ def _validate_shape(
             f"Shape mismatch for '{name}':\n"
             f"  Checkpoint: {loaded.shape}\n"
             f"  Expected:   {expected}\n"
-            f"Check that config matches the checkpoint."
+            "Check that config matches the checkpoint."
         )
 
 
-def _jax_to_numpy(x: Any) -> np.ndarray:
-    """Host-copy a JAX array (or tensor-like) to numpy.
-
-    In JAX 0.8+, np.asarray() handles device transfer automatically.
-
-    :param Any x: JAX array or array-like input.
-    :return np.ndarray: Host numpy array.
-    """
-    return np.asarray(x)
-
-
-def _to_torch_tensor(x: Any, *, dtype: "torch.dtype | None" = None) -> "torch.Tensor":
-    """Convert an array-like object into a torch tensor with safe host dtype handling.
+def _to_torch_tensor(x: Any, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Convert an array-like object into a torch tensor.
 
     :param Any x: JAX/NumPy array-like input.
     :param torch.dtype | None dtype: Optional target dtype for the tensor.
     :return torch.Tensor: Torch tensor on CPU.
     """
-    torch_mod = _require_torch()
-
-    arr = _jax_to_numpy(x)
+    arr = np.asarray(x)
     if np.issubdtype(arr.dtype, np.floating):
         arr = arr.astype(np.float32, copy=False)
     if not arr.flags.writeable:
         arr = arr.copy()
-    tensor = torch_mod.from_numpy(arr)
+    tensor = torch.from_numpy(arr)
     if dtype is not None:
         tensor = tensor.to(dtype)
     return tensor
 
 
-def _to_numpy_array(x: Any, *, dtype: np.dtype | None = None) -> np.ndarray:
-    """Convert an array-like object into a numpy array with safe dtype handling."""
-    arr = _jax_to_numpy(x)
-    if np.issubdtype(arr.dtype, np.floating):
-        arr = arr.astype(np.float32, copy=False)
-    if dtype is not None:
-        arr = arr.astype(dtype, copy=False)
-    if not arr.flags.writeable:
-        arr = arr.copy()
-    return arr
-
-
-def _export_state_dict(
+def convert_jax_to_torch(
     model: MegalodonForCausalLM,
     *,
-    to_array: Callable[[Any, Any | None], Any],
-    dtype: Any | None,
-    include_rope_inv_freq: bool,
-    gamma_dtype: Any,
-    clone_array: Callable[[Any], Any],
+    dtype: torch.dtype | None = None,
+    include_rope_inv_freq: bool = False,
 ) -> StateDict:
-    """Build a PyTorch-style state dict using a configurable array converter."""
+    """Convert a JAX Megalodon model to a PyTorch-style state dict.
 
-    def convert(arr: Any, *, dtype_override: Any | None = None) -> Any:
+    :param MegalodonForCausalLM model: JAX MegalodonForCausalLM to export.
+    :param torch.dtype | None dtype: Optional dtype for floating tensors.
+    :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
+    :return StateDict: PyTorch-style state dict for export.
+    """
+
+    def convert(arr: Any, *, dtype_override: torch.dtype | None = None) -> torch.Tensor:
         """Convert a leaf array with optional dtype override."""
         use_dtype = dtype_override if dtype_override is not None else dtype
-        return to_array(arr, use_dtype)
+        return _to_torch_tensor(arr, dtype=use_dtype)
 
     state_dict: StateDict = {}
 
@@ -158,11 +113,11 @@ def _export_state_dict(
         state_dict[f"{attn_prefix}.cema.theta"] = convert(layer.attn.cema.theta)
         state_dict[f"{attn_prefix}.cema.gamma_real"] = convert(
             layer.attn.cema.gamma_real,
-            dtype_override=gamma_dtype,
+            dtype_override=torch.float32,
         )
         state_dict[f"{attn_prefix}.cema.gamma_imag"] = convert(
             layer.attn.cema.gamma_imag,
-            dtype_override=gamma_dtype,
+            dtype_override=torch.float32,
         )
         state_dict[f"{attn_prefix}.cema.omega"] = convert(layer.attn.cema.omega)
 
@@ -209,45 +164,12 @@ def _export_state_dict(
 
     # LM head - always emit for PyTorch strict loading compatibility
     if not model.tied and model.lm_head is not None:
-        # Untied: use separate lm_head weights
         state_dict["lm_head.weight"] = convert(model.lm_head.weight)
     elif model.tied:
-        # Tied: emit embed weight as lm_head.weight for PyTorch compatibility
-        # Use clone to avoid SafeTensors shared memory error when saving
-        state_dict["lm_head.weight"] = clone_array(convert(model.model.embed.weight))
+        # Clone to avoid SafeTensors shared memory error
+        state_dict["lm_head.weight"] = convert(model.model.embed.weight).clone()
 
     return state_dict
-
-
-def convert_jax_to_torch(
-    model: MegalodonForCausalLM,
-    *,
-    dtype: "torch.dtype | None" = None,
-    include_rope_inv_freq: bool = False,
-) -> StateDict:
-    """Convert a JAX Megalodon model to a PyTorch-style state dict.
-
-    Requires torch to be installed.
-
-    :param MegalodonForCausalLM model: JAX MegalodonForCausalLM to export.
-    :param torch.dtype | None dtype: Optional dtype for floating tensors.
-    :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
-    :return StateDict: PyTorch-style state dict for export.
-    """
-    torch_mod = _require_torch()
-
-    def to_torch(arr: Any, dtype_override: Any | None) -> Any:
-        """Convert a JAX/NumPy array to a torch tensor with the export dtype."""
-        return _to_torch_tensor(arr, dtype=dtype_override)
-
-    return _export_state_dict(
-        model,
-        to_array=to_torch,
-        dtype=dtype,
-        include_rope_inv_freq=include_rope_inv_freq,
-        gamma_dtype=torch_mod.float32,
-        clone_array=lambda tensor: tensor.clone(),
-    )
 
 
 def load_weights_from_torch(
@@ -521,22 +443,20 @@ def load_weights_from_torch(
 
 def load_from_pretrained(
     path: str | Path,
-    config: MegalodonConfig | None = None,
+    config: MegalodonConfig,
     dtype: jnp.dtype = jnp.float32,
     *,
     key: Array,
 ) -> MegalodonForCausalLM:
-    """Load a MegalodonForCausalLM from a PyTorch checkpoint.
+    """Load a MegalodonForCausalLM from a checkpoint file.
 
-    `.safetensors` files load without torch (via `safetensors.numpy`);
-    other formats require torch for `torch.load`.
+    Supports .safetensors, .pt, and .bin formats.
 
     :param str | Path path: Path to checkpoint file.
-    :param MegalodonConfig | None config: Model configuration.
+    :param MegalodonConfig config: Model configuration.
     :param jnp.dtype dtype: Target dtype for parameters.
     :param Array key: PRNG key for model initialization.
     :raises FileNotFoundError: If checkpoint file doesn't exist.
-    :raises ValueError: If config is None and cannot be inferred.
     :return MegalodonForCausalLM: Model with loaded weights.
     """
     path = Path(path)
@@ -545,22 +465,17 @@ def load_from_pretrained(
 
     # Load state dict
     if path.suffix == ".safetensors":
-        from safetensors.numpy import load_file
+        from safetensors.torch import load_file
 
-        state_dict = load_file(path)
+        state_dict = load_file(str(path), device="cpu")
     else:
-        torch_mod = _require_torch()
-        state_dict = torch_mod.load(path, map_location="cpu", weights_only=True)
+        state_dict = torch.load(path, map_location="cpu", weights_only=True)
 
     # Handle nested state dict (e.g., from checkpoint with optimizer state)
     if "state_dict" in state_dict:
         state_dict = state_dict["state_dict"]
     if "model" in state_dict and isinstance(state_dict["model"], dict):
         state_dict = state_dict["model"]
-
-    # Config must be provided for now
-    if config is None:
-        raise ValueError("config must be provided. Automatic config inference not yet implemented.")
 
     # Initialize JAX model
     model = MegalodonForCausalLM(config, key=key)
@@ -590,13 +505,10 @@ def save_safetensors(
     model: MegalodonForCausalLM,
     path: str | Path,
     *,
-    dtype: "torch.dtype | None" = None,
+    dtype: torch.dtype | None = None,
     include_rope_inv_freq: bool = False,
 ) -> None:
-    """Save a MegalodonForCausalLM to SafeTensors (PyTorch format).
-
-    Uses the torch backend when available. Falls back to `safetensors.numpy`
-    when torch is not installed; dtype overrides require torch.
+    """Save a MegalodonForCausalLM to SafeTensors format.
 
     :param MegalodonForCausalLM model: JAX model to export.
     :param str | Path path: Output path for the .safetensors file.
@@ -604,24 +516,6 @@ def save_safetensors(
     :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
     :return None: None.
     """
-    if torch is None:
-        if dtype is not None:
-            raise ModuleNotFoundError(
-                "torch is required to use dtype overrides when saving safetensors."
-            )
-        from safetensors.numpy import save_file
-
-        state_dict = _export_state_dict(
-            model,
-            to_array=lambda arr, dtype_override: _to_numpy_array(arr, dtype=dtype_override),
-            dtype=None,
-            include_rope_inv_freq=include_rope_inv_freq,
-            gamma_dtype=np.float32,
-            clone_array=lambda array: np.array(array, copy=True),
-        )
-        save_file(state_dict, str(path))
-        return
-
     from safetensors.torch import save_file
 
     state_dict = convert_jax_to_torch(

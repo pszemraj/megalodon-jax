@@ -10,9 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from megalodon_jax import (
-    MegalodonConfig,
-    MegalodonForCausalLM,
+from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
+from megalodon_jax.convert import (
     convert_jax_to_torch,
     load_from_pretrained,
     load_weights_from_torch,

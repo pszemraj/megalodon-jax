@@ -26,13 +26,16 @@ Use PyTorch (megalodon-hf) for:
 
 ## Conversion workflows
 
+Conversion utilities live in `megalodon_jax.convert` and require torch
+(install with `megalodon-jax[convert]`).
+
 ### JAX -> PyTorch
 
 Use `convert_jax_to_torch` to get a PyTorch-style state dict, or
 `save_safetensors` to write a `.safetensors` file.
 
 ```python
-from megalodon_jax import convert_jax_to_torch, save_safetensors
+from megalodon_jax.convert import convert_jax_to_torch, save_safetensors
 
 state_dict = convert_jax_to_torch(model)
 save_safetensors(model, "model.safetensors")
@@ -45,8 +48,6 @@ Notes:
   for tooling (it will be an unexpected key under strict loading).
 - Use `dtype=` to export bf16 checkpoints (fp32 is the default and recommended).
 - CEMA `gamma_{real,imag}` is exported in fp32 for stability.
-- `save_safetensors` uses `safetensors.numpy` when torch is not installed;
-  dtype overrides require torch.
 
 ### PyTorch -> JAX
 
@@ -54,7 +55,7 @@ Use `load_from_pretrained` for a checkpoint file, or `load_weights_from_torch`
 if you already have a state dict in memory.
 
 ```python
-from megalodon_jax import load_from_pretrained
+from megalodon_jax.convert import load_from_pretrained
 
 model = load_from_pretrained(
     "model.safetensors",
@@ -68,8 +69,7 @@ norm_affine, output_size, etc).
 
 Notes:
 
-- `.safetensors` loads without torch (via `safetensors.numpy`).
-- `.pt`/`.bin` checkpoints require torch for `torch.load`.
+- Conversion paths require torch for `safetensors.torch` and `torch.load`.
 
 ## Functional differences (current)
 

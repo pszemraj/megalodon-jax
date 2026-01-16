@@ -3,6 +3,7 @@
 ---
 
 - [Dev Notes - megalodon-jax](#dev-notes---megalodon-jax)
+  - [Release Notes](#release-notes)
   - [Architecture Overview](#architecture-overview)
     - [Key Differences from Upstream Reference](#key-differences-from-upstream-reference)
     - [Performance Characteristics](#performance-characteristics)
@@ -22,6 +23,11 @@
   - [Profiling](#profiling)
 
 ---
+
+## Release Notes
+
+- Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch;
+  install `megalodon-jax[convert]` and import explicitly.
 
 ## Architecture Overview
 
@@ -109,6 +115,8 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 ## Weight Conversion
 
 `convert.py` provides bidirectional PyTorch ↔ JAX conversion:
+it requires torch (install `megalodon-jax[convert]`) and is imported from
+`megalodon_jax.convert`.
 
 **JAX → PyTorch** (`convert_jax_to_torch`):
 
