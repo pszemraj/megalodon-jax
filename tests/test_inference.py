@@ -547,6 +547,7 @@ class TestConversion:
             atol=1e-5,
         )
 
+    @pytest.mark.torch_ref
     def test_export_loads_in_torch_strict(self, tmp_path: Path) -> None:
         """Ensure JAX export loads strictly in the PyTorch reference.
 

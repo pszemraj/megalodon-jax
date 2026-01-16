@@ -11,24 +11,7 @@ from megalodon import modeling_megalodon as torch_modeling
 from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
+from tests.utils import to_jax
 
 
 class TestMegalodonConfig:
@@ -138,6 +121,7 @@ class TestMegalodonConfig:
         assert d[cfg] == "test"
 
 
+@pytest.mark.torch_ref
 class TestRMSNormParity:
     """Parity tests for RMSNorm against PyTorch reference."""
 
@@ -202,6 +186,7 @@ class TestRMSNormParity:
             assert y.shape == shape
 
 
+@pytest.mark.torch_ref
 class TestRotaryEmbeddingParity:
     """Parity tests for RotaryEmbedding against PyTorch reference."""
 

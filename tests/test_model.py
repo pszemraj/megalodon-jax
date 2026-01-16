@@ -13,24 +13,7 @@ from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
+from tests.utils import to_jax
 
 
 def small_config() -> MegalodonConfig:
@@ -534,18 +517,6 @@ class TestGradients:
         # Compute gradients
         grads = eqx.filter_grad(loss_fn)(model)
 
-        # Check that gradients exist and are finite
-        def check_grad(x: Any) -> bool:
-            """Validate a gradient leaf for finiteness.
-
-            :param Any x: Gradient leaf to validate.
-            :return bool: True if the leaf is a finite array.
-            """
-            if eqx.is_array(x):
-                assert jnp.all(jnp.isfinite(x)), "Gradient contains NaN or Inf"
-                return True
-            return False
-
         # Apply check to all leaves
         grad_leaves = jax.tree_util.tree_leaves(
             eqx.filter(grads, eqx.is_array), is_leaf=eqx.is_array
@@ -652,6 +623,7 @@ class TestModelCache:
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.torch_ref
 class TestParity:
     """Tests comparing JAX implementation to PyTorch reference."""
 

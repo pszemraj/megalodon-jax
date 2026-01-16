@@ -11,28 +11,10 @@ import torch
 from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
+from tests.utils import to_jax
 
 
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    if t.is_complex():
-        return jnp.array(t.detach().cpu().numpy())
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
-
-
+@pytest.mark.torch_ref
 class TestTimestepNormParity:
     """Parity tests for TimestepNorm against PyTorch reference."""
 
@@ -178,6 +160,7 @@ class TestTimestepNormParity:
             assert y.shape == shape
 
 
+@pytest.mark.torch_ref
 class TestComplexEMAParity:
     """Parity tests for ComplexEMA against PyTorch reference."""
 

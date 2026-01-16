@@ -6,6 +6,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 import torch
 from megalodon import modeling_megalodon as torch_modeling
 
@@ -17,25 +18,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
-
+from tests.utils import to_jax, to_torch
 
 # -----------------------------------------------------------------------------
 # Attention Primitive Tests
@@ -449,6 +432,7 @@ class TestNormalizedFFN:
         # Two-hop should use residual_base, not x
         assert not jnp.allclose(out_normal, out_two_hop)
 
+    @pytest.mark.torch_ref
     def test_ffn_parity(self, random_seed: int) -> None:
         """Test NormalizedFFN parity with PyTorch reference.
 

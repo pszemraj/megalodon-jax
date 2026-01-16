@@ -82,9 +82,8 @@ norm_affine, output_size, etc).
 - `max_cache_len` must be `>= chunk_size` when provided (validated in config).
 - Loss masking uses `ignore_index=-100` and attention masks consistently, same
   as the PyTorch/HF convention.
-- Parity tests import the external `megalodon-hf` package (dev dependency)
-  through `tests/torch_ref.py`, which guards against accidentally using any
-  in-repo Torch stubs.
+- Parity tests that rely on the external `megalodon-hf` package are marked with
+  `@pytest.mark.torch_ref` in `tests/` for easy selection.
 
 ## Quick parity checklist
 

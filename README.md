@@ -155,7 +155,7 @@ src/megalodon_jax/
 
 ```bash
 pytest                          # All CPU tests
-pytest -m cuda                  # GPU-only tests
+pytest -m torch_ref             # PyTorch reference parity tests
 pytest tests/test_model.py -v   # Single file
 ```
 
