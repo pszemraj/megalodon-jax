@@ -1,5 +1,7 @@
 """Phase 4 Model Assembly tests - MegalodonBlock, MegalodonModel, MegalodonForCausalLM."""
 
+from __future__ import annotations
+
 from typing import Any
 
 import equinox as eqx
@@ -7,9 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from megalodon import MegalodonConfig as TorchMegalodonConfig
-from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
@@ -663,11 +662,13 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = parity_config
         batch, seq = 2, 32
 
         # Create PyTorch model
-        torch_config = TorchMegalodonConfig(
+        torch_config = megalodon.MegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -683,7 +684,7 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         # Create JAX model
         key = jax.random.PRNGKey(random_seed)
@@ -729,13 +730,15 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = parity_config
         batch = 1
         prompt_len = 16
         gen_len = 4
 
         # Create PyTorch model
-        torch_config = TorchMegalodonConfig(
+        torch_config = megalodon.MegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -751,7 +754,7 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         # Create JAX model and load weights (from CPU state_dict)
         key = jax.random.PRNGKey(random_seed)
@@ -800,6 +803,8 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = MegalodonConfig(
             vocab_size=128,
             model_dim=64,
@@ -820,7 +825,7 @@ class TestParity:
         prompt_len = config.chunk_size - 1
         gen_len = 2
 
-        torch_config = TorchMegalodonConfig(
+        torch_config = megalodon.MegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -836,7 +841,7 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         key = jax.random.PRNGKey(random_seed)
         jax_model = MegalodonForCausalLM(config, key=key)

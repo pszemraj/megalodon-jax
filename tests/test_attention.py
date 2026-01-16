@@ -1,5 +1,7 @@
 """Phase 3 Attention tests - primitives, ChunkedAttention, MegalodonAttention, NormalizedFFN."""
 
+from __future__ import annotations
+
 from typing import Any
 
 import equinox as eqx
@@ -7,8 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax.layers import (
     ChunkedAttention,
@@ -18,7 +18,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
-from tests.utils import to_jax, to_torch
+from tests.utils import require_torch_modeling, to_jax, to_torch
 
 # -----------------------------------------------------------------------------
 # Attention Primitive Tests
@@ -439,6 +439,8 @@ class TestNormalizedFFN:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        torch_modeling = require_torch_modeling()
         TorchConfig = torch_modeling.MegalodonConfig
         TorchFFN = torch_modeling.NormalizedFFN
 
@@ -1160,6 +1162,7 @@ class TestParity:
 class TestMegalodonAttentionParity:
     """Parity tests for MegalodonAttention against PyTorch reference."""
 
+    @pytest.mark.torch_ref
     def test_megalodon_attention_forward_parity(
         self, random_seed: int, torch_device: torch.device
     ) -> None:
@@ -1171,6 +1174,8 @@ class TestMegalodonAttentionParity:
         """
         from tests.conftest import sync_and_clear_torch
 
+        torch = pytest.importorskip("torch")
+        torch_modeling = require_torch_modeling()
         TorchMegalodonAttention = torch_modeling.MegalodonAttention
         TorchConfig = torch_modeling.MegalodonConfig
 

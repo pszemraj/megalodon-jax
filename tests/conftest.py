@@ -1,5 +1,7 @@
 """Pytest configuration and fixtures for megalodon-jax tests."""
 
+from __future__ import annotations
+
 import os
 from collections.abc import Iterator
 
@@ -10,14 +12,18 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
+
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    torch = None
 
 # Cache GPU availability at module load
 _JAX_GPU_AVAILABLE = jax.default_backend() == "gpu"
-_TORCH_CUDA_AVAILABLE = torch.cuda.is_available()
+_TORCH_AVAILABLE = torch is not None
+_TORCH_CUDA_AVAILABLE = bool(_TORCH_AVAILABLE and torch.cuda.is_available())
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -33,37 +39,15 @@ def pytest_sessionstart(session: pytest.Session) -> None:
     print(f"\n{'=' * 60}")
     print("megalodon-jax test session")
     print(f"  JAX backend: {jax_backend} ({jax_device})")
-    print(f"  PyTorch device: {torch_device}")
+    if _TORCH_AVAILABLE:
+        print(f"  PyTorch device: {torch_device}")
+    else:
+        print("  PyTorch device: unavailable")
     if _JAX_GPU_AVAILABLE:
         print("  GPU tests: ENABLED")
     else:
         print("  GPU tests: DISABLED (running on CPU)")
     print(f"{'=' * 60}\n")
-
-
-# Skip decorator for tests requiring GPU
-requires_gpu = pytest.mark.skipif(
-    not _JAX_GPU_AVAILABLE,
-    reason="Test requires GPU but none available",
-)
-
-
-@pytest.fixture(scope="session")
-def has_gpu() -> bool:
-    """Report GPU availability for the session.
-
-    :return bool: True if a JAX GPU backend is available.
-    """
-    return _JAX_GPU_AVAILABLE
-
-
-@pytest.fixture(scope="session")
-def jax_device() -> jax.Device:
-    """Provide the primary JAX device.
-
-    :return jax.Device: Primary JAX device for the session.
-    """
-    return jax.devices()[0]
 
 
 @pytest.fixture
@@ -72,7 +56,8 @@ def random_seed() -> int:
 
     :return int: Seed value used for the session.
     """
-    torch.manual_seed(42)
+    if _TORCH_AVAILABLE:
+        torch.manual_seed(42)
     np.random.seed(42)
     return 42
 
@@ -87,7 +72,7 @@ def clear_gpu_caches() -> Iterator[None]:
 
     # Clear before test
     gc.collect()
-    if torch.cuda.is_available():
+    if _TORCH_CUDA_AVAILABLE:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -95,7 +80,7 @@ def clear_gpu_caches() -> Iterator[None]:
 
     # Clear after test
     gc.collect()
-    if torch.cuda.is_available():
+    if _TORCH_CUDA_AVAILABLE:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -126,7 +111,9 @@ def torch_device() -> torch.device:
 
     :return torch.device: Selected torch device for the session.
     """
-    if torch.cuda.is_available():
+    if not _TORCH_AVAILABLE:
+        pytest.skip("torch is not installed")
+    if _TORCH_CUDA_AVAILABLE:
         device = torch.device("cuda")
         # Enable TF32 to match JAX's default behavior
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -144,24 +131,6 @@ def sync_and_clear_torch() -> None:
     import gc
 
     gc.collect()
-    if torch.cuda.is_available():
+    if _TORCH_CUDA_AVAILABLE:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
-
-
-def sync_and_clear_jax() -> None:
-    """Synchronize and clear JAX GPU memory before switching to PyTorch.
-
-    :return None: None.
-    """
-    import gc
-
-    import jax
-
-    # Block until all JAX computations complete
-    for device in jax.devices():
-        if device.platform == "gpu":
-            # Force sync by blocking on a trivial computation
-            jax.device_get(jnp.array(0))
-            break
-    gc.collect()

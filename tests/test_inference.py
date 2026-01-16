@@ -1,5 +1,7 @@
 """Phase 5 inference and conversion tests."""
 
+from __future__ import annotations
+
 from dataclasses import asdict
 from pathlib import Path
 
@@ -7,9 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from megalodon import MegalodonConfig as TorchMegalodonConfig
-from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
 from megalodon_jax import (
     MegalodonConfig,
@@ -500,11 +499,13 @@ class TestSamplingAndGeneration:
 class TestConversion:
     """Weight conversion + SafeTensors roundtrip."""
 
+    @pytest.mark.torch_ref
     def test_torch_roundtrip_matches_logits(self) -> None:
         """Ensure JAX export/load roundtrip preserves logits.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -554,6 +555,8 @@ class TestConversion:
         :param Path tmp_path: Temporary directory fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -563,8 +566,8 @@ class TestConversion:
         config_kwargs = asdict(config)
         config_kwargs["gradient_checkpointing"] = config.use_checkpoint
         config_kwargs.pop("use_checkpoint", None)
-        torch_config = TorchMegalodonConfig(**config_kwargs)
-        torch_model = TorchMegalodonForCausalLM(torch_config).eval()
+        torch_config = megalodon.MegalodonConfig(**config_kwargs)
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).eval()
 
         from safetensors.torch import load_file
 
@@ -580,11 +583,13 @@ class TestConversion:
             )
         assert not torch.isnan(out.logits).any()
 
+    @pytest.mark.torch_ref
     def test_load_weights_requires_lm_head_for_untied(self) -> None:
         """Require lm_head weight for untied head loading.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = MegalodonConfig(
             vocab_size=64,
             model_dim=64,
@@ -608,11 +613,13 @@ class TestConversion:
                 state_dict,
             )
 
+    @pytest.mark.torch_ref
     def test_load_weights_rejects_swiglu_mismatch(self) -> None:
         """Reject mismatched SwiGLU configs on load.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config_swiglu = MegalodonConfig(
             vocab_size=64,
             model_dim=64,
@@ -649,11 +656,13 @@ class TestConversion:
                 state_dict,
             )
 
+    @pytest.mark.torch_ref
     def test_tied_model_export_has_lm_head(self) -> None:
         """Ensure tied models export lm_head for strict loading.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()  # default is tied (output_size=-1)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -671,11 +680,13 @@ class TestConversion:
             state_dict["model.embed.weight"].numpy(),
         )
 
+    @pytest.mark.torch_ref
     def test_export_skips_rope_inv_freq_by_default(self) -> None:
         """Ensure default export omits RoPE inv_freq.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -683,11 +694,13 @@ class TestConversion:
 
         assert not any(key.endswith("inner.rope.inv_freq") for key in state_dict)
 
+    @pytest.mark.torch_ref
     def test_export_includes_rope_inv_freq_when_requested(self) -> None:
         """Ensure explicit export includes RoPE inv_freq.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -695,11 +708,13 @@ class TestConversion:
 
         assert "model.layers.0.attn.inner.rope.inv_freq" in state_dict
 
+    @pytest.mark.torch_ref
     def test_export_dtype_casting_keeps_cema_gamma_fp32(self) -> None:
         """Ensure dtype export keeps CEMA gamma in fp32.
 
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -709,11 +724,13 @@ class TestConversion:
         assert state_dict["model.layers.0.attn.cema.gamma_real"].dtype == torch.float32
         assert state_dict["model.layers.0.attn.cema.gamma_imag"].dtype == torch.float32
 
+    @pytest.mark.torch_ref
     def test_untied_model_export(self) -> None:
         """Ensure untied models export separate lm_head weights.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = MegalodonConfig(
             vocab_size=64,
             model_dim=64,
@@ -740,11 +757,13 @@ class TestConversion:
         assert state_dict["lm_head.weight"].shape[0] == 32
         assert state_dict["model.embed.weight"].shape[0] == 64
 
+    @pytest.mark.torch_ref
     def test_shape_validation_error(self) -> None:
         """Ensure shape mismatches raise a ValueError.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -767,11 +786,13 @@ class TestConversion:
         with pytest.raises(ValueError, match="Shape mismatch"):
             load_weights_from_torch(model_wrong, state_dict)
 
+    @pytest.mark.torch_ref
     def test_layer_count_mismatch_error(self) -> None:
         """Ensure layer count mismatches raise a ValueError.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
@@ -794,11 +815,13 @@ class TestConversion:
         with pytest.raises(ValueError, match="Layer count mismatch"):
             load_weights_from_torch(model_wrong, state_dict)
 
+    @pytest.mark.torch_ref
     def test_missing_key_error(self) -> None:
         """Ensure missing keys raise a KeyError.
 
         :return None: None.
         """
+        pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state_dict = convert_jax_to_torch(model)
