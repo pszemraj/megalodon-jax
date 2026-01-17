@@ -276,6 +276,16 @@ class MegalodonModel(eqx.Module):
         :raises ValueError: If cache layer count does not match the model.
         :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
+        if not deterministic and key is None:
+            if (
+                self.config.dropout > 0.0
+                or self.config.attention_dropout > 0.0
+                or self.config.hidden_dropout > 0.0
+            ):
+                raise ValueError(
+                    "PRNG key required when deterministic=False and dropout is enabled. "
+                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+                )
         B, L = input_ids.shape
 
         # Handle empty inputs gracefully (B=0 or L=0)

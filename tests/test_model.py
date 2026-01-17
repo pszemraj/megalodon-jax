@@ -955,6 +955,37 @@ class TestFix1GradientCheckpointing:
             assert layer_cache is not None, "Layer cache should be returned when not checkpointing"
 
 
+class TestFixDropoutKeyGuard:
+    """Tests for dropout key validation in MegalodonModel."""
+
+    def test_requires_key_when_dropout_enabled(self, random_seed: int) -> None:
+        """Ensure deterministic=False requires a PRNG key when dropout is active.
+
+        :param int random_seed: Random seed fixture.
+        """
+        config = MegalodonConfig(
+            vocab_size=128,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            dropout=0.1,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+        input_ids = jax.random.randint(key, (2, 8), minval=0, maxval=config.vocab_size)
+
+        with pytest.raises(ValueError, match="PRNG key required"):
+            model(input_ids, deterministic=False, key=None)
+
+
 class TestFix2PadTokenMasking:
     """Tests for pad token masking (Fix 2)."""
 
