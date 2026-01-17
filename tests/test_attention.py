@@ -1,13 +1,14 @@
 """Phase 3 Attention tests - primitives, ChunkedAttention, MegalodonAttention, NormalizedFFN."""
 
+from __future__ import annotations
+
 from typing import Any
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-import torch
-from megalodon import modeling_megalodon as torch_modeling
+import pytest
 
 from megalodon_jax.layers import (
     ChunkedAttention,
@@ -17,25 +18,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
-
+from tests.utils import require_torch_modeling, to_jax, to_torch
 
 # -----------------------------------------------------------------------------
 # Attention Primitive Tests
@@ -449,12 +432,15 @@ class TestNormalizedFFN:
         # Two-hop should use residual_base, not x
         assert not jnp.allclose(out_normal, out_two_hop)
 
+    @pytest.mark.torch_ref
     def test_ffn_parity(self, random_seed: int) -> None:
         """Test NormalizedFFN parity with PyTorch reference.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        torch_modeling = require_torch_modeling()
         TorchConfig = torch_modeling.MegalodonConfig
         TorchFFN = torch_modeling.NormalizedFFN
 
@@ -1176,6 +1162,7 @@ class TestParity:
 class TestMegalodonAttentionParity:
     """Parity tests for MegalodonAttention against PyTorch reference."""
 
+    @pytest.mark.torch_ref
     def test_megalodon_attention_forward_parity(
         self, random_seed: int, torch_device: torch.device
     ) -> None:
@@ -1187,14 +1174,10 @@ class TestMegalodonAttentionParity:
         """
         from tests.conftest import sync_and_clear_torch
 
-        pytest = __import__("pytest")
-
-        # Check if PyTorch reference is available
-        try:
-            TorchMegalodonAttention = torch_modeling.MegalodonAttention
-            TorchConfig = torch_modeling.MegalodonConfig
-        except ImportError:
-            pytest.skip("PyTorch reference not available")
+        torch = pytest.importorskip("torch")
+        torch_modeling = require_torch_modeling()
+        TorchMegalodonAttention = torch_modeling.MegalodonAttention
+        TorchConfig = torch_modeling.MegalodonConfig
 
         # Config matching both implementations
         batch, seq_len = 1, 8

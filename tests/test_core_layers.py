@@ -1,5 +1,7 @@
 """Phase 2 Core Layers tests - TimestepNorm, ComplexEMA parity."""
 
+from __future__ import annotations
+
 from typing import Any
 
 import equinox as eqx
@@ -7,42 +9,24 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    if t.is_complex():
-        return jnp.array(t.detach().cpu().numpy())
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
+from megalodon_jax.layers.timestep_norm import VARIANCE_FLOOR
+from tests.utils import require_torch_modeling, to_jax
 
 
 class TestTimestepNormParity:
     """Parity tests for TimestepNorm against PyTorch reference."""
 
+    @pytest.mark.torch_ref
     def test_forward_parity(self, random_seed: int) -> None:
         """Test TimestepNorm forward pass matches PyTorch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_norm_cls = torch_modeling.TimestepNorm
+        torch = pytest.importorskip("torch")
+        torch_norm_cls = require_torch_modeling().TimestepNorm
 
         dim = 64
         num_groups = 8
@@ -158,6 +142,62 @@ class TestTimestepNormParity:
         # Count should be 8 for all batch elements
         np.testing.assert_array_equal(np.array(state_masked.count), np.array([8, 8]))
 
+    def test_state_dtype_fp32(self, random_seed: int) -> None:
+        """Ensure running stats stay in float32 for bf16 inputs."""
+        dim = 64
+        num_groups = 8
+        norm = TimestepNorm(dim, num_groups)
+
+        key = jax.random.PRNGKey(random_seed)
+        x = jax.random.normal(key, (2, 4, dim)).astype(jnp.bfloat16)
+        _, state = norm(x)
+
+        assert state.mean.dtype == jnp.float32
+        assert state.var.dtype == jnp.float32
+
+    def test_state_matches_explicit_stats(self, random_seed: int) -> None:
+        """Compare running stats to an explicit Welford implementation."""
+        dim = 16
+        num_groups = 4
+        group_size = dim // num_groups
+        norm = TimestepNorm(dim, num_groups)
+
+        key = jax.random.PRNGKey(random_seed)
+        x = jax.random.normal(key, (2, 5, dim))
+        mask = jnp.array(
+            [
+                [True, True, False, True, False],
+                [True, False, True, True, True],
+            ],
+            dtype=jnp.bool_,
+        )
+
+        _, state = norm(x, mask=mask)
+
+        x_np = np.array(x, dtype=np.float32)
+        mask_np = np.array(mask)
+        count = np.zeros((2,), dtype=np.int32)
+        mean = np.zeros((2, num_groups), dtype=np.float32)
+        m2 = np.ones((2, num_groups), dtype=np.float32)
+
+        for t in range(x_np.shape[1]):
+            group_means = x_np[:, t].reshape(2, num_groups, group_size).mean(axis=-1)
+            for b in range(2):
+                if not mask_np[b, t]:
+                    continue
+                count[b] += 1
+                delta = group_means[b] - mean[b]
+                mean[b] += delta / count[b]
+                delta2 = group_means[b] - mean[b]
+                m2[b] += delta * delta2
+
+        var = np.where(count[:, None] > 0, m2 / count[:, None], 1.0)
+        var = np.maximum(var, VARIANCE_FLOOR)
+
+        np.testing.assert_array_equal(np.array(state.count), count)
+        np.testing.assert_allclose(np.array(state.mean), mean, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.array(state.var), var, rtol=1e-5, atol=1e-5)
+
     def test_divisibility_validation(self) -> None:
         """Test that num_features must be divisible by num_groups.
 
@@ -181,13 +221,15 @@ class TestTimestepNormParity:
 class TestComplexEMAParity:
     """Parity tests for ComplexEMA against PyTorch reference."""
 
+    @pytest.mark.torch_ref
     def test_coefficients_parity(self, random_seed: int) -> None:
         """Test that coefficient computation matches PyTorch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling.ComplexEMA
+        pytest.importorskip("torch")
+        torch_ema_cls = require_torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
@@ -215,13 +257,15 @@ class TestComplexEMAParity:
             np.array(gamma_jax), gamma_torch.detach().numpy(), rtol=1e-5, atol=1e-6
         )
 
+    @pytest.mark.torch_ref
     def test_fft_forward_parity(self, random_seed: int) -> None:
         """Test FFT path forward pass matches PyTorch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling.ComplexEMA
+        torch = pytest.importorskip("torch")
+        torch_ema_cls = require_torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
@@ -250,13 +294,15 @@ class TestComplexEMAParity:
         # Compare outputs
         np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-4, atol=1e-5)
 
+    @pytest.mark.torch_ref
     def test_sequential_forward_parity(self, random_seed: int) -> None:
         """Test sequential path forward pass matches PyTorch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling.ComplexEMA
+        torch = pytest.importorskip("torch")
+        torch_ema_cls = require_torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16
@@ -507,13 +553,15 @@ class TestPrecisionPolicy:
             err_msg="bf16 params should produce fp32 coefficients close to fp32 params",
         )
 
+    @pytest.mark.torch_ref
     def test_complex_ema_bf16_forward(self, random_seed: int) -> None:
         """Test ComplexEMA forward pass with bf16 inputs.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_ema_cls = torch_modeling.ComplexEMA
+        torch = pytest.importorskip("torch")
+        torch_ema_cls = require_torch_modeling().ComplexEMA
 
         dim = 64
         ndim = 16

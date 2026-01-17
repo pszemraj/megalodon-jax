@@ -1,3 +1,16 @@
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Top-level Megalodon model classes.
 
 This module contains the complete model assembly:
@@ -273,10 +286,19 @@ class MegalodonModel(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
-        :raises ValueError: If dropout is enabled without a PRNG key.
         :raises ValueError: If cache layer count does not match the model.
         :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
+        if not deterministic and key is None:
+            if (
+                self.config.dropout > 0.0
+                or self.config.attention_dropout > 0.0
+                or self.config.hidden_dropout > 0.0
+            ):
+                raise ValueError(
+                    "PRNG key required when deterministic=False and dropout is enabled. "
+                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+                )
         B, L = input_ids.shape
 
         # Handle empty inputs gracefully (B=0 or L=0)
@@ -296,18 +318,6 @@ class MegalodonModel(eqx.Module):
 
         # Disable streaming cache updates during training (matches PyTorch behavior).
         layer_return_cache = return_cache and deterministic
-
-        # Validate PRNG key for dropout - prevent silent no-op when training
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
 
         # Validate token bounds - prevents silent incorrect embeddings from OOB indices
         # Note: Uses eqx.error_if for JIT-safe traced-value errors
@@ -512,8 +522,6 @@ class MegalodonForCausalLM(eqx.Module):
         else:
             # Separate LM head
             logits = jnp.matmul(hidden, self.lm_head.weight.T)
-            if self.lm_head.bias is not None:
-                logits = logits + self.lm_head.bias
 
         return logits, cache
 

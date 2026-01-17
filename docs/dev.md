@@ -3,6 +3,7 @@
 ---
 
 - [Dev Notes - megalodon-jax](#dev-notes---megalodon-jax)
+  - [Release Notes](#release-notes)
   - [Architecture Overview](#architecture-overview)
     - [Key Differences from Upstream Reference](#key-differences-from-upstream-reference)
     - [Performance Characteristics](#performance-characteristics)
@@ -22,6 +23,11 @@
   - [Profiling](#profiling)
 
 ---
+
+## Release Notes
+
+- Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch; install `megalodon-jax[convert]` and import explicitly.
+- Unreleased: `generate()` no longer accepts a `seed` argument; padded `attention_mask` is rejected for cached generation (`max_new_tokens > 1`, `return_cache=True`, or cache provided).
 
 ## Architecture Overview
 
@@ -86,7 +92,7 @@ Training uses FFT automatically (`return_state=False`). Sequential path is only 
 | 32k        | rel_err ~5e-5          | rel_err ~5e-5 | Kahan 4700x slower |
 | 64k        | rel_err ~2e-5          | rel_err ~2e-5 | Kahan 4200x slower |
 
-**Finding**: TimestepNorm already uses fp32 accumulators internally (line 146: `stats_dtype = jnp.float32`). This provides sufficient precision-variance floor (1e-6) was never triggered at 64k tokens. Kahan compensation via `jax.lax.scan` is catastrophically slow (~4000x overhead) because scan is sequential while `jnp.cumsum` uses optimized XLA primitives.
+**Finding**: TimestepNorm already uses fp32 accumulators internally (search for `stats_dtype = jnp.float32` in `timestep_norm.py`). This provides sufficient precision-variance floor (1e-6) was never triggered at 64k tokens. Kahan compensation via `jax.lax.scan` is catastrophically slow (~4000x overhead) because scan is sequential while `jnp.cumsum` uses optimized XLA primitives.
 
 **Recommendation**: Keep current implementation. If precision issues arise at 100k+ tokens, consider fp64 accumulators (simple, 2x memory) rather than Kahan.
 
@@ -108,7 +114,7 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 
 ## Weight Conversion
 
-`convert.py` provides bidirectional PyTorch ↔ JAX conversion:
+`convert.py` provides bidirectional PyTorch ↔ JAX conversion: it requires torch (install `megalodon-jax[convert]`) and is imported from `megalodon_jax.convert`.
 
 **JAX → PyTorch** (`convert_jax_to_torch`):
 
@@ -132,7 +138,7 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Testing
 
-200+ tests covering:
+150+ tests (200+ cases via parametrization) covering:
 
 - Parity with the reference implementation (rtol=1e-4 for fp32, rtol=1e-2 for bf16)
 - Streaming equivalence: chunk-wise streaming matches batch processing (token fallback for partial chunks)
@@ -144,5 +150,4 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Profiling
 
-This repo no longer ships profiling scripts. For the PyTorch reference timing helpers,
-use [megalodon-hf/scripts](https://github.com/pszemraj/megalodon-hf/tree/f85a47849d07d52982a2e6e4cf0297c2621e9916/scripts).
+This repo no longer ships profiling scripts. For the PyTorch reference timing helpers, use [megalodon-hf/scripts](https://github.com/pszemraj/megalodon-hf/tree/f85a47849d07d52982a2e6e4cf0297c2621e9916/scripts).

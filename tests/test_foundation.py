@@ -1,34 +1,17 @@
 """Phase 1 Foundation tests - config, types, RMSNorm, RotaryEmbedding parity."""
 
+from __future__ import annotations
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from megalodon import modeling_megalodon as torch_modeling
 
 from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
+from tests.utils import require_torch_modeling, to_jax
 
 
 class TestMegalodonConfig:
@@ -141,13 +124,15 @@ class TestMegalodonConfig:
 class TestRMSNormParity:
     """Parity tests for RMSNorm against PyTorch reference."""
 
+    @pytest.mark.torch_ref
     def test_forward_parity(self, random_seed: int) -> None:
         """Test RMSNorm forward pass matches PyTorch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_norm_cls = torch_modeling.RMSNorm
+        torch = pytest.importorskip("torch")
+        torch_norm_cls = require_torch_modeling().RMSNorm
 
         dim = 64
         eps = 1e-6
@@ -205,13 +190,15 @@ class TestRMSNormParity:
 class TestRotaryEmbeddingParity:
     """Parity tests for RotaryEmbedding against PyTorch reference."""
 
+    @pytest.mark.torch_ref
     def test_forward_parity(self, random_seed: int) -> None:
         """Test RotaryEmbedding forward pass matches PyTorch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_rope_cls = torch_modeling.RotaryEmbedding
+        torch = pytest.importorskip("torch")
+        torch_rope_cls = require_torch_modeling().RotaryEmbedding
 
         dim = 64
         base = 10000.0
@@ -248,13 +235,15 @@ class TestRotaryEmbeddingParity:
             np.array(k_rot_jax), k_rot_torch.detach().numpy(), rtol=1e-5, atol=1e-5
         )
 
+    @pytest.mark.torch_ref
     def test_different_start_positions(self, random_seed: int) -> None:
         """Test RotaryEmbedding at various start positions.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_rope_cls = torch_modeling.RotaryEmbedding
+        torch = pytest.importorskip("torch")
+        torch_rope_cls = require_torch_modeling().RotaryEmbedding
 
         dim = 64
         torch_rope = torch_rope_cls(dim)
@@ -303,13 +292,15 @@ class TestRotaryEmbeddingParity:
         with pytest.raises(ValueError, match="even head dimension"):
             RotaryEmbedding(63)
 
+    @pytest.mark.torch_ref
     def test_different_base_values(self, random_seed: int) -> None:
         """Test RotaryEmbedding with different base values.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        torch_rope_cls = torch_modeling.RotaryEmbedding
+        torch = pytest.importorskip("torch")
+        torch_rope_cls = require_torch_modeling().RotaryEmbedding
 
         dim = 64
         batch, seq, heads = 2, 8, 4

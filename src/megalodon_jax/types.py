@@ -1,3 +1,16 @@
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Type definitions for Megalodon cache and state.
 
 CRITICAL: All position/count fields are JAX arrays (not Python ints).
@@ -53,11 +66,11 @@ def _register_pytree(cls: type[T]) -> type[T]:
 class AttentionCache:
     """Cache for streaming attention.
 
-    Stores key/value tensors in fixed-capacity buffers with masked validity.
+    Stores key/value tensors in fixed-capacity buffers.
     Use `count` for the total tokens processed (absolute position after last token).
-    Buffer capacity is `k.shape[1]`; valid entries are masked internally.
-    The buffer is treated as a circular ring indexed by absolute position modulo
-    the cache capacity.
+    Buffer capacity is `k.shape[1]`; validity is inferred from `count` and ring
+    indexing rather than an explicit mask. The buffer is treated as a circular
+    ring indexed by absolute position modulo the cache capacity.
 
     Note: Unlike the PyTorch reference, this cache does not expose length/start_index
     properties because they would be misleading. In JAX, caches use fixed-size buffers
@@ -75,7 +88,8 @@ class NormState:
     """Running statistics for TimestepNorm (Welford's algorithm).
 
     Tracks cumulative count, mean, and variance per group for streaming
-    normalization that only uses past context.
+    normalization that only uses past context. Mean/variance are stored in
+    float32 for numerical stability, regardless of activation dtype.
     """
 
     count: Int[Array, "batch"]  # tokens seen per batch element

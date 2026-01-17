@@ -1,3 +1,16 @@
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utility functions for Megalodon JAX."""
 
 from collections.abc import Callable
@@ -34,11 +47,11 @@ def get_initializer(
     :param int | None dim: Dimension for gaussian stddev; None uses stddev=1.0.
     :return Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]: Initializer.
 
-    Modes: none (zeros), he (He normal), xavier (Glorot uniform), bert (std=0.02),
+    Modes: he (He normal), xavier (Glorot uniform), bert (std=0.02),
     gaussian (truncated normal with std=1/sqrt(dim) or 1.0 when dim is None).
     """
     if mode == "none":
-        return lambda key, shape, dtype: jnp.zeros(shape, dtype=dtype)
+        raise ValueError("Init mode 'none' skips reinitialization and has no initializer.")
 
     if mode == "he":
         return jax.nn.initializers.he_normal()

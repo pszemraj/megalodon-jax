@@ -1,5 +1,7 @@
 """Phase 4 Model Assembly tests - MegalodonBlock, MegalodonModel, MegalodonForCausalLM."""
 
+from __future__ import annotations
+
 from typing import Any
 
 import equinox as eqx
@@ -7,30 +9,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import torch
-from megalodon import MegalodonConfig as TorchMegalodonConfig
-from megalodon import MegalodonForCausalLM as TorchMegalodonForCausalLM
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
-
-
-def to_jax(t: torch.Tensor) -> jnp.ndarray:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param torch.Tensor t: Input PyTorch tensor.
-    :return jnp.ndarray: JAX array on the default device.
-    """
-    return jnp.array(t.detach().cpu().numpy())
-
-
-def to_torch(a: jnp.ndarray) -> torch.Tensor:
-    """Convert a JAX array to a PyTorch tensor.
-
-    :param jnp.ndarray a: Input JAX array.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    return torch.from_numpy(np.array(a))
+from tests.utils import to_jax
 
 
 def small_config() -> MegalodonConfig:
@@ -534,18 +516,6 @@ class TestGradients:
         # Compute gradients
         grads = eqx.filter_grad(loss_fn)(model)
 
-        # Check that gradients exist and are finite
-        def check_grad(x: Any) -> bool:
-            """Validate a gradient leaf for finiteness.
-
-            :param Any x: Gradient leaf to validate.
-            :return bool: True if the leaf is a finite array.
-            """
-            if eqx.is_array(x):
-                assert jnp.all(jnp.isfinite(x)), "Gradient contains NaN or Inf"
-                return True
-            return False
-
         # Apply check to all leaves
         grad_leaves = jax.tree_util.tree_leaves(
             eqx.filter(grads, eqx.is_array), is_leaf=eqx.is_array
@@ -652,6 +622,7 @@ class TestModelCache:
 # -----------------------------------------------------------------------------
 
 
+@pytest.mark.torch_ref
 class TestParity:
     """Tests comparing JAX implementation to PyTorch reference."""
 
@@ -691,11 +662,13 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = parity_config
         batch, seq = 2, 32
 
         # Create PyTorch model
-        torch_config = TorchMegalodonConfig(
+        torch_config = megalodon.MegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -711,7 +684,7 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         # Create JAX model
         key = jax.random.PRNGKey(random_seed)
@@ -757,13 +730,15 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = parity_config
         batch = 1
         prompt_len = 16
         gen_len = 4
 
         # Create PyTorch model
-        torch_config = TorchMegalodonConfig(
+        torch_config = megalodon.MegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -779,7 +754,7 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         # Create JAX model and load weights (from CPU state_dict)
         key = jax.random.PRNGKey(random_seed)
@@ -828,6 +803,8 @@ class TestParity:
         :param torch.device torch_device: Torch device fixture.
         :return None: None.
         """
+        torch = pytest.importorskip("torch")
+        megalodon = pytest.importorskip("megalodon")
         config = MegalodonConfig(
             vocab_size=128,
             model_dim=64,
@@ -848,7 +825,7 @@ class TestParity:
         prompt_len = config.chunk_size - 1
         gen_len = 2
 
-        torch_config = TorchMegalodonConfig(
+        torch_config = megalodon.MegalodonConfig(
             vocab_size=config.vocab_size,
             model_dim=config.model_dim,
             num_layers=config.num_layers,
@@ -864,7 +841,7 @@ class TestParity:
             attention_dropout=0.0,
             hidden_dropout=0.0,
         )
-        torch_model = TorchMegalodonForCausalLM(torch_config).to(torch_device).eval()
+        torch_model = megalodon.MegalodonForCausalLM(torch_config).to(torch_device).eval()
 
         key = jax.random.PRNGKey(random_seed)
         jax_model = MegalodonForCausalLM(config, key=key)
@@ -976,6 +953,37 @@ class TestFix1GradientCheckpointing:
         # Layer caches should be populated
         for layer_cache in cache.layer_caches:
             assert layer_cache is not None, "Layer cache should be returned when not checkpointing"
+
+
+class TestFixDropoutKeyGuard:
+    """Tests for dropout key validation in MegalodonModel."""
+
+    def test_requires_key_when_dropout_enabled(self, random_seed: int) -> None:
+        """Ensure deterministic=False requires a PRNG key when dropout is active.
+
+        :param int random_seed: Random seed fixture.
+        """
+        config = MegalodonConfig(
+            vocab_size=128,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            dropout=0.1,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonModel(config, key=key)
+        input_ids = jax.random.randint(key, (2, 8), minval=0, maxval=config.vocab_size)
+
+        with pytest.raises(ValueError, match="PRNG key required"):
+            model(input_ids, deterministic=False, key=None)
 
 
 class TestFix2PadTokenMasking:
