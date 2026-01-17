@@ -95,18 +95,12 @@ flowchart TD
 
 ## 5) Padding and Generation
 
-- In this JAX implementation, cached decoding does not support padding because
-  cache validity is not tracked per position.
-- `generate()` rejects padded `attention_mask` when cached generation is requested
-  (`max_new_tokens > 1`, `return_cache=True`, or a cache is provided).
+- In this JAX implementation, cached decoding does not support padding because cache validity is not tracked per position.
+- `generate()` rejects padded `attention_mask` when cached generation is requested (`max_new_tokens > 1`, `return_cache=True`, or a cache is provided).
 - For variable-length prompts, trim/pad on the caller side or loop over prompts.
 
 ## Defaults and Options
 
-- **PyTorch reference (megalodon-hf):** default `max_cache_len = chunk_size` (chunk-local);
-  set `max_cache_len` above `chunk_size` for a sliding window; validates
-  `max_cache_len >= chunk_size`.
+- **PyTorch reference (megalodon-hf):** default `max_cache_len = chunk_size` (chunk-local); set `max_cache_len` above `chunk_size` for a sliding window; validates `max_cache_len >= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set
-  `max_cache_len` above `chunk_size` for sliding-window attention; use
-  `cache_unbounded=True` to disable chunk resets (still fixed-size).
+- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable chunk resets (still fixed-size).

@@ -26,11 +26,8 @@
 
 ## Release Notes
 
-- Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch;
-  install `megalodon-jax[convert]` and import explicitly.
-- Unreleased: `generate()` no longer accepts a `seed` argument; padded `attention_mask`
-  is rejected for cached generation (`max_new_tokens > 1`, `return_cache=True`, or cache
-  provided).
+- Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch; install `megalodon-jax[convert]` and import explicitly.
+- Unreleased: `generate()` no longer accepts a `seed` argument; padded `attention_mask` is rejected for cached generation (`max_new_tokens > 1`, `return_cache=True`, or cache provided).
 
 ## Architecture Overview
 
@@ -117,9 +114,7 @@ Uses `-jnp.inf` for masked positions (not `finfo.min`). Ensures fully-masked que
 
 ## Weight Conversion
 
-`convert.py` provides bidirectional PyTorch ↔ JAX conversion:
-it requires torch (install `megalodon-jax[convert]`) and is imported from
-`megalodon_jax.convert`.
+`convert.py` provides bidirectional PyTorch ↔ JAX conversion: it requires torch (install `megalodon-jax[convert]`) and is imported from `megalodon_jax.convert`.
 
 **JAX → PyTorch** (`convert_jax_to_torch`):
 
@@ -155,5 +150,4 @@ All cache objects are JAX pytrees with position counters as JAX scalar arrays (n
 
 ## Profiling
 
-This repo no longer ships profiling scripts. For the PyTorch reference timing helpers,
-use [megalodon-hf/scripts](https://github.com/pszemraj/megalodon-hf/tree/f85a47849d07d52982a2e6e4cf0297c2621e9916/scripts).
+This repo no longer ships profiling scripts. For the PyTorch reference timing helpers, use [megalodon-hf/scripts](https://github.com/pszemraj/megalodon-hf/tree/f85a47849d07d52982a2e6e4cf0297c2621e9916/scripts).

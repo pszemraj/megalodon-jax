@@ -28,9 +28,7 @@ cd megalodon-jax
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+.
-PyTorch is optional; install `.[convert]` for conversion utilities and `.[dev]` for
-conversion plus parity tests and dev tooling.
+Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+. PyTorch is optional; install `.[convert]` for conversion utilities and `.[dev]` for conversion plus parity tests and dev tooling.
 
 ## Quick Start
 
@@ -78,8 +76,7 @@ tokens, cache, key = generate(
 )
 ```
 
-Note: when `attention_mask` contains padding, cached generation
-(`max_new_tokens > 1`, `return_cache=True`, or `cache` provided) is not supported.
+Note: when `attention_mask` contains padding, cached generation (`max_new_tokens > 1`, `return_cache=True`, or `cache` provided) is not supported.
 
 ### Training with Loss
 

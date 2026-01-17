@@ -1,8 +1,6 @@
 # JAX and PyTorch Interop
 
-This repo provides the JAX implementation. The PyTorch reference lives in
-[megalodon-hf](https://github.com/pszemraj/megalodon-hf) and is the target for
-deployment and parity checks.
+This repo provides the JAX implementation. The PyTorch reference lives in [megalodon-hf](https://github.com/pszemraj/megalodon-hf) and is the target for deployment and parity checks.
 
 ## Why the JAX version exists
 
@@ -26,13 +24,11 @@ Use PyTorch (megalodon-hf) for:
 
 ## Conversion workflows
 
-Conversion utilities live in `megalodon_jax.convert` and require torch
-(install with `megalodon-jax[convert]`).
+Conversion utilities live in `megalodon_jax.convert` and require torch (install with `megalodon-jax[convert]`).
 
 ### JAX -> PyTorch
 
-Use `convert_jax_to_torch` to get a PyTorch-style state dict, or
-`save_safetensors` to write a `.safetensors` file.
+Use `convert_jax_to_torch` to get a PyTorch-style state dict, or `save_safetensors` to write a `.safetensors` file.
 
 ```python
 from megalodon_jax.convert import convert_jax_to_torch, save_safetensors
@@ -43,16 +39,13 @@ save_safetensors(model, "model.safetensors")
 
 Notes:
 
-- `inner.rope.inv_freq` is not in the PyTorch state dict. The JAX exporter
-  skips it by default. Use `include_rope_inv_freq=True` only if you need it
-  for tooling (it will be an unexpected key under strict loading).
+- `inner.rope.inv_freq` is not in the PyTorch state dict. The JAX exporter skips it by default. Use `include_rope_inv_freq=True` only if you need it for tooling (it will be an unexpected key under strict loading).
 - Use `dtype=` to export bf16 checkpoints (fp32 is the default and recommended).
 - CEMA `gamma_{real,imag}` is exported in fp32 for stability.
 
 ### PyTorch -> JAX
 
-Use `load_from_pretrained` for a checkpoint file, or `load_weights_from_torch`
-if you already have a state dict in memory.
+Use `load_from_pretrained` for a checkpoint file, or `load_weights_from_torch` if you already have a state dict in memory.
 
 ```python
 from megalodon_jax.convert import load_from_pretrained
@@ -64,8 +57,7 @@ model = load_from_pretrained(
 )
 ```
 
-Make sure the JAX config matches the PyTorch config (dims, layer count, swiglu,
-norm_affine, output_size, etc).
+Make sure the JAX config matches the PyTorch config (dims, layer count, swiglu, norm_affine, output_size, etc).
 
 Notes:
 
@@ -73,24 +65,17 @@ Notes:
 
 ## Functional differences (current)
 
-- **Cache + padding**: JAX does not support streaming cache with padded inputs.
-  Use unpadded prompts for cached decoding, or set `return_cache=False`.
-- **Cache sizing**: JAX uses a fixed-size ring buffer for KV cache (required for
-  JIT). PyTorch can grow dynamically.
-- **Generation API**: JAX provides its own `generate` loop; it does not implement
-  the full HuggingFace `GenerationMixin` surface.
-- **Compilation shapes**: JAX recompiles on new shapes. Pad sequences to a
-  consistent length for throughput.
+- **Cache + padding**: JAX does not support padded inputs for cached generation; `generate()` rejects padded `attention_mask` when `max_new_tokens > 1`, `return_cache=True`, or a cache is provided. Use unpadded prompts or generate one token at a time.
+- **Cache sizing**: JAX uses a fixed-size ring buffer for KV cache (required for JIT). PyTorch can grow dynamically.
+- **Generation API**: JAX provides its own `generate` loop; it does not implement the full HuggingFace `GenerationMixin` surface.
+- **Compilation shapes**: JAX recompiles on new shapes. Pad sequences to a consistent length for throughput.
 
 ## Parity and compatibility notes
 
-- The torch fixes for masking, cache semantics, and per-batch positions do not
-  add or rename parameters; weight mapping is unchanged.
+- The torch fixes for masking, cache semantics, and per-batch positions do not add or rename parameters; weight mapping is unchanged.
 - `max_cache_len` must be `>= chunk_size` when provided (validated in config).
-- Loss masking uses `ignore_index=-100` and attention masks consistently, same
-  as the PyTorch/HF convention.
-- Parity tests that rely on the external `megalodon-hf` package are marked with
-  `@pytest.mark.torch_ref` in `tests/` for easy selection.
+- Loss masking uses `ignore_index=-100` and attention masks consistently, same as the PyTorch/HF convention.
+- Parity tests that rely on the external `megalodon-hf` package are marked with `@pytest.mark.torch_ref` in `tests/` for easy selection.
 
 ## Quick parity checklist
 
