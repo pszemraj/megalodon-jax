@@ -28,6 +28,9 @@
 
 - Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch;
   install `megalodon-jax[convert]` and import explicitly.
+- Unreleased: `generate()` no longer accepts a `seed` argument; padded `attention_mask`
+  is rejected for cached generation (`max_new_tokens > 1`, `return_cache=True`, or cache
+  provided).
 
 ## Architecture Overview
 

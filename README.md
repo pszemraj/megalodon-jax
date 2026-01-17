@@ -79,7 +79,7 @@ tokens, cache, key = generate(
 ```
 
 Note: when `attention_mask` contains padding, cached generation
-(`max_new_tokens > 1` or `return_cache=True`) is not supported.
+(`max_new_tokens > 1`, `return_cache=True`, or `cache` provided) is not supported.
 
 ### Training with Loss
 
