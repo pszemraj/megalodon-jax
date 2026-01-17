@@ -387,8 +387,8 @@ class TestSamplingAndGeneration:
         assert out.shape == (1, 2)
         assert int(out[0, 0]) == config.bos_token_id
 
-    def test_generate_sampling_requires_key_or_seed(self) -> None:
-        """Ensure sampling requires a PRNG key or seed.
+    def test_generate_sampling_requires_key(self) -> None:
+        """Ensure sampling requires a PRNG key.
 
         :return None: None.
         """
@@ -404,8 +404,8 @@ class TestSamplingAndGeneration:
                 temperature=1.0,
             )
 
-    def test_generate_grouped_left_padding_multi_token(self) -> None:
-        """Ensure grouped left-padding generation matches per-group outputs.
+    def test_generate_padded_left_padding_cached_generation_raises(self) -> None:
+        """Ensure padded attention masks reject cached generation.
 
         :return None: None.
         """
@@ -426,32 +426,15 @@ class TestSamplingAndGeneration:
             ]
         )
 
-        out, _, _ = generate(
-            model,
-            prompt,
-            max_new_tokens=2,
-            temperature=0.0,
-            attention_mask=attention_mask,
-            return_cache=False,
-        )
-
-        trimmed0 = prompt[0:1, 2:]
-        trimmed1 = prompt[1:2, 1:]
-        out0, _, _ = generate(
-            model,
-            trimmed0,
-            max_new_tokens=2,
-            temperature=0.0,
-        )
-        out1, _, _ = generate(
-            model,
-            trimmed1,
-            max_new_tokens=2,
-            temperature=0.0,
-        )
-
-        np.testing.assert_array_equal(np.array(out[0, 4:]), np.array(out0[0, 2:]))
-        np.testing.assert_array_equal(np.array(out[1, 4:]), np.array(out1[0, 3:]))
+        with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
+            generate(
+                model,
+                prompt,
+                max_new_tokens=2,
+                temperature=0.0,
+                attention_mask=attention_mask,
+                return_cache=False,
+            )
 
     def test_generate_right_padding_raises(self) -> None:
         """Ensure right padding is rejected for generation.
@@ -464,7 +447,7 @@ class TestSamplingAndGeneration:
         prompt = jnp.array([[1, 2, 0, 0]], dtype=jnp.int32)
         attention_mask = jnp.array([[True, True, False, False]])
 
-        with pytest.raises(ValueError, match="Right padding"):
+        with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
             generate(
                 model,
                 prompt,
@@ -484,7 +467,7 @@ class TestSamplingAndGeneration:
         prompt = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
         attention_mask = jnp.array([[False, True, True, True]])
 
-        with pytest.raises(ValueError, match="return_cache"):
+        with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
             generate(
                 model,
                 prompt,

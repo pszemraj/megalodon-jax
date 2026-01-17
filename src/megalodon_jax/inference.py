@@ -8,7 +8,6 @@ from collections.abc import Callable
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
@@ -577,7 +576,6 @@ def generate(
     max_new_tokens: int,
     key: PRNGKeyArray | None = None,
     *,
-    seed: int | None = None,
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
@@ -587,16 +585,12 @@ def generate(
     cache: ModelCache | None = None,
     return_cache: bool = False,
 ) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
-    """Autoregressive generation with optional padding-aware grouping.
-
-    When attention_mask contains padding and max_new_tokens > 1, prompts are
-    grouped by length (left padding only) and return_cache is disallowed.
+    """Autoregressive generation with padding-aware constraints.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
     :param int max_new_tokens: Number of new tokens to generate.
     :param PRNGKeyArray | None key: PRNG key for sampling.
-    :param int | None seed: Seed for deterministic sampling.
     :param float temperature: Sampling temperature.
     :param int | None top_k: Top-k filter.
     :param float | None top_p: Top-p filter.
@@ -608,11 +602,6 @@ def generate(
     :raises ValueError: If inputs are invalid or padding constraints are violated.
     :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
     """
-
-    if seed is not None and key is not None:
-        raise ValueError("Specify only one of key or seed (not both).")
-    if key is None and seed is not None:
-        key = jax.random.PRNGKey(seed)
 
     if attention_mask is None:
         return _generate_core(
@@ -631,71 +620,27 @@ def generate(
         )
 
     has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
-    needs_cache = return_cache or max_new_tokens > 1
-    if not has_padding or not needs_cache:
-        return _generate_core(
-            model,
-            prompt_ids,
-            max_new_tokens,
-            key,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            attention_mask=attention_mask,
-            cache=cache,
-            return_cache=return_cache,
-        )
-
-    if cache is not None:
+    needs_cache = cache is not None or return_cache or max_new_tokens > 1
+    if has_padding and needs_cache:
         raise ValueError(
             "Cannot use cache with padded attention_mask. "
-            "Provide unpadded prompts or pass return_cache=False."
-        )
-    if return_cache:
-        raise ValueError(
-            "return_cache=True is not supported for padded batches. "
-            "Provide unpadded prompts or set return_cache=False."
+            "Provide unpadded prompts for cached generation."
         )
 
-    mask_host = np.asarray(jax.device_get(attention_mask)).astype(bool)
-    B, Lmax = mask_host.shape
-    lens = mask_host.sum(axis=1).astype(np.int32)
-    for row in mask_host:
-        if not row.any():
-            raise ValueError("attention_mask must contain at least one True per batch element.")
-        if not row[-1]:
-            raise ValueError("Right padding is not supported for decoder-only generation.")
-        first_true = int(row.argmax())
-        if not row[first_true:].all():
-            raise ValueError("attention_mask must be a single contiguous True block per row.")
-
-    out = jnp.concatenate(
-        [prompt_ids, jnp.zeros((B, max_new_tokens), dtype=prompt_ids.dtype)], axis=1
+    return _generate_core(
+        model,
+        prompt_ids,
+        max_new_tokens,
+        key,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        attention_mask=attention_mask,
+        cache=cache,
+        return_cache=return_cache,
     )
-
-    for length in np.unique(lens):
-        idx = np.where(lens == length)[0]
-        trimmed = prompt_ids[idx, Lmax - length :]
-        group_out, _, key = _generate_core(
-            model,
-            trimmed,
-            max_new_tokens,
-            key,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            attention_mask=None,
-            cache=None,
-            return_cache=False,
-        )
-        gen_tail = group_out[:, length:]
-        out = out.at[idx, Lmax:].set(gen_tail)
-
-    return out, None, key
 
 
 # Convenience JIT wrapper for generation with static knobs

@@ -78,8 +78,8 @@ tokens, cache, key = generate(
 )
 ```
 
-Note: when `attention_mask` contains padding and `max_new_tokens > 1`, generation groups
-by prompt length (left padding only) and does not support `return_cache=True`.
+Note: when `attention_mask` contains padding, cached generation
+(`max_new_tokens > 1` or `return_cache=True`) is not supported.
 
 ### Training with Loss
 
@@ -151,7 +151,7 @@ src/megalodon_jax/
 - Pure JAX implementation (no fused CUDA kernels)
 - Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
-- Cached decoding does not support padded batches; left-padding grouping is only for `return_cache=False`
+- Cached decoding does not support padded batches
 - CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
 
 ## Testing

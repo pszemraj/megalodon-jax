@@ -97,9 +97,9 @@ flowchart TD
 
 - In this JAX implementation, cached decoding does not support padding because
   cache validity is not tracked per position.
-- `generate()` handles left-padded batches by grouping prompts by length when `max_new_tokens > 1`.
-- The left-padding grouping path uses a host-side length scan and is not JIT-friendly.
-- Right padding or non-contiguous masks are rejected; padded batches cannot return a single cache.
+- `generate()` rejects padded `attention_mask` when cached generation is requested
+  (`max_new_tokens > 1`, `return_cache=True`, or a cache is provided).
+- For variable-length prompts, trim/pad on the caller side or loop over prompts.
 
 ## Defaults and Options
 
