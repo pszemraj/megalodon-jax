@@ -27,7 +27,9 @@ def _assert_gemm_backend(gemm_backend: str) -> None:
     :return None: None.
     """
     if gemm_backend != "default":
-        raise NotImplementedError(f"gemm_backend={gemm_backend} is not implemented yet.")
+        raise NotImplementedError(
+            f"gemm_backend='{gemm_backend}' not implemented; only 'default' is supported."
+        )
 
 
 def linear_3d(
@@ -52,6 +54,7 @@ def linear_3d(
     y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
     if linear.bias is not None:
         y = y + linear.bias.astype(compute_dtype)
+    # Downcast from accum_dtype (e.g., fp32) to compute_dtype (e.g., bf16).
     return y.astype(compute_dtype)
 
 
@@ -75,4 +78,5 @@ def matmul_3d_weight(
     x_c = x.astype(compute_dtype)
     w_c = weight.astype(compute_dtype)
     y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
+    # Downcast from accum_dtype (e.g., fp32) to compute_dtype (e.g., bf16).
     return y.astype(compute_dtype)

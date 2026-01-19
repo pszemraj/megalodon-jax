@@ -109,6 +109,8 @@ class MegalodonConfig:
                 f"gemm_backend must be 'default' until other backends are implemented, got "
                 f"{self.gemm_backend}"
             )
+        if jnp.finfo(self.accum_dtype).bits < jnp.finfo(self.compute_dtype).bits:
+            raise ValueError("accum_dtype should be >= compute_dtype for stable accumulation.")
 
     @property
     def head_dim(self) -> int:

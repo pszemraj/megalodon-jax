@@ -129,6 +129,14 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match="gemm_backend"):
             MegalodonConfig(gemm_backend="unsupported")  # type: ignore[arg-type]
 
+    def test_accum_dtype_precision_validation(self) -> None:
+        """Test accum_dtype must be at least as wide as compute_dtype.
+
+        :return None: None.
+        """
+        with pytest.raises(ValueError, match="accum_dtype should be >= compute_dtype"):
+            MegalodonConfig(compute_dtype=jnp.float32, accum_dtype=jnp.bfloat16)
+
     def test_config_is_frozen(self) -> None:
         """Test that config is immutable.
 
