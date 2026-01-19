@@ -15,7 +15,8 @@ MegalodonConfig separates:
 - `gemm_backend`: `"default"` (reserved for future FP8 backends).
 
 Use one of the following:
-TODO: implement the `mxfp8` and `nvfp4` GEMM backends and relax config validation once they exist.
+
+Attention matmuls honor `accum_dtype` for accumulation (default fp32).
 
 ### 1) Full fp32 (most stable)
 
@@ -82,6 +83,14 @@ mismatches = audit_sensitive_param_dtypes(model)
 assert not mismatches, mismatches
 ```
 
+## Internal precision choices (not configurable)
+
+The following operations use fixed higher precision for stability:
+
+- **Normalization layers**: RMSNorm, LayerNorm, and TimestepNorm compute stats in fp32.
+- **ComplexEMA coefficients**: computed in float32/complex64 regardless of parameter dtype.
+- **RoPE**: angles computed in fp32, outputs cast to input dtype.
+
 ## Training loop guidance (fp32 or bf16 compute)
 
 The model already casts activations to `compute_dtype`. Use config-driven
@@ -121,6 +130,7 @@ Notes:
 - Let the model handle compute casting; avoid manual `astype` on the model.
 - Input token ids should remain int32.
 - Loss is computed in `softmax_dtype` (default fp32) for stability.
+- GEMM wrappers cast weights each forward pass; this is correct but adds overhead.
 
 ## Inference and cache dtype
 

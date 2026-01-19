@@ -28,7 +28,7 @@
 
 - Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch; install `megalodon-jax[convert]` and import explicitly.
 - Unreleased: `generate()` no longer accepts a `seed` argument; padded `attention_mask` is rejected for cached generation (`max_new_tokens > 1`, `return_cache=True`, or cache provided).
-- Unreleased: added accum/softmax dtypes and GEMM backend selection to the precision policy.
+- Unreleased: added accum/softmax dtypes, GEMM backend selection, and centralized GEMM ops for future FP8 backends.
 - Unreleased: added `docs/dtypes-and-stability.md` with downstream dtype guidance.
 
 ## Architecture Overview
@@ -80,6 +80,7 @@ Training uses FFT automatically (`return_state=False`). Sequential path is only 
 - **Vectorized prefill with cache:** Add a fast prefill path for `return_cache=True` when `L <= chunk_size` to avoid token-by-token cache construction; keep the current path as fallback and validate boundary parity.
 - **Layer stack scan:** Consider a `lax.scan` over layers to reduce HLO size and compile time for deep models; requires careful static/dynamic argument handling in Equinox.
 - **Export metadata sidecar:** Save config + git SHA + dtype policy alongside weights to prevent accidental mismatched loads.
+- **FP8 GEMM backends:** Implement `mxfp8` and `nvfp4` GEMM backends and relax config validation once they exist.
 
 ## Numerical Stability
 
