@@ -555,7 +555,7 @@ def load_from_pretrained(
         model = jax.tree.map(cast_arrays, model)
         model = ensure_sensitive_param_dtype(model)
 
-    return model
+    return ensure_sensitive_param_dtype(model)
 
 
 def save_safetensors(
