@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import equinox as eqx
@@ -557,6 +558,34 @@ class TestGradients:
         assert jnp.all(jnp.isfinite(embed_grad))
         # Some gradients should be non-zero (for tokens that appear in input)
         assert jnp.any(embed_grad != 0)
+
+    def test_gradient_dtype_matches_param_dtype_bf16_compute(self, random_seed: int) -> None:
+        """Test that gradients keep param_dtype when compute dtype is bf16.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        config = replace(small_config(), compute_dtype=jnp.bfloat16)
+        batch, seq = 2, 8
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
+        labels = input_ids
+
+        def loss_fn(model: MegalodonForCausalLM) -> jnp.ndarray:
+            """Compute a scalar loss for gradient checks.
+
+            :param MegalodonForCausalLM model: Model under test.
+            :return jnp.ndarray: Scalar loss value.
+            """
+            return model.compute_loss(input_ids, labels)
+
+        grads = eqx.filter_grad(loss_fn)(model)
+        embed_grad = grads.model.embed.weight
+        assert embed_grad is not None
+        assert embed_grad.dtype == jnp.float32
 
 
 # -----------------------------------------------------------------------------
@@ -1903,6 +1932,98 @@ class TestEdgeCases:
             f"Expected {config.softmax_dtype}, got {loss.dtype}"
         )
         assert loss == 0.0
+
+    def test_loss_close_bf16_vs_fp32(self, random_seed: int) -> None:
+        """Test bf16 compute loss stays close to fp32 loss.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        config_fp32 = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            compute_dtype=jnp.float32,
+        )
+        config_bf16 = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            compute_dtype=jnp.bfloat16,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_data = jax.random.split(key)
+
+        model_fp32 = MegalodonForCausalLM(config_fp32, key=k_model)
+        model_bf16 = MegalodonForCausalLM(config_bf16, key=k_model)
+
+        k_input, k_labels = jax.random.split(k_data)
+        batch, seq = 2, 8
+        input_ids = jax.random.randint(
+            k_input, (batch, seq), minval=1, maxval=config_fp32.vocab_size
+        )
+        labels = jax.random.randint(k_labels, (batch, seq), minval=1, maxval=config_fp32.vocab_size)
+
+        loss_fp32 = model_fp32.compute_loss(input_ids, labels)
+        loss_bf16 = model_bf16.compute_loss(input_ids, labels)
+
+        assert jnp.isfinite(loss_fp32)
+        assert jnp.isfinite(loss_bf16)
+        np.testing.assert_allclose(
+            np.array(loss_fp32),
+            np.array(loss_bf16),
+            rtol=5e-2,
+            atol=5e-2,
+            err_msg="bf16 compute loss should be close to fp32 loss",
+        )
+
+    def test_loss_softmax_dtype_bf16(self, random_seed: int) -> None:
+        """Test that loss can be computed in bf16 softmax dtype.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        config = MegalodonConfig(
+            vocab_size=256,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            compute_dtype=jnp.bfloat16,
+            softmax_dtype=jnp.bfloat16,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_input, k_labels = jax.random.split(key, 3)
+        model = MegalodonForCausalLM(config, key=k_model)
+        batch, seq = 2, 8
+        input_ids = jax.random.randint(k_input, (batch, seq), minval=1, maxval=config.vocab_size)
+        labels = jax.random.randint(k_labels, (batch, seq), minval=1, maxval=config.vocab_size)
+
+        loss = model.compute_loss(input_ids, labels)
+
+        assert loss.dtype == jnp.bfloat16
+        assert jnp.isfinite(loss)
 
 
 class TestPrecisionAudit:
