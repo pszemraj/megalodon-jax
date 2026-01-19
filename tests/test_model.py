@@ -1869,8 +1869,8 @@ class TestEdgeCases:
         with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
             model.compute_loss(input_ids, bad_labels)
 
-    def test_loss_dtype_matches_model_bf16(self, random_seed: int) -> None:
-        """Test that empty sequence loss returns correct dtype when model is bf16.
+    def test_loss_dtype_fp32_under_bf16_compute(self, random_seed: int) -> None:
+        """Test that loss stays fp32 even when compute dtype is bf16.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1898,8 +1898,8 @@ class TestEdgeCases:
 
         loss = model.compute_loss(input_ids, labels)
 
-        # Loss should be bf16 (matching logits dtype), not float32
-        assert loss.dtype == jnp.bfloat16, f"Expected bfloat16, got {loss.dtype}"
+        # Loss should stay fp32 for numerical stability
+        assert loss.dtype == jnp.float32, f"Expected float32, got {loss.dtype}"
         assert loss == 0.0
 
 

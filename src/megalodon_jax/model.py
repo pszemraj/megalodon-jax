@@ -613,7 +613,7 @@ class MegalodonForCausalLM(eqx.Module):
         # Guard against empty sequences (seq=0 or seq=1 after shift)
         # jnp.mean() on empty array returns NaN, which would poison training
         if shift_labels.shape[1] == 0:
-            return jnp.zeros((), dtype=shift_logits.dtype)  # Match model dtype
+            return jnp.zeros((), dtype=jnp.float32)
 
         # Build valid mask: positions that contribute to loss
         # Excludes both ignore_index labels and attention-masked positions
@@ -639,7 +639,8 @@ class MegalodonForCausalLM(eqx.Module):
         safe_labels = jnp.where(valid_mask, shift_labels, 0)
 
         # Cross-entropy loss
-        log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+        shift_logits_f32 = shift_logits.astype(jnp.float32)
+        log_probs = jax.nn.log_softmax(shift_logits_f32, axis=-1)
         B, L, V = log_probs.shape
 
         # Gather log prob of correct token
@@ -648,18 +649,10 @@ class MegalodonForCausalLM(eqx.Module):
         target_log_probs = log_probs[batch_idx, seq_idx, safe_labels]
 
         # Apply valid mask and compute mean over valid positions only
-        target_log_probs = jnp.where(
-            valid_mask, target_log_probs, jnp.zeros((), dtype=target_log_probs.dtype)
-        )
+        target_log_probs = jnp.where(valid_mask, target_log_probs, 0.0)
 
-        # Accumulate in float32 (or higher) for numerical stability, then cast back
-        # to the model dtype so mixed-precision pipelines preserve bf16 end-to-end.
-        loss_dtype = shift_logits.dtype
-        compute_dtype = jnp.promote_types(loss_dtype, jnp.float32)
-
-        target_log_probs = target_log_probs.astype(compute_dtype)
-        num_valid = valid_mask.sum().astype(compute_dtype)
+        num_valid = valid_mask.sum().astype(jnp.float32)
         # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=compute_dtype))
+        num_valid = jnp.maximum(num_valid, 1.0)
         loss = -target_log_probs.sum() / num_valid
-        return loss.astype(loss_dtype)
+        return loss
