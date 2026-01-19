@@ -3,6 +3,7 @@
 Quick links to the documentation in this folder.
 
 - [dev.md](dev.md): Dev notes, internal decisions, testing guidance, and release notes.
+- [dtypes-and-stability.md](dtypes-and-stability.md): Precision policy, bf16 guidance, and stability tips.
 - [ema-implementation.md](ema-implementation.md): Details on the ComplexEMA implementation and numerical behavior.
 - [jax-torch.md](jax-torch.md): JAX/PyTorch interoperability, conversion workflows, and parity tips.
 - [long-context-streaming.md](long-context-streaming.md): Streaming/cache design, padding constraints, and inference notes.
