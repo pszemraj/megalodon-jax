@@ -32,6 +32,8 @@ class TestMegalodonConfig:
         assert cfg.ffn_hidden_dim == 2560
         assert cfg.cema_ndim == 16
         assert cfg.chunk_size == 2048
+        assert cfg.param_dtype == jnp.float32
+        assert cfg.compute_dtype == jnp.float32
 
     def test_head_dim_property(self) -> None:
         """Test head_dim computed property.
@@ -101,6 +103,16 @@ class TestMegalodonConfig:
             MegalodonConfig(chunk_size=8, max_cache_len=-1)
         with pytest.raises(ValueError, match="max_cache_len.*chunk_size"):
             MegalodonConfig(chunk_size=8, max_cache_len=4)
+
+    def test_dtype_validation(self) -> None:
+        """Test dtype constraints reject float16.
+
+        :return None: None.
+        """
+        with pytest.raises(ValueError, match="float16"):
+            MegalodonConfig(param_dtype=jnp.float16)
+        with pytest.raises(ValueError, match="float16"):
+            MegalodonConfig(compute_dtype=jnp.float16)
 
     def test_config_is_frozen(self) -> None:
         """Test that config is immutable.

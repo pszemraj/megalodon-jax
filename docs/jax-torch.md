@@ -41,7 +41,7 @@ Notes:
 
 - `inner.rope.inv_freq` is not in the PyTorch state dict. The JAX exporter skips it by default. Use `include_rope_inv_freq=True` only if you need it for tooling (it will be an unexpected key under strict loading).
 - Use `dtype=` to export bf16 checkpoints (fp32 is the default and recommended).
-- CEMA `gamma_{real,imag}` is exported in fp32 for stability.
+- Precision-sensitive parameters (CEMA params, norms, per-head Q/K affine) are exported in fp32 for stability.
 
 ### PyTorch -> JAX
 

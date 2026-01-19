@@ -84,8 +84,8 @@ class TimestepNorm(eqx.Module):
         self.affine = affine
         if affine:
             # Initialize weight to zeros (effective scale = weight + 1.0 = 1.0)
-            self.weight = jnp.zeros(num_features)
-            self.bias = jnp.zeros(num_features)
+            self.weight = jnp.zeros(num_features, dtype=jnp.float32)
+            self.bias = jnp.zeros(num_features, dtype=jnp.float32)
         else:
             self.weight = None
             self.bias = None

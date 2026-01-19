@@ -66,6 +66,24 @@ def _stop_if_array(x: Any) -> Any:
     return jax.lax.stop_gradient(x) if eqx.is_array(x) else x
 
 
+def _matmul_3d_weight(
+    x: Float[Array, "batch seq in_dim"],
+    weight: Float[Array, "out_dim in_dim"],
+    compute_dtype: jnp.dtype,
+) -> Float[Array, "batch seq out_dim"]:
+    """Apply a weight matrix to a (batch, seq, dim) tensor with compute dtype control.
+
+    :param Float[Array, "batch seq in_dim"] x: Input tensor.
+    :param Float[Array, "out_dim in_dim"] weight: Weight matrix (out_dim, in_dim).
+    :param jnp.dtype compute_dtype: Compute dtype for matmul and output.
+    :return Float[Array, "batch seq out_dim"]: Output tensor.
+    """
+    x_c = x.astype(compute_dtype)
+    w_c = weight.astype(compute_dtype)
+    y = jnp.matmul(x_c, w_c.T, preferred_element_type=jnp.float32)
+    return y.astype(compute_dtype)
+
+
 # -----------------------------------------------------------------------------
 # MegalodonBlock
 # -----------------------------------------------------------------------------
@@ -121,6 +139,8 @@ class MegalodonBlock(eqx.Module):
             dropout=config.dropout,
             attention_dropout=config.attention_dropout,
             hidden_dropout=config.hidden_dropout,
+            param_dtype=config.param_dtype,
+            compute_dtype=config.compute_dtype,
             key=k1,
         )
 
@@ -134,6 +154,8 @@ class MegalodonBlock(eqx.Module):
             layer_id=layer_id,
             hidden_dropout=config.hidden_dropout,
             dropout=config.dropout,
+            param_dtype=config.param_dtype,
+            compute_dtype=config.compute_dtype,
             key=k2,
         )
 
@@ -236,6 +258,7 @@ class MegalodonModel(eqx.Module):
         embed = eqx.nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_size=config.model_dim,
+            dtype=config.param_dtype,
             key=k_embed,
         )
 
@@ -302,9 +325,9 @@ class MegalodonModel(eqx.Module):
         B, L = input_ids.shape
 
         # Handle empty inputs gracefully (B=0 or L=0)
-        # Use embed dtype to match model's native dtype (e.g., bf16 if autocast applied)
+        # Use compute dtype to match model's output dtype.
         if B == 0 or L == 0:
-            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.embed.weight.dtype)
+            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.config.compute_dtype)
             if return_cache:
                 # Preserve any existing streaming state when input is empty.
                 empty_cache = (
@@ -340,6 +363,9 @@ class MegalodonModel(eqx.Module):
         # Use dtype-matched zero to avoid upcasting bf16 to float32
         pad_mask = input_ids == self.config.pad_token_id
         x = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=x.dtype), x)
+
+        if x.dtype != self.config.compute_dtype:
+            x = x.astype(self.config.compute_dtype)
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
@@ -468,7 +494,13 @@ class MegalodonForCausalLM(eqx.Module):
             k_model, k_head, k_head_reinit = jax.random.split(key, 3)
             self.model = MegalodonModel(config, key=k_model)
 
-            lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k_head)
+            lm_head = eqx.nn.Linear(
+                config.model_dim,
+                lm_out,
+                use_bias=False,
+                dtype=config.param_dtype,
+                key=k_head,
+            )
             # Apply init_mode to untied lm_head
             # For gaussian init, match PyTorch reference: std = 1/sqrt(output_dim)
             if config.init_mode != "none":
@@ -516,12 +548,13 @@ class MegalodonForCausalLM(eqx.Module):
             key=key,
         )
 
+        compute_dtype = self.config.compute_dtype
         if self.tied:
             # Weight-tied projection
-            logits = hidden @ self.model.embed.weight.T
+            logits = _matmul_3d_weight(hidden, self.model.embed.weight, compute_dtype)
         else:
             # Separate LM head
-            logits = jnp.matmul(hidden, self.lm_head.weight.T)
+            logits = _matmul_3d_weight(hidden, self.lm_head.weight, compute_dtype)
 
         return logits, cache
 

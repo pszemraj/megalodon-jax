@@ -670,24 +670,12 @@ class TestPrecision:
             cema_ndim=cema_ndim,
             chunk_size=chunk_size,
             norm_num_groups=norm_num_groups,
+            compute_dtype=jnp.bfloat16,
             key=k1,
         )
 
-        # Cast params to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        attn_bf16 = jax.tree.map(to_bf16, attn)
-
         x = jax.random.normal(k2, (batch, seq, model_dim)).astype(jnp.bfloat16)
-        y, _ = attn_bf16(x)
+        y, _ = attn(x)
 
         assert y.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(y))
@@ -707,24 +695,12 @@ class TestPrecision:
             model_dim=model_dim,
             ffn_hidden_dim=ffn_dim,
             swiglu=True,
+            compute_dtype=jnp.bfloat16,
             key=k1,
         )
 
-        # Cast params to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        ffn_bf16 = jax.tree.map(to_bf16, ffn)
-
         x = jax.random.normal(k2, (batch, seq, model_dim)).astype(jnp.bfloat16)
-        out = ffn_bf16(x)
+        out = ffn(x)
 
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))

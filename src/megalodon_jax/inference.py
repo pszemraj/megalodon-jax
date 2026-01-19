@@ -35,7 +35,7 @@ from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache
 def init_cache(
     config: MegalodonConfig,
     batch_size: int,
-    dtype: jnp.dtype = jnp.float32,
+    dtype: jnp.dtype | None = None,
     *,
     allocate_kv: bool = False,
     allocate_norm: bool = False,
@@ -45,7 +45,7 @@ def init_cache(
 
     :param MegalodonConfig config: Model configuration.
     :param int batch_size: Batch size for cached tensors.
-    :param jnp.dtype dtype: Floating dtype for cached arrays.
+    :param jnp.dtype | None dtype: Floating dtype for cached arrays (defaults to config.compute_dtype).
     :param bool allocate_kv: Whether to pre-allocate KV buffers.
     :param bool allocate_norm: Whether to pre-allocate TimestepNorm state.
     :param bool allocate_ema: Whether to pre-allocate ComplexEMA state.
@@ -53,6 +53,7 @@ def init_cache(
     """
 
     cache_len = config.effective_max_cache_len
+    cache_dtype = config.compute_dtype if dtype is None else dtype
     num_heads = config.num_heads
     head_dim = config.head_dim
     value_head_dim = config.value_head_dim
@@ -64,8 +65,8 @@ def init_cache(
         """
         if not allocate_kv:
             return None
-        k = jnp.zeros((batch_size, cache_len, num_heads, head_dim), dtype=dtype)
-        v = jnp.zeros((batch_size, cache_len, num_heads, value_head_dim), dtype=dtype)
+        k = jnp.zeros((batch_size, cache_len, num_heads, head_dim), dtype=cache_dtype)
+        v = jnp.zeros((batch_size, cache_len, num_heads, value_head_dim), dtype=cache_dtype)
         return AttentionCache(k=k, v=v, count=jnp.array(0, dtype=jnp.int32))
 
     def make_norm_state() -> NormState:

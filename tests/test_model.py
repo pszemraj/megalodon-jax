@@ -12,6 +12,7 @@ import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.convert import load_weights_from_torch
+from megalodon_jax.precision import audit_sensitive_param_dtypes
 from tests.utils import to_jax
 
 
@@ -1053,29 +1054,17 @@ class TestFix2PadTokenMasking:
             chunk_size=16,
             norm_num_groups=8,
             pad_token_id=0,
+            compute_dtype=jnp.bfloat16,
         )
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
 
-        # Cast model to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        model_bf16 = jax.tree.map(to_bf16, model)
-
         # Create input with pad tokens
         input_ids = jnp.array([[5, 0, 10, 0, 15]])
 
         # Forward pass should preserve bf16 dtype
-        hidden, _ = model_bf16(input_ids, return_cache=False)
+        hidden, _ = model(input_ids, return_cache=False)
 
         assert hidden.dtype == jnp.bfloat16, (
             f"Expected bf16 output, got {hidden.dtype}. Pad masking may be upcasting to float32."
@@ -1808,32 +1797,20 @@ class TestEdgeCases:
             cema_ndim=4,
             chunk_size=16,
             norm_num_groups=8,
+            compute_dtype=jnp.bfloat16,
         )
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
 
-        # Cast model to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        model_bf16 = jax.tree.map(to_bf16, model)
-
         # Empty batch (B=0)
         empty_batch = jnp.zeros((0, 16), dtype=jnp.int32)
-        logits_b0, _ = model_bf16(empty_batch, return_cache=False)
+        logits_b0, _ = model(empty_batch, return_cache=False)
         assert logits_b0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_b0.dtype}"
 
         # Empty sequence (L=0)
         empty_seq = jnp.zeros((2, 0), dtype=jnp.int32)
-        logits_l0, _ = model_bf16(empty_seq, return_cache=False)
+        logits_l0, _ = model(empty_seq, return_cache=False)
         assert logits_l0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_l0.dtype}"
 
     def test_vocab_bounds_input_ids_raises(self, random_seed: int) -> None:
@@ -1909,33 +1886,60 @@ class TestEdgeCases:
             cema_ndim=4,
             chunk_size=16,
             norm_num_groups=8,
+            compute_dtype=jnp.bfloat16,
         )
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
 
-        # Cast model to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        model_bf16 = jax.tree.map(to_bf16, model)
-
         # Single token sequence (becomes empty after shift)
         input_ids = jnp.array([[1]])
         labels = jnp.array([[2]])
 
-        loss = model_bf16.compute_loss(input_ids, labels)
+        loss = model.compute_loss(input_ids, labels)
 
         # Loss should be bf16 (matching logits dtype), not float32
         assert loss.dtype == jnp.bfloat16, f"Expected bfloat16, got {loss.dtype}"
         assert loss == 0.0
+
+
+class TestPrecisionAudit:
+    """Tests for precision policy audits."""
+
+    def test_sensitive_params_fp32(self, random_seed: int) -> None:
+        """Ensure sensitive params remain fp32 by default and audit detects drift.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        config = MegalodonConfig(
+            vocab_size=128,
+            model_dim=64,
+            num_layers=1,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=8,
+            norm_num_groups=8,
+            compute_dtype=jnp.bfloat16,
+        )
+
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        mismatches = audit_sensitive_param_dtypes(model)
+        assert mismatches == {}
+
+        def to_bf16(x: Any) -> Any:
+            if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(jnp.bfloat16)
+            return x
+
+        model_bf16 = jax.tree.map(to_bf16, model)
+        mismatches = audit_sensitive_param_dtypes(model_bf16)
+        assert "layers.0.attn.cema.alpha" in mismatches
 
 
 class TestComplexEMAMask:
