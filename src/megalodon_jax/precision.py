@@ -27,7 +27,11 @@ from megalodon_jax.model import MegalodonForCausalLM, MegalodonModel
 def _iter_sensitive_params(
     model: MegalodonForCausalLM | MegalodonModel,
 ) -> Iterable[tuple[str, Array]]:
-    """Yield (name, array) pairs for precision-sensitive parameters."""
+    """Yield (name, array) pairs for precision-sensitive parameters.
+
+    :param model: Model to inspect for sensitive parameters.
+    :return Iterable[tuple[str, Array]]: Pairs of parameter name and array.
+    """
     core = model.model if isinstance(model, MegalodonForCausalLM) else model
 
     for i, layer in enumerate(core.layers):

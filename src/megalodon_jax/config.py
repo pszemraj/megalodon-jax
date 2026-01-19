@@ -112,27 +112,42 @@ class MegalodonConfig:
 
     @property
     def head_dim(self) -> int:
-        """Per-head dimension for Q/K projection."""
+        """Per-head dimension for Q/K projection.
+
+        :return int: z_dim divided by num_heads.
+        """
         return self.z_dim // self.num_heads
 
     @property
     def value_head_dim(self) -> int:
-        """Per-head dimension for value projection."""
+        """Per-head dimension for value projection.
+
+        :return int: value_dim divided by num_heads.
+        """
         return self.value_dim // self.num_heads
 
     @property
     def effective_rope_base(self) -> float:
-        """RoPE frequency base, defaulting to 10000.0 if not specified."""
+        """RoPE frequency base, defaulting to 10000.0 if not specified.
+
+        :return float: rope_base if set, otherwise 10000.0.
+        """
         return self.rope_base if self.rope_base is not None else 10000.0
 
     @property
     def effective_max_cache_len(self) -> int:
-        """Max cache length, defaulting to chunk_size if not specified."""
+        """Max cache length, defaulting to chunk_size if not specified.
+
+        :return int: max_cache_len if set, otherwise chunk_size.
+        """
         return self.max_cache_len if self.max_cache_len is not None else self.chunk_size
 
     @classmethod
     def from_7b(cls) -> "MegalodonConfig":
-        """Create configuration for 7B parameter model."""
+        """Create configuration for 7B parameter model.
+
+        :return MegalodonConfig: Config with 7B-scale hyperparameters.
+        """
         return cls(
             model_dim=4096,
             num_layers=32,

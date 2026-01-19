@@ -106,7 +106,12 @@ def convert_jax_to_torch(
     """
 
     def convert(arr: Any, *, dtype_override: torch.dtype | None = None) -> torch.Tensor:
-        """Convert a leaf array with optional dtype override."""
+        """Convert a leaf array with optional dtype override.
+
+        :param Any arr: JAX array or scalar to convert.
+        :param torch.dtype | None dtype_override: Override dtype for this tensor.
+        :return torch.Tensor: Converted PyTorch tensor.
+        """
         use_dtype = dtype_override if dtype_override is not None else dtype
         return _to_torch_tensor(arr, dtype=use_dtype)
 
