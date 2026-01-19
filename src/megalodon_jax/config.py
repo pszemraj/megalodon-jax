@@ -19,7 +19,7 @@ from typing import Literal
 import jax.numpy as jnp
 
 InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
-GemmBackend = Literal["default", "mxfp8", "nvfp4"]
+GemmBackend = Literal["default"]
 
 
 @dataclass(frozen=True)
@@ -104,9 +104,10 @@ class MegalodonConfig:
                 raise ValueError(f"{name} must be a floating dtype, got {dtype}")
             if dtype == jnp.float16:
                 raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
-        if self.gemm_backend not in ("default", "mxfp8", "nvfp4"):
+        if self.gemm_backend != "default":
             raise ValueError(
-                f"gemm_backend must be one of default/mxfp8/nvfp4, got {self.gemm_backend}"
+                f"gemm_backend must be 'default' until other backends are implemented, got "
+                f"{self.gemm_backend}"
             )
 
     @property
