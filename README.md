@@ -129,8 +129,12 @@ src/megalodon_jax/
 
 ## Precision
 
-- Float32 for numerical stability
-- BFloat16 compatible via explicit bf16 parameters with fp32 accumulators where required
+- Parameters use `param_dtype` (default float32); compute uses `compute_dtype` (default float32).
+- Set `compute_dtype=jnp.bfloat16` for AMP-style bf16 compute while keeping sensitive params in fp32.
+- Use `accum_dtype` and `softmax_dtype` to keep GEMM accumulation and loss math in fp32.
+- Use `megalodon_jax.precision.audit_sensitive_param_dtypes` to verify fp32-sensitive params.
+- Avoid blanket `jax.tree.map` casts to bf16; use the config dtypes or `ensure_sensitive_param_dtype`.
+- See `docs/dtypes-and-stability.md` for downstream training guidance.
 - **Never use float16** (EMA/FFT overflow)
 
 ## Performance

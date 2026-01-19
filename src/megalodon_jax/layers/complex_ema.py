@@ -79,8 +79,8 @@ class ComplexEMA(eqx.Module):
         k1, k2, k3, k4, k5 = jax.random.split(key, 5)
 
         # alpha & delta (logit space): normal(0, 0.2)
-        self.alpha = jax.random.normal(k1, (embed_dim, ndim, 1)) * 0.2
-        self.delta = jax.random.normal(k2, (embed_dim, ndim, 1)) * 0.2
+        self.alpha = jax.random.normal(k1, (embed_dim, ndim, 1), dtype=jnp.float32) * 0.2
+        self.delta = jax.random.normal(k2, (embed_dim, ndim, 1), dtype=jnp.float32) * 0.2
 
         # theta (logit space): inverse-sigmoid of permuted frequency schedule
         freqs = math.log(embed_dim) / float(embed_dim)
@@ -95,11 +95,13 @@ class ComplexEMA(eqx.Module):
         self.theta = freqs.reshape(embed_dim, 1, 1)
 
         # gamma: real part normal(0, 1), imaginary part zeros
-        self.gamma_real = jax.random.normal(k4, (embed_dim, ndim))
-        self.gamma_imag = jnp.zeros((embed_dim, ndim))
+        self.gamma_real = jax.random.normal(k4, (embed_dim, ndim), dtype=jnp.float32)
+        self.gamma_imag = jnp.zeros((embed_dim, ndim), dtype=jnp.float32)
 
         # omega: truncated normal(0, 0.25, -1, 1)
-        self.omega = jax.random.truncated_normal(k5, -4.0, 4.0, (embed_dim,)) * 0.25
+        self.omega = (
+            jax.random.truncated_normal(k5, -4.0, 4.0, (embed_dim,), dtype=jnp.float32) * 0.25
+        )
 
     def _coeffs(
         self,

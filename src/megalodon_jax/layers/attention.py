@@ -27,8 +27,6 @@ Key design decisions:
 - All counters are JAX arrays (not Python ints) to prevent recompilation
 """
 
-import math
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -39,6 +37,7 @@ from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.timestep_norm import TimestepNorm
+from megalodon_jax.ops import linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
 from megalodon_jax.utils import reinit_linear_weights
 
@@ -47,26 +46,12 @@ from megalodon_jax.utils import reinit_linear_weights
 # -----------------------------------------------------------------------------
 
 
-def _linear_3d(
-    linear: eqx.nn.Linear, x: Float[Array, "batch seq in_dim"]
-) -> Float[Array, "batch seq out_dim"]:
-    """Apply an Equinox Linear over a (batch, seq, dim) tensor.
-
-    :param eqx.nn.Linear linear: Linear module to apply.
-    :param jax.Array x: Input tensor of shape (batch, seq, in_dim).
-    :return jax.Array: Output tensor of shape (batch, seq, out_dim).
-    """
-    y = jnp.matmul(x, linear.weight.T)
-    if linear.bias is not None:
-        y = y + linear.bias
-    return y
-
-
 def attention_single_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch kv_seq heads head_dim"],
     v: Float[Array, "batch kv_seq heads value_dim"],
     kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    accum_dtype: jnp.dtype = jnp.float32,
     causal: bool = True,
     dropout_rate: float = 0.0,
     deterministic: bool = True,
@@ -82,6 +67,7 @@ def attention_single_chunk(
     :param jax.Array k: Key tensor of shape (batch, kv_seq, heads, head_dim).
     :param jax.Array v: Value tensor of shape (batch, kv_seq, heads, value_dim).
     :param jax.Array | None kv_mask: Optional mask where True marks valid positions.
+    :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param bool causal: Whether to apply causal masking.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
@@ -99,12 +85,12 @@ def attention_single_chunk(
 
     # Compute attention scores: (B, H, L_q, L_kv)
     # NO scaling by 1/sqrt(d_k) - this is normalized attention
-    # Keep inputs in native dtype but accumulate in float32 for stability/perf.
+    # Keep inputs in native dtype but accumulate in accum_dtype for stability/perf.
     scores = jnp.einsum(
         "bqhd,bkhd->bhqk",
         q,
         k,
-        preferred_element_type=jnp.float32,
+        preferred_element_type=accum_dtype,
     )
 
     # Build attention mask
@@ -149,7 +135,7 @@ def attention_single_chunk(
         "bhqk,bkhd->bqhd",
         attn_weights,
         v,
-        preferred_element_type=jnp.float32,
+        preferred_element_type=accum_dtype,
     )
 
     return out.astype(q.dtype)
@@ -163,6 +149,7 @@ def attention_multi_chunk(
     start_index: Int[Array, ""],
     rotary: RotaryEmbedding,
     mask: Bool[Array, "batch seq"] | None = None,
+    accum_dtype: jnp.dtype = jnp.float32,
     dropout_rate: float = 0.0,
     deterministic: bool = True,
     key: PRNGKeyArray | None = None,
@@ -180,6 +167,7 @@ def attention_multi_chunk(
     :param jax.Array start_index: Absolute position offset for RoPE (JAX scalar).
     :param RotaryEmbedding rotary: RotaryEmbedding module for position encoding.
     :param jax.Array | None mask: Optional mask where True marks valid positions.
+    :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
     :param PRNGKeyArray | None key: PRNG key for dropout.
@@ -200,6 +188,7 @@ def attention_multi_chunk(
             k_rot,
             v,
             kv_mask=mask,
+            accum_dtype=accum_dtype,
             causal=True,
             dropout_rate=dropout_rate,
             deterministic=deterministic,
@@ -235,6 +224,7 @@ def attention_multi_chunk(
         k_rot,
         v_chunked,
         kv_mask=mask_chunked,
+        accum_dtype=accum_dtype,
         dropout_rate=dropout_rate,
         deterministic=deterministic,
         key=key,
@@ -285,6 +275,7 @@ class ChunkedAttention(eqx.Module):
         cache_unbounded: If True, disables chunk boundary resets (but buffer
             is still bounded by max_cache_len for JIT compatibility).
         attention_dropout: Dropout rate for attention weights.
+        accum_dtype: Accumulation dtype for attention matmuls.
         rotary: RotaryEmbedding module.
     """
 
@@ -295,6 +286,7 @@ class ChunkedAttention(eqx.Module):
     max_cache_len: int = eqx.field(static=True)
     cache_unbounded: bool = eqx.field(static=True)
     attention_dropout: float = eqx.field(static=True)
+    accum_dtype: jnp.dtype = eqx.field(static=True)
 
     rotary: RotaryEmbedding
 
@@ -308,6 +300,7 @@ class ChunkedAttention(eqx.Module):
         max_cache_len: int | None = None,
         cache_unbounded: bool = False,
         attention_dropout: float = 0.0,
+        accum_dtype: jnp.dtype = jnp.float32,
         *,
         key: PRNGKeyArray,
     ):
@@ -321,6 +314,7 @@ class ChunkedAttention(eqx.Module):
         :param int | None max_cache_len: Maximum cache length; None/-1 uses chunk_size; >chunk_size enables sliding window.
         :param bool cache_unbounded: If True, disables chunk boundary resets while keeping a bounded buffer for JIT compatibility.
         :param float attention_dropout: Dropout rate for attention weights.
+        :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.num_heads = num_heads
@@ -334,6 +328,7 @@ class ChunkedAttention(eqx.Module):
             self.max_cache_len = max_cache_len
         self.cache_unbounded = cache_unbounded
         self.attention_dropout = attention_dropout
+        self.accum_dtype = accum_dtype
         self.rotary = RotaryEmbedding(dim=head_dim, base=rope_base)
 
     def __call__(
@@ -381,6 +376,7 @@ class ChunkedAttention(eqx.Module):
                 start_index=position,
                 rotary=self.rotary,
                 mask=mask,
+                accum_dtype=self.accum_dtype,
                 dropout_rate=self.attention_dropout,
                 deterministic=deterministic,
                 key=key,
@@ -584,6 +580,7 @@ class ChunkedAttention(eqx.Module):
                     c_k_step,
                     c_v_step,
                     kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
                     causal=False,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -735,6 +732,7 @@ class ChunkedAttention(eqx.Module):
                     k_cat,
                     v_cat,
                     kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
                     causal=True,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -752,6 +750,7 @@ class ChunkedAttention(eqx.Module):
                     k_rot,
                     v_blk,
                     kv_mask=mask_blk if mask_blk is not None else None,
+                    accum_dtype=self.accum_dtype,
                     causal=True,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -851,6 +850,7 @@ class ChunkedAttention(eqx.Module):
                     c_k_step,
                     c_v_step,
                     kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
                     causal=False,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -1047,6 +1047,10 @@ class MegalodonAttention(eqx.Module):
     norm_eps: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
+    param_dtype: jnp.dtype = eqx.field(static=True)
+    compute_dtype: jnp.dtype = eqx.field(static=True)
+    accum_dtype: jnp.dtype = eqx.field(static=True)
+    gemm_backend: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1065,6 +1069,10 @@ class MegalodonAttention(eqx.Module):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         hidden_dropout: float = 0.0,
+        param_dtype: jnp.dtype = jnp.float32,
+        compute_dtype: jnp.dtype = jnp.float32,
+        accum_dtype: jnp.dtype = jnp.float32,
+        gemm_backend: str = "default",
         *,
         key: PRNGKeyArray,
     ):
@@ -1085,6 +1093,10 @@ class MegalodonAttention(eqx.Module):
         :param float dropout: Output dropout rate.
         :param float attention_dropout: Attention weight dropout rate.
         :param float hidden_dropout: Hidden layer dropout rate.
+        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
+        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
+        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
+        :param str gemm_backend: GEMM backend selector.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.model_dim = model_dim
@@ -1096,6 +1108,10 @@ class MegalodonAttention(eqx.Module):
         self.norm_eps = norm_eps
         self.dropout = dropout
         self.hidden_dropout = hidden_dropout
+        self.param_dtype = param_dtype
+        self.compute_dtype = compute_dtype
+        self.accum_dtype = accum_dtype
+        self.gemm_backend = gemm_backend
 
         # Split keys
         keys = jax.random.split(key, 9)
@@ -1115,19 +1131,20 @@ class MegalodonAttention(eqx.Module):
             max_cache_len=max_cache_len,
             cache_unbounded=cache_unbounded,
             attention_dropout=attention_dropout,
+            accum_dtype=accum_dtype,
             key=keys[1],
         )
 
         # Projections
-        self.wz = eqx.nn.Linear(model_dim, z_dim, key=keys[2])
-        self.wv = eqx.nn.Linear(model_dim, value_dim, key=keys[3])
-        self.wr = eqx.nn.Linear(model_dim, value_dim, key=keys[4])
-        self.wh1 = eqx.nn.Linear(model_dim, model_dim, key=keys[5])
-        self.wh2 = eqx.nn.Linear(value_dim, model_dim, key=keys[6])
+        self.wz = eqx.nn.Linear(model_dim, z_dim, dtype=param_dtype, key=keys[2])
+        self.wv = eqx.nn.Linear(model_dim, value_dim, dtype=param_dtype, key=keys[3])
+        self.wr = eqx.nn.Linear(model_dim, value_dim, dtype=param_dtype, key=keys[4])
+        self.wh1 = eqx.nn.Linear(model_dim, model_dim, dtype=param_dtype, key=keys[5])
+        self.wh2 = eqx.nn.Linear(value_dim, model_dim, dtype=param_dtype, key=keys[6])
 
         # Per-head affine parameters (gamma+1 parameterization, init zeros)
-        self.gamma = jnp.zeros((2, z_dim))
-        self.beta = jnp.zeros((2, z_dim))
+        self.gamma = jnp.zeros((2, z_dim), dtype=jnp.float32)
+        self.beta = jnp.zeros((2, z_dim), dtype=jnp.float32)
 
     def __call__(
         self,
@@ -1152,6 +1169,8 @@ class MegalodonAttention(eqx.Module):
         H = self.num_heads
         Dh = self.head_dim
         Dv = self.value_head_dim
+
+        x = x.astype(self.compute_dtype)
 
         # Split keys for dropout (4 keys: attention, mx_dropout, gated_dropout, output_dropout)
         if key is not None:
@@ -1186,33 +1205,36 @@ class MegalodonAttention(eqx.Module):
             mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
 
         # Shared Z projection for Q/K
-        z = _linear_3d(self.wz, mx)  # (B, L, z_dim)
+        z = linear_3d(
+            self.wz, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend
+        )  # (B, L, z_dim)
         z = z.reshape(B, L, H, Dh)
 
         # Per-head RMS normalization (in fp32 for stability)
         z_f32 = z.astype(jnp.float32)
         rms = jnp.sqrt(jnp.mean(z_f32**2, axis=-1, keepdims=True) + self.norm_eps)
-        z_normed = (z_f32 / rms).astype(z.dtype)
+        z_normed = z_f32 / rms
 
-        # Affine transform to Q and K
+        # Affine transform to Q and K in fp32 for stability
         # gamma, beta: (2, z_dim) -> (2, H, Dh)
-        # Cast to z.dtype to preserve bf16 in mixed-precision
-        gamma_heads = self.gamma.reshape(2, H, Dh).astype(z.dtype)
-        beta_heads = self.beta.reshape(2, H, Dh).astype(z.dtype)
-        scale = (gamma_heads + jnp.asarray(1.0, dtype=z.dtype)) / jnp.asarray(
-            math.sqrt(Dh), dtype=z.dtype
-        )
+        gamma_heads = self.gamma.reshape(2, H, Dh).astype(jnp.float32)
+        beta_heads = self.beta.reshape(2, H, Dh).astype(jnp.float32)
+        scale = (gamma_heads + 1.0) / jnp.sqrt(jnp.asarray(Dh, dtype=jnp.float32))
 
         # Broadcast and apply: z_normed is (B, L, H, Dh)
-        q = z_normed * scale[0] + beta_heads[0]
-        k = z_normed * scale[1] + beta_heads[1]
+        q = (z_normed * scale[0] + beta_heads[0]).astype(self.compute_dtype)
+        k = (z_normed * scale[1] + beta_heads[1]).astype(self.compute_dtype)
 
         # Value projection with SiLU
-        v = jax.nn.silu(_linear_3d(self.wv, x_tn))  # (B, L, value_dim)
+        v = jax.nn.silu(
+            linear_3d(self.wv, x_tn, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+        )  # (B, L, value_dim)
         v = v.reshape(B, L, H, Dv)
 
         # Gate projection with SiLU
-        r = jax.nn.silu(_linear_3d(self.wr, mx))  # (B, L, value_dim)
+        r = jax.nn.silu(
+            linear_3d(self.wr, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+        )  # (B, L, value_dim)
 
         # Inner attention
         out, new_attn_cache, new_position = self.inner(
@@ -1239,7 +1261,9 @@ class MegalodonAttention(eqx.Module):
             gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
 
         # Output projections
-        h = _linear_3d(self.wh1, mx) + _linear_3d(self.wh2, gated)
+        h = linear_3d(
+            self.wh1, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend
+        ) + linear_3d(self.wh2, gated, self.compute_dtype, self.accum_dtype, self.gemm_backend)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k4 is not None:
@@ -1283,6 +1307,10 @@ class MegalodonAttention(eqx.Module):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         hidden_dropout: float = 0.0,
+        param_dtype: jnp.dtype = jnp.float32,
+        compute_dtype: jnp.dtype = jnp.float32,
+        accum_dtype: jnp.dtype = jnp.float32,
+        gemm_backend: str = "default",
         init_mode: InitMode = "gaussian",
         *,
         key: PRNGKeyArray,
@@ -1308,6 +1336,10 @@ class MegalodonAttention(eqx.Module):
         :param float dropout: Output dropout rate.
         :param float attention_dropout: Attention weight dropout rate.
         :param float hidden_dropout: Hidden layer dropout rate.
+        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
+        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
+        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
+        :param str gemm_backend: GEMM backend selector.
         :param InitMode init_mode: Initialization mode for Linear weights.
         :param PRNGKeyArray key: PRNG key for initialization.
         :return MegalodonAttention: Instance with reinitialized weights.
@@ -1329,6 +1361,10 @@ class MegalodonAttention(eqx.Module):
             dropout=dropout,
             attention_dropout=attention_dropout,
             hidden_dropout=hidden_dropout,
+            param_dtype=param_dtype,
+            compute_dtype=compute_dtype,
+            accum_dtype=accum_dtype,
+            gemm_backend=gemm_backend,
             key=key1,
         )
         if init_mode != "none":
@@ -1366,6 +1402,10 @@ class NormalizedFFN(eqx.Module):
     hidden_dropout: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
     alpha: float | None = eqx.field(static=True)  # Residual rescale factor
+    param_dtype: jnp.dtype = eqx.field(static=True)
+    compute_dtype: jnp.dtype = eqx.field(static=True)
+    accum_dtype: jnp.dtype = eqx.field(static=True)
+    gemm_backend: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1378,6 +1418,10 @@ class NormalizedFFN(eqx.Module):
         layer_id: int = 0,
         hidden_dropout: float = 0.0,
         dropout: float = 0.0,
+        param_dtype: jnp.dtype = jnp.float32,
+        compute_dtype: jnp.dtype = jnp.float32,
+        accum_dtype: jnp.dtype = jnp.float32,
+        gemm_backend: str = "default",
         *,
         key: PRNGKeyArray,
     ):
@@ -1392,6 +1436,10 @@ class NormalizedFFN(eqx.Module):
         :param int layer_id: Layer index for computing rescale factor (0-indexed).
         :param float hidden_dropout: Dropout after hidden layer.
         :param float dropout: Dropout after output projection.
+        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
+        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
+        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
+        :param str gemm_backend: GEMM backend selector.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.model_dim = model_dim
@@ -1399,17 +1447,21 @@ class NormalizedFFN(eqx.Module):
         self.swiglu = swiglu
         self.hidden_dropout = hidden_dropout
         self.dropout = dropout
+        self.param_dtype = param_dtype
+        self.compute_dtype = compute_dtype
+        self.accum_dtype = accum_dtype
+        self.gemm_backend = gemm_backend
         # Compute rescale alpha: 0.1 * (0.5 ** layer_id)
         self.alpha = (0.1 * (0.5**layer_id)) if rescale else None
 
         keys = jax.random.split(key, 3)
 
         self.norm = BatchedLayerNorm(model_dim, eps=norm_eps, affine=norm_affine)
-        self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, key=keys[0])
-        self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, key=keys[1])
+        self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, dtype=param_dtype, key=keys[0])
+        self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, dtype=param_dtype, key=keys[1])
 
         if swiglu:
-            self.fc3 = eqx.nn.Linear(model_dim, ffn_hidden_dim, key=keys[2])
+            self.fc3 = eqx.nn.Linear(model_dim, ffn_hidden_dim, dtype=param_dtype, key=keys[2])
         else:
             self.fc3 = None
 
@@ -1428,16 +1480,21 @@ class NormalizedFFN(eqx.Module):
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :return jax.Array: Output tensor of shape (batch, seq, dim).
         """
-        residual = x if residual_base is None else residual_base
+        x = x.astype(self.compute_dtype)
+        residual = x if residual_base is None else residual_base.astype(self.compute_dtype)
 
         # Layer norm (BatchedLayerNorm handles leading dims).
         h = self.norm(x)
 
         # Hidden layer with activation
         if self.swiglu:
-            h = jax.nn.silu(_linear_3d(self.fc1, h)) * _linear_3d(self.fc3, h)
+            h = jax.nn.silu(
+                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            ) * linear_3d(self.fc3, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
         else:
-            h = jax.nn.silu(_linear_3d(self.fc1, h))
+            h = jax.nn.silu(
+                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            )
 
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
@@ -1453,7 +1510,7 @@ class NormalizedFFN(eqx.Module):
             k2 = key
 
         # Output projection
-        out = _linear_3d(self.fc2, h)
+        out = linear_3d(self.fc2, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k2 is not None:
@@ -1479,6 +1536,10 @@ class NormalizedFFN(eqx.Module):
         layer_id: int = 0,
         hidden_dropout: float = 0.0,
         dropout: float = 0.0,
+        param_dtype: jnp.dtype = jnp.float32,
+        compute_dtype: jnp.dtype = jnp.float32,
+        accum_dtype: jnp.dtype = jnp.float32,
+        gemm_backend: str = "default",
         init_mode: InitMode = "gaussian",
         *,
         key: PRNGKeyArray,
@@ -1498,6 +1559,10 @@ class NormalizedFFN(eqx.Module):
         :param int layer_id: Layer index for computing rescale factor (0-indexed).
         :param float hidden_dropout: Dropout after hidden layer.
         :param float dropout: Dropout after output projection.
+        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
+        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
+        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
+        :param str gemm_backend: GEMM backend selector.
         :param InitMode init_mode: Initialization mode for Linear weights.
         :param PRNGKeyArray key: PRNG key for initialization.
         :return NormalizedFFN: Instance with reinitialized weights.
@@ -1513,6 +1578,10 @@ class NormalizedFFN(eqx.Module):
             layer_id=layer_id,
             hidden_dropout=hidden_dropout,
             dropout=dropout,
+            param_dtype=param_dtype,
+            compute_dtype=compute_dtype,
+            accum_dtype=accum_dtype,
+            gemm_backend=gemm_backend,
             key=key1,
         )
         if init_mode != "none":

@@ -59,7 +59,7 @@ class RMSNorm(eqx.Module):
         self.eps = eps
         self.affine = affine
         if affine:
-            self.gamma = jnp.zeros(dim)
+            self.gamma = jnp.zeros(dim, dtype=jnp.float32)
         else:
             self.gamma = None
 

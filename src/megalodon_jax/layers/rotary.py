@@ -74,14 +74,14 @@ class RotaryEmbedding(eqx.Module):
         seq_len = q.shape[1]
 
         # Compute positions: [start_index, start_index+1, ..., start_index+seq_len-1]
-        positions = jnp.arange(seq_len, dtype=jnp.float32) + start_index
+        positions = jnp.arange(seq_len, dtype=jnp.float32) + start_index.astype(jnp.float32)
 
-        # Compute angles: (seq, half_dim)
+        # Compute angles in fp32: (seq, half_dim)
         angles = positions[:, None] * self.inv_freq[None, :]
 
-        # Compute cos/sin in input dtype
-        cos = jnp.cos(angles).astype(q.dtype)  # (seq, half_dim)
-        sin = jnp.sin(angles).astype(q.dtype)  # (seq, half_dim)
+        # Compute cos/sin in fp32 for numerical stability
+        cos = jnp.cos(angles)  # (seq, half_dim)
+        sin = jnp.sin(angles)  # (seq, half_dim)
 
         # Reshape for broadcasting: (1, seq, 1, half_dim)
         cos = cos[None, :, None, :]
@@ -89,11 +89,13 @@ class RotaryEmbedding(eqx.Module):
 
         # Split into real/imag pairs (first half, second half)
         half = self.dim // 2
-        q1, q2 = q[..., :half], q[..., half:]
-        k1, k2 = k[..., :half], k[..., half:]
+        q1 = q[..., :half].astype(jnp.float32)
+        q2 = q[..., half:].astype(jnp.float32)
+        k1 = k[..., :half].astype(jnp.float32)
+        k2 = k[..., half:].astype(jnp.float32)
 
         # Apply rotation: (a + ib)(cos + i*sin) = (a*cos - b*sin) + i(b*cos + a*sin)
         q_rot = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
         k_rot = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
-        return q_rot, k_rot
+        return q_rot.astype(q.dtype), k_rot.astype(k.dtype)

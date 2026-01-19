@@ -16,7 +16,10 @@
 from dataclasses import dataclass
 from typing import Literal
 
+import jax.numpy as jnp
+
 InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
+GemmBackend = Literal["default"]
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,9 @@ class MegalodonConfig:
 
     This is a frozen dataclass (immutable and hashable) that defines all
     hyperparameters for the Megalodon architecture.
+    The dtype policy separates parameter storage (param_dtype) from compute
+    (compute_dtype), with explicit GEMM accumulation (accum_dtype) and
+    softmax/loss dtypes for AMP-style behavior in JAX.
     """
 
     vocab_size: int = 32_000
@@ -55,6 +61,11 @@ class MegalodonConfig:
     init_mode: InitMode = "gaussian"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
     output_size: int = -1  # LM head size; -1 ties to vocab_size
+    param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
+    compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations
+    accum_dtype: jnp.dtype = jnp.float32  # Accumulation dtype for GEMM/reductions
+    softmax_dtype: jnp.dtype = jnp.float32  # Softmax/log-softmax dtype
+    gemm_backend: GemmBackend = "default"
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
@@ -83,30 +94,62 @@ class MegalodonConfig:
             raise ValueError("max_cache_len must be positive when provided.")
         if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
             raise ValueError("max_cache_len must be >= chunk_size to preserve causal attention.")
+        for name, dtype in (
+            ("param_dtype", self.param_dtype),
+            ("compute_dtype", self.compute_dtype),
+            ("accum_dtype", self.accum_dtype),
+            ("softmax_dtype", self.softmax_dtype),
+        ):
+            if not jnp.issubdtype(dtype, jnp.floating):
+                raise ValueError(f"{name} must be a floating dtype, got {dtype}")
+            if dtype == jnp.float16:
+                raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
+        if self.gemm_backend != "default":
+            raise ValueError(
+                f"gemm_backend must be 'default' until other backends are implemented, got "
+                f"{self.gemm_backend}"
+            )
+        if jnp.finfo(self.accum_dtype).bits < jnp.finfo(self.compute_dtype).bits:
+            raise ValueError("accum_dtype should be >= compute_dtype for stable accumulation.")
 
     @property
     def head_dim(self) -> int:
-        """Per-head dimension for Q/K projection."""
+        """Per-head dimension for Q/K projection.
+
+        :return int: z_dim divided by num_heads.
+        """
         return self.z_dim // self.num_heads
 
     @property
     def value_head_dim(self) -> int:
-        """Per-head dimension for value projection."""
+        """Per-head dimension for value projection.
+
+        :return int: value_dim divided by num_heads.
+        """
         return self.value_dim // self.num_heads
 
     @property
     def effective_rope_base(self) -> float:
-        """RoPE frequency base, defaulting to 10000.0 if not specified."""
+        """RoPE frequency base, defaulting to 10000.0 if not specified.
+
+        :return float: rope_base if set, otherwise 10000.0.
+        """
         return self.rope_base if self.rope_base is not None else 10000.0
 
     @property
     def effective_max_cache_len(self) -> int:
-        """Max cache length, defaulting to chunk_size if not specified."""
+        """Max cache length, defaulting to chunk_size if not specified.
+
+        :return int: max_cache_len if set, otherwise chunk_size.
+        """
         return self.max_cache_len if self.max_cache_len is not None else self.chunk_size
 
     @classmethod
     def from_7b(cls) -> "MegalodonConfig":
-        """Create configuration for 7B parameter model."""
+        """Create configuration for 7B parameter model.
+
+        :return MegalodonConfig: Config with 7B-scale hyperparameters.
+        """
         return cls(
             model_dim=4096,
             num_layers=32,

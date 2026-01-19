@@ -26,6 +26,7 @@ If a boolean `mask` is provided, masked positions are zeroed before the recurren
 
 ## Stability Notes
 
+- Parameters are stored in float32 to avoid bf16 quantization of EMA dynamics.
 - Coefficients are computed in float32/complex64 regardless of parameter dtype.
 - `|q| < 1` by construction, ensuring a decaying impulse response.
 - Kernel powers use magnitude/phase (`|q|^t * exp(i * phi * t)`) to avoid numerical issues with cumprod or `log(0)`.

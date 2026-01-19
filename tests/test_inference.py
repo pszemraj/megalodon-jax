@@ -548,6 +548,11 @@ class TestConversion:
         config_kwargs = asdict(config)
         config_kwargs["gradient_checkpointing"] = config.use_checkpoint
         config_kwargs.pop("use_checkpoint", None)
+        config_kwargs.pop("param_dtype", None)
+        config_kwargs.pop("compute_dtype", None)
+        config_kwargs.pop("accum_dtype", None)
+        config_kwargs.pop("softmax_dtype", None)
+        config_kwargs.pop("gemm_backend", None)
         torch_config = megalodon.MegalodonConfig(**config_kwargs)
         torch_model = megalodon.MegalodonForCausalLM(torch_config).eval()
 
@@ -703,8 +708,14 @@ class TestConversion:
         state_dict = convert_jax_to_torch(model, dtype=torch.bfloat16)
 
         assert state_dict["model.embed.weight"].dtype == torch.bfloat16
+        assert state_dict["model.layers.0.attn.cema.alpha"].dtype == torch.float32
+        assert state_dict["model.layers.0.attn.cema.delta"].dtype == torch.float32
+        assert state_dict["model.layers.0.attn.cema.theta"].dtype == torch.float32
         assert state_dict["model.layers.0.attn.cema.gamma_real"].dtype == torch.float32
         assert state_dict["model.layers.0.attn.cema.gamma_imag"].dtype == torch.float32
+        assert state_dict["model.layers.0.attn.cema.omega"].dtype == torch.float32
+        assert state_dict["model.layers.0.attn.gamma"].dtype == torch.float32
+        assert state_dict["model.layers.0.attn.beta"].dtype == torch.float32
 
     @pytest.mark.torch_ref
     def test_untied_model_export(self) -> None:
@@ -837,6 +848,8 @@ class TestConversion:
 
         # Check that floating point params are bf16
         assert loaded.model.embed.weight.dtype == jnp.bfloat16
+        assert loaded.model.layers[0].attn.cema.alpha.dtype == jnp.float32
+        assert loaded.model.layers[0].attn.gamma.dtype == jnp.float32
 
     def test_missing_file_error(self) -> None:
         """Ensure load_from_pretrained raises for missing files.

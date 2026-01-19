@@ -12,14 +12,20 @@ if TYPE_CHECKING:
 
 
 def _require_torch() -> "torch":
-    """Return torch or skip the caller if torch is unavailable."""
+    """Return torch or skip the caller if torch is unavailable.
+
+    :return torch: The torch module.
+    """
     import pytest
 
     return pytest.importorskip("torch")
 
 
 def _require_megalodon() -> Any:
-    """Return megalodon-hf module or skip the caller if unavailable."""
+    """Return megalodon-hf module or skip the caller if unavailable.
+
+    :return Any: The megalodon module.
+    """
     import pytest
 
     return pytest.importorskip("megalodon")
@@ -46,6 +52,9 @@ def to_torch(a: jnp.ndarray) -> "torch.Tensor":
 
 
 def require_torch_modeling() -> Any:
-    """Return megalodon.modeling_megalodon or skip if missing."""
+    """Return megalodon.modeling_megalodon or skip if missing.
+
+    :return Any: The modeling_megalodon submodule.
+    """
     megalodon = _require_megalodon()
     return megalodon.modeling_megalodon

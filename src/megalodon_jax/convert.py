@@ -32,6 +32,7 @@ from jaxtyping import Array
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
+from megalodon_jax.precision import ensure_sensitive_param_dtype
 
 StateDict = dict[str, Any]
 
@@ -95,6 +96,9 @@ def convert_jax_to_torch(
 ) -> StateDict:
     """Convert a JAX Megalodon model to a PyTorch-style state dict.
 
+    Precision-sensitive parameters (CEMA params, norms, per-head Q/K affine) are
+    exported in fp32 regardless of the requested dtype.
+
     :param MegalodonForCausalLM model: JAX MegalodonForCausalLM to export.
     :param torch.dtype | None dtype: Optional dtype for floating tensors.
     :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
@@ -102,7 +106,12 @@ def convert_jax_to_torch(
     """
 
     def convert(arr: Any, *, dtype_override: torch.dtype | None = None) -> torch.Tensor:
-        """Convert a leaf array with optional dtype override."""
+        """Convert a leaf array with optional dtype override.
+
+        :param Any arr: JAX array or scalar to convert.
+        :param torch.dtype | None dtype_override: Override dtype for this tensor.
+        :return torch.Tensor: Converted PyTorch tensor.
+        """
         use_dtype = dtype_override if dtype_override is not None else dtype
         return _to_torch_tensor(arr, dtype=use_dtype)
 
@@ -116,14 +125,29 @@ def convert_jax_to_torch(
 
         # TimestepNorm
         if layer.attn.timenorm.weight is not None:
-            state_dict[f"{attn_prefix}.timenorm.weight"] = convert(layer.attn.timenorm.weight)
+            state_dict[f"{attn_prefix}.timenorm.weight"] = convert(
+                layer.attn.timenorm.weight,
+                dtype_override=torch.float32,
+            )
         if layer.attn.timenorm.bias is not None:
-            state_dict[f"{attn_prefix}.timenorm.bias"] = convert(layer.attn.timenorm.bias)
+            state_dict[f"{attn_prefix}.timenorm.bias"] = convert(
+                layer.attn.timenorm.bias,
+                dtype_override=torch.float32,
+            )
 
         # CEMA
-        state_dict[f"{attn_prefix}.cema.alpha"] = convert(layer.attn.cema.alpha)
-        state_dict[f"{attn_prefix}.cema.delta"] = convert(layer.attn.cema.delta)
-        state_dict[f"{attn_prefix}.cema.theta"] = convert(layer.attn.cema.theta)
+        state_dict[f"{attn_prefix}.cema.alpha"] = convert(
+            layer.attn.cema.alpha,
+            dtype_override=torch.float32,
+        )
+        state_dict[f"{attn_prefix}.cema.delta"] = convert(
+            layer.attn.cema.delta,
+            dtype_override=torch.float32,
+        )
+        state_dict[f"{attn_prefix}.cema.theta"] = convert(
+            layer.attn.cema.theta,
+            dtype_override=torch.float32,
+        )
         state_dict[f"{attn_prefix}.cema.gamma_real"] = convert(
             layer.attn.cema.gamma_real,
             dtype_override=torch.float32,
@@ -132,11 +156,17 @@ def convert_jax_to_torch(
             layer.attn.cema.gamma_imag,
             dtype_override=torch.float32,
         )
-        state_dict[f"{attn_prefix}.cema.omega"] = convert(layer.attn.cema.omega)
+        state_dict[f"{attn_prefix}.cema.omega"] = convert(
+            layer.attn.cema.omega,
+            dtype_override=torch.float32,
+        )
 
         # RMSNorm
         if layer.attn.rmsnorm.gamma is not None:
-            state_dict[f"{attn_prefix}.rmsnorm.gamma"] = convert(layer.attn.rmsnorm.gamma)
+            state_dict[f"{attn_prefix}.rmsnorm.gamma"] = convert(
+                layer.attn.rmsnorm.gamma,
+                dtype_override=torch.float32,
+            )
 
         # Linear projections
         for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
@@ -145,8 +175,14 @@ def convert_jax_to_torch(
             if proj.bias is not None:
                 state_dict[f"{attn_prefix}.{proj_name}.bias"] = convert(proj.bias)
 
-        state_dict[f"{attn_prefix}.gamma"] = convert(layer.attn.gamma)
-        state_dict[f"{attn_prefix}.beta"] = convert(layer.attn.beta)
+        state_dict[f"{attn_prefix}.gamma"] = convert(
+            layer.attn.gamma,
+            dtype_override=torch.float32,
+        )
+        state_dict[f"{attn_prefix}.beta"] = convert(
+            layer.attn.beta,
+            dtype_override=torch.float32,
+        )
 
         # Rotary embedding (inv_freq is not a persistent buffer in PyTorch)
         if include_rope_inv_freq:
@@ -156,9 +192,15 @@ def convert_jax_to_torch(
 
         # FFN norms
         if layer.ffn.norm.weight is not None:
-            state_dict[f"{ffn_prefix}.norm.weight"] = convert(layer.ffn.norm.weight)
+            state_dict[f"{ffn_prefix}.norm.weight"] = convert(
+                layer.ffn.norm.weight,
+                dtype_override=torch.float32,
+            )
         if layer.ffn.norm.bias is not None:
-            state_dict[f"{ffn_prefix}.norm.bias"] = convert(layer.ffn.norm.bias)
+            state_dict[f"{ffn_prefix}.norm.bias"] = convert(
+                layer.ffn.norm.bias,
+                dtype_override=torch.float32,
+            )
 
         # FFN linear layers
         for fc_name in ["fc1", "fc2", "fc3"]:
@@ -171,9 +213,15 @@ def convert_jax_to_torch(
 
     # Final norm
     if model.model.norm.weight is not None:
-        state_dict["model.norm.weight"] = convert(model.model.norm.weight)
+        state_dict["model.norm.weight"] = convert(
+            model.model.norm.weight,
+            dtype_override=torch.float32,
+        )
     if model.model.norm.bias is not None:
-        state_dict["model.norm.bias"] = convert(model.model.norm.bias)
+        state_dict["model.norm.bias"] = convert(
+            model.model.norm.bias,
+            dtype_override=torch.float32,
+        )
 
     # LM head - always emit for PyTorch strict loading compatibility
     if not model.tied and model.lm_head is not None:
@@ -451,7 +499,7 @@ def load_weights_from_torch(
             lm_head_weight,
         )
 
-    return model
+    return ensure_sensitive_param_dtype(model)
 
 
 def load_from_pretrained(
@@ -467,7 +515,7 @@ def load_from_pretrained(
 
     :param str | Path path: Path to checkpoint file.
     :param MegalodonConfig config: Model configuration.
-    :param jnp.dtype dtype: Target dtype for parameters.
+    :param jnp.dtype dtype: Target dtype for parameters (sensitive params stay fp32).
     :param Array key: PRNG key for model initialization.
     :raises FileNotFoundError: If checkpoint file doesn't exist.
     :return MegalodonForCausalLM: Model with loaded weights.
@@ -510,8 +558,9 @@ def load_from_pretrained(
             return x
 
         model = jax.tree.map(cast_arrays, model)
+        model = ensure_sensitive_param_dtype(model)
 
-    return model
+    return ensure_sensitive_param_dtype(model)
 
 
 def save_safetensors(

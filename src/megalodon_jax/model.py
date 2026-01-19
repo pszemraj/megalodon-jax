@@ -28,6 +28,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
+from megalodon_jax.ops import matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_initializer, reinit_linear_weights
 
@@ -121,6 +122,10 @@ class MegalodonBlock(eqx.Module):
             dropout=config.dropout,
             attention_dropout=config.attention_dropout,
             hidden_dropout=config.hidden_dropout,
+            param_dtype=config.param_dtype,
+            compute_dtype=config.compute_dtype,
+            accum_dtype=config.accum_dtype,
+            gemm_backend=config.gemm_backend,
             key=k1,
         )
 
@@ -134,6 +139,10 @@ class MegalodonBlock(eqx.Module):
             layer_id=layer_id,
             hidden_dropout=config.hidden_dropout,
             dropout=config.dropout,
+            param_dtype=config.param_dtype,
+            compute_dtype=config.compute_dtype,
+            accum_dtype=config.accum_dtype,
+            gemm_backend=config.gemm_backend,
             key=k2,
         )
 
@@ -236,6 +245,7 @@ class MegalodonModel(eqx.Module):
         embed = eqx.nn.Embedding(
             num_embeddings=config.vocab_size,
             embedding_size=config.model_dim,
+            dtype=config.param_dtype,
             key=k_embed,
         )
 
@@ -302,9 +312,9 @@ class MegalodonModel(eqx.Module):
         B, L = input_ids.shape
 
         # Handle empty inputs gracefully (B=0 or L=0)
-        # Use embed dtype to match model's native dtype (e.g., bf16 if autocast applied)
+        # Use compute dtype to match model's output dtype.
         if B == 0 or L == 0:
-            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.embed.weight.dtype)
+            empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.config.compute_dtype)
             if return_cache:
                 # Preserve any existing streaming state when input is empty.
                 empty_cache = (
@@ -340,6 +350,9 @@ class MegalodonModel(eqx.Module):
         # Use dtype-matched zero to avoid upcasting bf16 to float32
         pad_mask = input_ids == self.config.pad_token_id
         x = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=x.dtype), x)
+
+        if x.dtype != self.config.compute_dtype:
+            x = x.astype(self.config.compute_dtype)
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
@@ -468,7 +481,13 @@ class MegalodonForCausalLM(eqx.Module):
             k_model, k_head, k_head_reinit = jax.random.split(key, 3)
             self.model = MegalodonModel(config, key=k_model)
 
-            lm_head = eqx.nn.Linear(config.model_dim, lm_out, use_bias=False, key=k_head)
+            lm_head = eqx.nn.Linear(
+                config.model_dim,
+                lm_out,
+                use_bias=False,
+                dtype=config.param_dtype,
+                key=k_head,
+            )
             # Apply init_mode to untied lm_head
             # For gaussian init, match PyTorch reference: std = 1/sqrt(output_dim)
             if config.init_mode != "none":
@@ -516,12 +535,27 @@ class MegalodonForCausalLM(eqx.Module):
             key=key,
         )
 
+        compute_dtype = self.config.compute_dtype
+        accum_dtype = self.config.accum_dtype
+        gemm_backend = self.config.gemm_backend
         if self.tied:
             # Weight-tied projection
-            logits = hidden @ self.model.embed.weight.T
+            logits = matmul_3d_weight(
+                hidden,
+                self.model.embed.weight,
+                compute_dtype,
+                accum_dtype,
+                gemm_backend,
+            )
         else:
             # Separate LM head
-            logits = jnp.matmul(hidden, self.lm_head.weight.T)
+            logits = matmul_3d_weight(
+                hidden,
+                self.lm_head.weight,
+                compute_dtype,
+                accum_dtype,
+                gemm_backend,
+            )
 
         return logits, cache
 
@@ -579,8 +613,9 @@ class MegalodonForCausalLM(eqx.Module):
 
         # Guard against empty sequences (seq=0 or seq=1 after shift)
         # jnp.mean() on empty array returns NaN, which would poison training
+        softmax_dtype = self.config.softmax_dtype
         if shift_labels.shape[1] == 0:
-            return jnp.zeros((), dtype=shift_logits.dtype)  # Match model dtype
+            return jnp.zeros((), dtype=softmax_dtype)
 
         # Build valid mask: positions that contribute to loss
         # Excludes both ignore_index labels and attention-masked positions
@@ -606,7 +641,8 @@ class MegalodonForCausalLM(eqx.Module):
         safe_labels = jnp.where(valid_mask, shift_labels, 0)
 
         # Cross-entropy loss
-        log_probs = jax.nn.log_softmax(shift_logits, axis=-1)
+        shift_logits_softmax = shift_logits.astype(softmax_dtype)
+        log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
         B, L, V = log_probs.shape
 
         # Gather log prob of correct token
@@ -616,17 +652,11 @@ class MegalodonForCausalLM(eqx.Module):
 
         # Apply valid mask and compute mean over valid positions only
         target_log_probs = jnp.where(
-            valid_mask, target_log_probs, jnp.zeros((), dtype=target_log_probs.dtype)
+            valid_mask, target_log_probs, jnp.zeros((), dtype=softmax_dtype)
         )
 
-        # Accumulate in float32 (or higher) for numerical stability, then cast back
-        # to the model dtype so mixed-precision pipelines preserve bf16 end-to-end.
-        loss_dtype = shift_logits.dtype
-        compute_dtype = jnp.promote_types(loss_dtype, jnp.float32)
-
-        target_log_probs = target_log_probs.astype(compute_dtype)
-        num_valid = valid_mask.sum().astype(compute_dtype)
+        num_valid = valid_mask.sum().astype(softmax_dtype)
         # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=compute_dtype))
+        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=softmax_dtype))
         loss = -target_log_probs.sum() / num_valid
-        return loss.astype(loss_dtype)
+        return loss
