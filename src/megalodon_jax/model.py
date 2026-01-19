@@ -28,6 +28,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
+from megalodon_jax.ops import matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_initializer, reinit_linear_weights
 
@@ -64,30 +65,6 @@ def _stop_if_array(x: Any) -> Any:
     :return Any: Stopped-gradient array or original value.
     """
     return jax.lax.stop_gradient(x) if eqx.is_array(x) else x
-
-
-def _matmul_3d_weight(
-    x: Float[Array, "batch seq in_dim"],
-    weight: Float[Array, "out_dim in_dim"],
-    compute_dtype: jnp.dtype,
-    accum_dtype: jnp.dtype,
-    gemm_backend: str,
-) -> Float[Array, "batch seq out_dim"]:
-    """Apply a weight matrix to a (batch, seq, dim) tensor with compute dtype control.
-
-    :param Float[Array, "batch seq in_dim"] x: Input tensor.
-    :param Float[Array, "out_dim in_dim"] weight: Weight matrix (out_dim, in_dim).
-    :param jnp.dtype compute_dtype: Compute dtype for matmul and output.
-    :param jnp.dtype accum_dtype: Accumulation dtype for GEMM.
-    :param str gemm_backend: GEMM backend selector.
-    :return Float[Array, "batch seq out_dim"]: Output tensor.
-    """
-    if gemm_backend != "default":
-        raise NotImplementedError(f"gemm_backend={gemm_backend} is not implemented yet.")
-    x_c = x.astype(compute_dtype)
-    w_c = weight.astype(compute_dtype)
-    y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
-    return y.astype(compute_dtype)
 
 
 # -----------------------------------------------------------------------------
@@ -563,7 +540,7 @@ class MegalodonForCausalLM(eqx.Module):
         gemm_backend = self.config.gemm_backend
         if self.tied:
             # Weight-tied projection
-            logits = _matmul_3d_weight(
+            logits = matmul_3d_weight(
                 hidden,
                 self.model.embed.weight,
                 compute_dtype,
@@ -572,7 +549,7 @@ class MegalodonForCausalLM(eqx.Module):
             )
         else:
             # Separate LM head
-            logits = _matmul_3d_weight(
+            logits = matmul_3d_weight(
                 hidden,
                 self.lm_head.weight,
                 compute_dtype,

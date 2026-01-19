@@ -37,38 +37,13 @@ from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.timestep_norm import TimestepNorm
+from megalodon_jax.ops import linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
 from megalodon_jax.utils import reinit_linear_weights
 
 # -----------------------------------------------------------------------------
 # Attention Primitives (Pure Functions)
 # -----------------------------------------------------------------------------
-
-
-def _linear_3d(
-    linear: eqx.nn.Linear,
-    x: Float[Array, "batch seq in_dim"],
-    compute_dtype: jnp.dtype,
-    accum_dtype: jnp.dtype,
-    gemm_backend: str,
-) -> Float[Array, "batch seq out_dim"]:
-    """Apply an Equinox Linear over a (batch, seq, dim) tensor.
-
-    :param eqx.nn.Linear linear: Linear module to apply.
-    :param jax.Array x: Input tensor of shape (batch, seq, in_dim).
-    :param jnp.dtype compute_dtype: Compute dtype for matmul and output.
-    :param jnp.dtype accum_dtype: Accumulation dtype for GEMM.
-    :param str gemm_backend: GEMM backend selector.
-    :return jax.Array: Output tensor of shape (batch, seq, out_dim).
-    """
-    if gemm_backend != "default":
-        raise NotImplementedError(f"gemm_backend={gemm_backend} is not implemented yet.")
-    x_c = x.astype(compute_dtype)
-    w_c = linear.weight.astype(compute_dtype)
-    y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
-    if linear.bias is not None:
-        y = y + linear.bias.astype(compute_dtype)
-    return y.astype(compute_dtype)
 
 
 def attention_single_chunk(
@@ -1213,7 +1188,7 @@ class MegalodonAttention(eqx.Module):
             mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
 
         # Shared Z projection for Q/K
-        z = _linear_3d(
+        z = linear_3d(
             self.wz, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend
         )  # (B, L, z_dim)
         z = z.reshape(B, L, H, Dh)
@@ -1235,13 +1210,13 @@ class MegalodonAttention(eqx.Module):
 
         # Value projection with SiLU
         v = jax.nn.silu(
-            _linear_3d(self.wv, x_tn, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            linear_3d(self.wv, x_tn, self.compute_dtype, self.accum_dtype, self.gemm_backend)
         )  # (B, L, value_dim)
         v = v.reshape(B, L, H, Dv)
 
         # Gate projection with SiLU
         r = jax.nn.silu(
-            _linear_3d(self.wr, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            linear_3d(self.wr, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend)
         )  # (B, L, value_dim)
 
         # Inner attention
@@ -1269,9 +1244,9 @@ class MegalodonAttention(eqx.Module):
             gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
 
         # Output projections
-        h = _linear_3d(
+        h = linear_3d(
             self.wh1, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend
-        ) + _linear_3d(self.wh2, gated, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+        ) + linear_3d(self.wh2, gated, self.compute_dtype, self.accum_dtype, self.gemm_backend)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k4 is not None:
@@ -1497,11 +1472,11 @@ class NormalizedFFN(eqx.Module):
         # Hidden layer with activation
         if self.swiglu:
             h = jax.nn.silu(
-                _linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
-            ) * _linear_3d(self.fc3, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            ) * linear_3d(self.fc3, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
         else:
             h = jax.nn.silu(
-                _linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
             )
 
         # Hidden dropout
@@ -1518,7 +1493,7 @@ class NormalizedFFN(eqx.Module):
             k2 = key
 
         # Output projection
-        out = _linear_3d(self.fc2, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+        out = linear_3d(self.fc2, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
 
         # Output dropout
         if not deterministic and self.dropout > 0.0 and k2 is not None:
