@@ -94,9 +94,19 @@ def ensure_sensitive_param_dtype(
     """
 
     def cast_if_present(arr: Array | None) -> Array | None:
+        """Cast array to dtype when present.
+
+        :param Array | None arr: Array to cast (optional).
+        :return Array | None: Casted array or None.
+        """
         return arr.astype(dtype) if arr is not None else None
 
     def update_core(core: MegalodonModel) -> MegalodonModel:
+        """Cast precision-sensitive parameters for a core MegalodonModel.
+
+        :param MegalodonModel core: Model to update.
+        :return MegalodonModel: Updated model.
+        """
         for i, layer in enumerate(core.layers):
             attn = layer.attn
             core = eqx.tree_at(

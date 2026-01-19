@@ -1935,6 +1935,11 @@ class TestPrecisionAudit:
         assert mismatches == {}
 
         def to_bf16(x: Any) -> Any:
+            """Cast floating-point arrays to bf16.
+
+            :param Any x: Input value to cast when floating point.
+            :return Any: Casted value or original input.
+            """
             if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
                 return x.astype(jnp.bfloat16)
             return x
