@@ -15,6 +15,7 @@ MegalodonConfig separates:
 - `gemm_backend`: `"default"` (reserved for future FP8 backends).
 
 Use one of the following:
+TODO: implement the `mxfp8` and `nvfp4` GEMM backends and relax config validation once they exist.
 
 ### 1) Full fp32 (most stable)
 
