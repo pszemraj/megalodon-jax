@@ -648,6 +648,26 @@ class TestPrecision:
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
 
+    def test_attention_accum_dtype_override(self, random_seed: int) -> None:
+        """Test attention primitives accept an accum_dtype override.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        batch, seq, heads, head_dim = 2, 8, 2, 16
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
+        v = jax.random.normal(k3, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
+
+        out = attention_single_chunk(q, k, v, accum_dtype=jnp.bfloat16)
+
+        assert out.dtype == jnp.bfloat16
+        assert not jnp.any(jnp.isnan(out))
+
     def test_megalodon_attention_bf16(self, random_seed: int) -> None:
         """Test MegalodonAttention with bf16 inputs and params.
 

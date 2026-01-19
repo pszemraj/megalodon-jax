@@ -51,6 +51,7 @@ def attention_single_chunk(
     k: Float[Array, "batch kv_seq heads head_dim"],
     v: Float[Array, "batch kv_seq heads value_dim"],
     kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    accum_dtype: jnp.dtype = jnp.float32,
     causal: bool = True,
     dropout_rate: float = 0.0,
     deterministic: bool = True,
@@ -66,6 +67,7 @@ def attention_single_chunk(
     :param jax.Array k: Key tensor of shape (batch, kv_seq, heads, head_dim).
     :param jax.Array v: Value tensor of shape (batch, kv_seq, heads, value_dim).
     :param jax.Array | None kv_mask: Optional mask where True marks valid positions.
+    :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param bool causal: Whether to apply causal masking.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
@@ -83,12 +85,12 @@ def attention_single_chunk(
 
     # Compute attention scores: (B, H, L_q, L_kv)
     # NO scaling by 1/sqrt(d_k) - this is normalized attention
-    # Keep inputs in native dtype but accumulate in float32 for stability/perf.
+    # Keep inputs in native dtype but accumulate in accum_dtype for stability/perf.
     scores = jnp.einsum(
         "bqhd,bkhd->bhqk",
         q,
         k,
-        preferred_element_type=jnp.float32,
+        preferred_element_type=accum_dtype,
     )
 
     # Build attention mask
@@ -133,7 +135,7 @@ def attention_single_chunk(
         "bhqk,bkhd->bqhd",
         attn_weights,
         v,
-        preferred_element_type=jnp.float32,
+        preferred_element_type=accum_dtype,
     )
 
     return out.astype(q.dtype)
@@ -147,6 +149,7 @@ def attention_multi_chunk(
     start_index: Int[Array, ""],
     rotary: RotaryEmbedding,
     mask: Bool[Array, "batch seq"] | None = None,
+    accum_dtype: jnp.dtype = jnp.float32,
     dropout_rate: float = 0.0,
     deterministic: bool = True,
     key: PRNGKeyArray | None = None,
@@ -164,6 +167,7 @@ def attention_multi_chunk(
     :param jax.Array start_index: Absolute position offset for RoPE (JAX scalar).
     :param RotaryEmbedding rotary: RotaryEmbedding module for position encoding.
     :param jax.Array | None mask: Optional mask where True marks valid positions.
+    :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
     :param PRNGKeyArray | None key: PRNG key for dropout.
@@ -184,6 +188,7 @@ def attention_multi_chunk(
             k_rot,
             v,
             kv_mask=mask,
+            accum_dtype=accum_dtype,
             causal=True,
             dropout_rate=dropout_rate,
             deterministic=deterministic,
@@ -219,6 +224,7 @@ def attention_multi_chunk(
         k_rot,
         v_chunked,
         kv_mask=mask_chunked,
+        accum_dtype=accum_dtype,
         dropout_rate=dropout_rate,
         deterministic=deterministic,
         key=key,
@@ -269,6 +275,7 @@ class ChunkedAttention(eqx.Module):
         cache_unbounded: If True, disables chunk boundary resets (but buffer
             is still bounded by max_cache_len for JIT compatibility).
         attention_dropout: Dropout rate for attention weights.
+        accum_dtype: Accumulation dtype for attention matmuls.
         rotary: RotaryEmbedding module.
     """
 
@@ -279,6 +286,7 @@ class ChunkedAttention(eqx.Module):
     max_cache_len: int = eqx.field(static=True)
     cache_unbounded: bool = eqx.field(static=True)
     attention_dropout: float = eqx.field(static=True)
+    accum_dtype: jnp.dtype = eqx.field(static=True)
 
     rotary: RotaryEmbedding
 
@@ -292,6 +300,7 @@ class ChunkedAttention(eqx.Module):
         max_cache_len: int | None = None,
         cache_unbounded: bool = False,
         attention_dropout: float = 0.0,
+        accum_dtype: jnp.dtype = jnp.float32,
         *,
         key: PRNGKeyArray,
     ):
@@ -305,6 +314,7 @@ class ChunkedAttention(eqx.Module):
         :param int | None max_cache_len: Maximum cache length; None/-1 uses chunk_size; >chunk_size enables sliding window.
         :param bool cache_unbounded: If True, disables chunk boundary resets while keeping a bounded buffer for JIT compatibility.
         :param float attention_dropout: Dropout rate for attention weights.
+        :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.num_heads = num_heads
@@ -318,6 +328,7 @@ class ChunkedAttention(eqx.Module):
             self.max_cache_len = max_cache_len
         self.cache_unbounded = cache_unbounded
         self.attention_dropout = attention_dropout
+        self.accum_dtype = accum_dtype
         self.rotary = RotaryEmbedding(dim=head_dim, base=rope_base)
 
     def __call__(
@@ -365,6 +376,7 @@ class ChunkedAttention(eqx.Module):
                 start_index=position,
                 rotary=self.rotary,
                 mask=mask,
+                accum_dtype=self.accum_dtype,
                 dropout_rate=self.attention_dropout,
                 deterministic=deterministic,
                 key=key,
@@ -568,6 +580,7 @@ class ChunkedAttention(eqx.Module):
                     c_k_step,
                     c_v_step,
                     kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
                     causal=False,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -719,6 +732,7 @@ class ChunkedAttention(eqx.Module):
                     k_cat,
                     v_cat,
                     kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
                     causal=True,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -736,6 +750,7 @@ class ChunkedAttention(eqx.Module):
                     k_rot,
                     v_blk,
                     kv_mask=mask_blk if mask_blk is not None else None,
+                    accum_dtype=self.accum_dtype,
                     causal=True,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -835,6 +850,7 @@ class ChunkedAttention(eqx.Module):
                     c_k_step,
                     c_v_step,
                     kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
                     causal=False,
                     dropout_rate=self.attention_dropout,
                     deterministic=deterministic,
@@ -1115,6 +1131,7 @@ class MegalodonAttention(eqx.Module):
             max_cache_len=max_cache_len,
             cache_unbounded=cache_unbounded,
             attention_dropout=attention_dropout,
+            accum_dtype=accum_dtype,
             key=keys[1],
         )
 
