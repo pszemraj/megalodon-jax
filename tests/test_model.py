@@ -1899,7 +1899,9 @@ class TestEdgeCases:
         loss = model.compute_loss(input_ids, labels)
 
         # Loss should stay fp32 for numerical stability
-        assert loss.dtype == jnp.float32, f"Expected float32, got {loss.dtype}"
+        assert loss.dtype == config.softmax_dtype, (
+            f"Expected {config.softmax_dtype}, got {loss.dtype}"
+        )
         assert loss == 0.0
 
 

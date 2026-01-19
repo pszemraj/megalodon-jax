@@ -19,6 +19,7 @@ from typing import Literal
 import jax.numpy as jnp
 
 InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
+GemmBackend = Literal["default", "mxfp8", "nvfp4"]
 
 
 @dataclass(frozen=True)
@@ -28,7 +29,8 @@ class MegalodonConfig:
     This is a frozen dataclass (immutable and hashable) that defines all
     hyperparameters for the Megalodon architecture.
     The dtype policy separates parameter storage (param_dtype) from compute
-    (compute_dtype) to mimic AMP-style behavior in JAX.
+    (compute_dtype), with explicit GEMM accumulation (accum_dtype) and
+    softmax/loss dtypes for AMP-style behavior in JAX.
     """
 
     vocab_size: int = 32_000
@@ -61,6 +63,9 @@ class MegalodonConfig:
     output_size: int = -1  # LM head size; -1 ties to vocab_size
     param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
     compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations
+    accum_dtype: jnp.dtype = jnp.float32  # Accumulation dtype for GEMM/reductions
+    softmax_dtype: jnp.dtype = jnp.float32  # Softmax/log-softmax dtype
+    gemm_backend: GemmBackend = "default"
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
@@ -89,12 +94,20 @@ class MegalodonConfig:
             raise ValueError("max_cache_len must be positive when provided.")
         if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
             raise ValueError("max_cache_len must be >= chunk_size to preserve causal attention.")
-        if not jnp.issubdtype(self.param_dtype, jnp.floating):
-            raise ValueError(f"param_dtype must be a floating dtype, got {self.param_dtype}")
-        if not jnp.issubdtype(self.compute_dtype, jnp.floating):
-            raise ValueError(f"compute_dtype must be a floating dtype, got {self.compute_dtype}")
-        if self.param_dtype == jnp.float16 or self.compute_dtype == jnp.float16:
-            raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
+        for name, dtype in (
+            ("param_dtype", self.param_dtype),
+            ("compute_dtype", self.compute_dtype),
+            ("accum_dtype", self.accum_dtype),
+            ("softmax_dtype", self.softmax_dtype),
+        ):
+            if not jnp.issubdtype(dtype, jnp.floating):
+                raise ValueError(f"{name} must be a floating dtype, got {dtype}")
+            if dtype == jnp.float16:
+                raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
+        if self.gemm_backend not in ("default", "mxfp8", "nvfp4"):
+            raise ValueError(
+                f"gemm_backend must be one of default/mxfp8/nvfp4, got {self.gemm_backend}"
+            )
 
     @property
     def head_dim(self) -> int:

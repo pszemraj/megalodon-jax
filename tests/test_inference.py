@@ -550,6 +550,9 @@ class TestConversion:
         config_kwargs.pop("use_checkpoint", None)
         config_kwargs.pop("param_dtype", None)
         config_kwargs.pop("compute_dtype", None)
+        config_kwargs.pop("accum_dtype", None)
+        config_kwargs.pop("softmax_dtype", None)
+        config_kwargs.pop("gemm_backend", None)
         torch_config = megalodon.MegalodonConfig(**config_kwargs)
         torch_model = megalodon.MegalodonForCausalLM(torch_config).eval()
 

@@ -10,6 +10,9 @@ MegalodonConfig separates:
 
 - `param_dtype`: parameter storage dtype (default fp32).
 - `compute_dtype`: matmul/activation dtype (default fp32).
+- `accum_dtype`: accumulation dtype for GEMM and reductions (default fp32).
+- `softmax_dtype`: softmax/log-softmax dtype (default fp32).
+- `gemm_backend`: `"default"` (reserved for future FP8 backends).
 
 Use one of the following:
 
@@ -20,6 +23,8 @@ config = MegalodonConfig(
     ...,
     param_dtype=jnp.float32,
     compute_dtype=jnp.float32,
+    accum_dtype=jnp.float32,
+    softmax_dtype=jnp.float32,
 )
 ```
 
@@ -30,6 +35,8 @@ config = MegalodonConfig(
     ...,
     param_dtype=jnp.float32,
     compute_dtype=jnp.bfloat16,
+    accum_dtype=jnp.float32,
+    softmax_dtype=jnp.float32,
 )
 ```
 
@@ -89,6 +96,8 @@ config = MegalodonConfig(
     ...,
     param_dtype=jnp.float32,
     compute_dtype=jnp.bfloat16,
+    accum_dtype=jnp.float32,
+    softmax_dtype=jnp.float32,
 )
 model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
@@ -110,6 +119,7 @@ Notes:
 - Keep `param_dtype` as fp32 to maintain master weights.
 - Let the model handle compute casting; avoid manual `astype` on the model.
 - Input token ids should remain int32.
+- Loss is computed in `softmax_dtype` (default fp32) for stability.
 
 ## Inference and cache dtype
 
@@ -128,7 +138,8 @@ Use `init_cache(config, ...)` without a dtype override so cache dtypes match
 
 If bf16 training looks unstable:
 
-1. Verify config uses `param_dtype=jnp.float32` and `compute_dtype=jnp.bfloat16`.
+1. Verify config uses `param_dtype=jnp.float32`, `compute_dtype=jnp.bfloat16`,
+   and `softmax_dtype=jnp.float32`.
 2. Run `audit_sensitive_param_dtypes(model)` and ensure no mismatches.
 3. Remove any `jax.tree.map` casts applied in downstream code.
 4. Confirm you are not using float16 (unsupported).

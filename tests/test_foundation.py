@@ -34,6 +34,9 @@ class TestMegalodonConfig:
         assert cfg.chunk_size == 2048
         assert cfg.param_dtype == jnp.float32
         assert cfg.compute_dtype == jnp.float32
+        assert cfg.accum_dtype == jnp.float32
+        assert cfg.softmax_dtype == jnp.float32
+        assert cfg.gemm_backend == "default"
 
     def test_head_dim_property(self) -> None:
         """Test head_dim computed property.
@@ -113,6 +116,18 @@ class TestMegalodonConfig:
             MegalodonConfig(param_dtype=jnp.float16)
         with pytest.raises(ValueError, match="float16"):
             MegalodonConfig(compute_dtype=jnp.float16)
+        with pytest.raises(ValueError, match="float16"):
+            MegalodonConfig(accum_dtype=jnp.float16)
+        with pytest.raises(ValueError, match="float16"):
+            MegalodonConfig(softmax_dtype=jnp.float16)
+
+    def test_gemm_backend_validation(self) -> None:
+        """Test gemm_backend validation.
+
+        :return None: None.
+        """
+        with pytest.raises(ValueError, match="gemm_backend"):
+            MegalodonConfig(gemm_backend="unsupported")  # type: ignore[arg-type]
 
     def test_config_is_frozen(self) -> None:
         """Test that config is immutable.

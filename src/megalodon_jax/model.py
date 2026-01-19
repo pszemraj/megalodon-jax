@@ -70,17 +70,23 @@ def _matmul_3d_weight(
     x: Float[Array, "batch seq in_dim"],
     weight: Float[Array, "out_dim in_dim"],
     compute_dtype: jnp.dtype,
+    accum_dtype: jnp.dtype,
+    gemm_backend: str,
 ) -> Float[Array, "batch seq out_dim"]:
     """Apply a weight matrix to a (batch, seq, dim) tensor with compute dtype control.
 
     :param Float[Array, "batch seq in_dim"] x: Input tensor.
     :param Float[Array, "out_dim in_dim"] weight: Weight matrix (out_dim, in_dim).
     :param jnp.dtype compute_dtype: Compute dtype for matmul and output.
+    :param jnp.dtype accum_dtype: Accumulation dtype for GEMM.
+    :param str gemm_backend: GEMM backend selector.
     :return Float[Array, "batch seq out_dim"]: Output tensor.
     """
+    if gemm_backend != "default":
+        raise NotImplementedError(f"gemm_backend={gemm_backend} is not implemented yet.")
     x_c = x.astype(compute_dtype)
     w_c = weight.astype(compute_dtype)
-    y = jnp.matmul(x_c, w_c.T, preferred_element_type=jnp.float32)
+    y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
     return y.astype(compute_dtype)
 
 
@@ -141,6 +147,8 @@ class MegalodonBlock(eqx.Module):
             hidden_dropout=config.hidden_dropout,
             param_dtype=config.param_dtype,
             compute_dtype=config.compute_dtype,
+            accum_dtype=config.accum_dtype,
+            gemm_backend=config.gemm_backend,
             key=k1,
         )
 
@@ -156,6 +164,8 @@ class MegalodonBlock(eqx.Module):
             dropout=config.dropout,
             param_dtype=config.param_dtype,
             compute_dtype=config.compute_dtype,
+            accum_dtype=config.accum_dtype,
+            gemm_backend=config.gemm_backend,
             key=k2,
         )
 
@@ -549,12 +559,26 @@ class MegalodonForCausalLM(eqx.Module):
         )
 
         compute_dtype = self.config.compute_dtype
+        accum_dtype = self.config.accum_dtype
+        gemm_backend = self.config.gemm_backend
         if self.tied:
             # Weight-tied projection
-            logits = _matmul_3d_weight(hidden, self.model.embed.weight, compute_dtype)
+            logits = _matmul_3d_weight(
+                hidden,
+                self.model.embed.weight,
+                compute_dtype,
+                accum_dtype,
+                gemm_backend,
+            )
         else:
             # Separate LM head
-            logits = _matmul_3d_weight(hidden, self.lm_head.weight, compute_dtype)
+            logits = _matmul_3d_weight(
+                hidden,
+                self.lm_head.weight,
+                compute_dtype,
+                accum_dtype,
+                gemm_backend,
+            )
 
         return logits, cache
 
@@ -612,8 +636,9 @@ class MegalodonForCausalLM(eqx.Module):
 
         # Guard against empty sequences (seq=0 or seq=1 after shift)
         # jnp.mean() on empty array returns NaN, which would poison training
+        softmax_dtype = self.config.softmax_dtype
         if shift_labels.shape[1] == 0:
-            return jnp.zeros((), dtype=jnp.float32)
+            return jnp.zeros((), dtype=softmax_dtype)
 
         # Build valid mask: positions that contribute to loss
         # Excludes both ignore_index labels and attention-masked positions
@@ -639,8 +664,8 @@ class MegalodonForCausalLM(eqx.Module):
         safe_labels = jnp.where(valid_mask, shift_labels, 0)
 
         # Cross-entropy loss
-        shift_logits_f32 = shift_logits.astype(jnp.float32)
-        log_probs = jax.nn.log_softmax(shift_logits_f32, axis=-1)
+        shift_logits_softmax = shift_logits.astype(softmax_dtype)
+        log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
         B, L, V = log_probs.shape
 
         # Gather log prob of correct token
@@ -651,8 +676,8 @@ class MegalodonForCausalLM(eqx.Module):
         # Apply valid mask and compute mean over valid positions only
         target_log_probs = jnp.where(valid_mask, target_log_probs, 0.0)
 
-        num_valid = valid_mask.sum().astype(jnp.float32)
+        num_valid = valid_mask.sum().astype(softmax_dtype)
         # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, 1.0)
+        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=softmax_dtype))
         loss = -target_log_probs.sum() / num_valid
         return loss
