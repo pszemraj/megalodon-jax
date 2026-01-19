@@ -651,7 +651,9 @@ class MegalodonForCausalLM(eqx.Module):
         target_log_probs = log_probs[batch_idx, seq_idx, safe_labels]
 
         # Apply valid mask and compute mean over valid positions only
-        target_log_probs = jnp.where(valid_mask, target_log_probs, 0.0)
+        target_log_probs = jnp.where(
+            valid_mask, target_log_probs, jnp.zeros((), dtype=softmax_dtype)
+        )
 
         num_valid = valid_mask.sum().astype(softmax_dtype)
         # Avoid division by zero (return 0 loss if no valid positions)
