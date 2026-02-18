@@ -38,6 +38,8 @@ def _checkpointed_layer(
     layer: "MegalodonBlock",
     x: Float[Array, "batch seq dim"],
     mask: Bool[Array, "batch seq"] | None,
+    segment_ids: Int[Array, "batch seq"] | None,
+    position_ids: Int[Array, "batch seq"] | None,
     key: PRNGKeyArray | None,
 ) -> Float[Array, "batch seq dim"]:
     """Execute layer without caching for gradient checkpointing.
@@ -48,10 +50,21 @@ def _checkpointed_layer(
     :param MegalodonBlock layer: Block to execute.
     :param Float[Array, "batch seq dim"] x: Input activations.
     :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
+    :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+    :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
     :param PRNGKeyArray | None key: Optional dropout key.
     :return Float[Array, "batch seq dim"]: Output activations.
     """
-    out, _ = layer(x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key)
+    out, _ = layer(
+        x,
+        cache=None,
+        mask=mask,
+        segment_ids=segment_ids,
+        position_ids=position_ids,
+        return_cache=False,
+        deterministic=False,
+        key=key,
+    )
     return out
 
 
@@ -151,6 +164,8 @@ class MegalodonBlock(eqx.Module):
         x: Float[Array, "batch seq dim"],
         cache: LayerCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -160,6 +175,8 @@ class MegalodonBlock(eqx.Module):
         :param Float[Array, "batch seq dim"] x: Input activations.
         :param LayerCache | None cache: Optional layer cache.
         :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
@@ -179,6 +196,8 @@ class MegalodonBlock(eqx.Module):
             x,
             cache=cache,
             mask=mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             return_cache=return_cache,
             deterministic=deterministic,
             key=k_attn,
@@ -283,6 +302,8 @@ class MegalodonModel(eqx.Module):
         self,
         input_ids: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         cache: ModelCache | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
@@ -292,6 +313,8 @@ class MegalodonModel(eqx.Module):
 
         :param Int[Array, "batch seq"] input_ids: Token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
         :param ModelCache | None cache: Optional model cache.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
@@ -401,7 +424,9 @@ class MegalodonModel(eqx.Module):
         for layer, layer_cache, layer_key in zip(self.layers, layer_caches, keys):
             if use_ckpt:
                 # Checkpointed path: disable cache during training
-                x = _checkpointed_layer(layer, x, attention_mask, layer_key)
+                x = _checkpointed_layer(
+                    layer, x, attention_mask, segment_ids, position_ids, layer_key
+                )
                 new_caches.append(None)
             else:
                 # Standard path with optional caching
@@ -409,6 +434,8 @@ class MegalodonModel(eqx.Module):
                     x,
                     cache=layer_cache,
                     mask=attention_mask,
+                    segment_ids=segment_ids,
+                    position_ids=position_ids,
                     return_cache=layer_return_cache,
                     deterministic=deterministic,
                     key=layer_key,
@@ -500,6 +527,8 @@ class MegalodonForCausalLM(eqx.Module):
         self,
         input_ids: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         cache: ModelCache | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
@@ -509,6 +538,8 @@ class MegalodonForCausalLM(eqx.Module):
 
         :param Int[Array, "batch seq"] input_ids: Token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
         :param ModelCache | None cache: Optional model cache.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
@@ -529,6 +560,8 @@ class MegalodonForCausalLM(eqx.Module):
         hidden, cache = self.model(
             input_ids,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             cache=cache,
             return_cache=return_cache,
             deterministic=deterministic,
@@ -564,6 +597,8 @@ class MegalodonForCausalLM(eqx.Module):
         input_ids: Int[Array, "batch seq"],
         labels: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         ignore_index: int = -100,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -580,6 +615,8 @@ class MegalodonForCausalLM(eqx.Module):
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
         :param int ignore_index: Label value to ignore in loss computation.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
@@ -601,6 +638,8 @@ class MegalodonForCausalLM(eqx.Module):
         logits, _ = self(
             input_ids,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             cache=None,
             return_cache=False,
             deterministic=deterministic,

@@ -2238,3 +2238,57 @@ class TestAttentionMasking:
             rtol=1e-5,
             err_msg="First causal position should output first value exactly",
         )
+
+
+class TestPackedMetadata:
+    """Tests for strict packed metadata plumbing in model forward/loss."""
+
+    def test_compute_loss_parity_without_effective_segmentation(self, random_seed: int) -> None:
+        """Passing monotonic position_ids and single segment should match default loss."""
+        config = small_config()
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_data = jax.random.split(key)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        batch, seq = 2, 12
+        input_ids = jax.random.randint(k_data, (batch, seq), 0, config.vocab_size)
+        labels = input_ids
+        attention_mask = jnp.ones((batch, seq), dtype=jnp.bool_)
+        segment_ids = jnp.ones((batch, seq), dtype=jnp.int32)
+        position_ids = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None, :], (batch, seq))
+
+        loss_default = model.compute_loss(input_ids, labels, attention_mask=attention_mask)
+        loss_meta = model.compute_loss(
+            input_ids,
+            labels,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        np.testing.assert_allclose(
+            np.array(loss_default), np.array(loss_meta), rtol=1e-5, atol=1e-5
+        )
+
+    def test_segment_ids_change_outputs_for_packed_sequence(self, random_seed: int) -> None:
+        """Strict packed metadata should alter outputs on later packed segments."""
+        config = replace(small_config(), chunk_size=8)
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+
+        input_ids = jnp.asarray([[10, 11, 12, 13, 14, 15, 16, 17]], dtype=jnp.int32)
+        attention_mask = jnp.ones_like(input_ids, dtype=jnp.bool_)
+        segment_ids = jnp.asarray([[1, 1, 1, 1, 2, 2, 2, 2]], dtype=jnp.int32)
+        position_ids = jnp.asarray([[0, 1, 2, 3, 0, 1, 2, 3]], dtype=jnp.int32)
+
+        logits_default, _ = model(input_ids, attention_mask=attention_mask, return_cache=False)
+        logits_strict, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+            return_cache=False,
+        )
+        assert not np.allclose(
+            np.array(logits_default[:, 4:, :]),
+            np.array(logits_strict[:, 4:, :]),
+        )
