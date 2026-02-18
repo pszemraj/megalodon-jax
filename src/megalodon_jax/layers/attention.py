@@ -51,6 +51,7 @@ def attention_single_chunk(
     k: Float[Array, "batch kv_seq heads head_dim"],
     v: Float[Array, "batch kv_seq heads value_dim"],
     kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    qk_mask: Bool[Array, "batch seq kv_seq"] | None = None,
     accum_dtype: jnp.dtype = jnp.float32,
     causal: bool = True,
     dropout_rate: float = 0.0,
@@ -67,6 +68,7 @@ def attention_single_chunk(
     :param jax.Array k: Key tensor of shape (batch, kv_seq, heads, head_dim).
     :param jax.Array v: Value tensor of shape (batch, kv_seq, heads, value_dim).
     :param jax.Array | None kv_mask: Optional mask where True marks valid positions.
+    :param jax.Array | None qk_mask: Optional per-query/per-key boolean mask.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param bool causal: Whether to apply causal masking.
     :param float dropout_rate: Attention dropout rate.
@@ -115,6 +117,8 @@ def attention_single_chunk(
         # kv_mask: (B, L_kv) with True for valid positions
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
         scores = jnp.where(kv_mask_expanded, scores, neg_inf)
+    if qk_mask is not None:
+        scores = jnp.where(qk_mask[:, None, :, :], scores, neg_inf)
 
     # Softmax with NaN guard for fully-masked queries
     # If all keys are masked for a query, softmax(all -inf) = NaN
@@ -149,6 +153,8 @@ def attention_multi_chunk(
     start_index: Int[Array, ""],
     rotary: RotaryEmbedding,
     mask: Bool[Array, "batch seq"] | None = None,
+    segment_ids: Int[Array, "batch seq"] | None = None,
+    position_ids: Int[Array, "batch seq"] | None = None,
     accum_dtype: jnp.dtype = jnp.float32,
     dropout_rate: float = 0.0,
     deterministic: bool = True,
@@ -167,6 +173,8 @@ def attention_multi_chunk(
     :param jax.Array start_index: Absolute position offset for RoPE (JAX scalar).
     :param RotaryEmbedding rotary: RotaryEmbedding module for position encoding.
     :param jax.Array | None mask: Optional mask where True marks valid positions.
+    :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
+    :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
@@ -181,13 +189,21 @@ def attention_multi_chunk(
         return jnp.zeros((B, L, H, Dv), dtype=q.dtype)
 
     if L <= chunk_size:
-        # Single chunk: apply RoPE and attention directly
-        q_rot, k_rot = rotary(q, k, start_index)
+        # Single chunk: apply RoPE and attention directly.
+        q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
+        qk_mask = None
+        if segment_ids is not None:
+            qk_mask = (
+                (segment_ids[:, :, None] == segment_ids[:, None, :])
+                & (segment_ids[:, :, None] > 0)
+                & (segment_ids[:, None, :] > 0)
+            )
         return attention_single_chunk(
             q_rot,
             k_rot,
             v,
             kv_mask=mask,
+            qk_mask=qk_mask,
             accum_dtype=accum_dtype,
             causal=True,
             dropout_rate=dropout_rate,
@@ -203,12 +219,16 @@ def attention_multi_chunk(
         v = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
         if mask is not None:
             mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        if position_ids is not None:
+            position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
 
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
 
     # Apply RoPE once with absolute positions, then reshape into chunks.
-    q_rot_full, k_rot_full = rotary(q, k, start_index)
+    q_rot_full, k_rot_full = rotary(q, k, start_index, position_ids=position_ids)
     q_rot = q_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     k_rot = k_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     v_chunked = v.reshape(B, num_chunks, chunk_size, H, Dv).reshape(
@@ -218,12 +238,21 @@ def attention_multi_chunk(
     mask_chunked = None
     if mask is not None:
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
+    qk_mask_chunked = None
+    if segment_ids is not None:
+        seg_chunked = segment_ids.reshape(B * num_chunks, chunk_size)
+        qk_mask_chunked = (
+            (seg_chunked[:, :, None] == seg_chunked[:, None, :])
+            & (seg_chunked[:, :, None] > 0)
+            & (seg_chunked[:, None, :] > 0)
+        )
 
     out_chunked = attention_single_chunk(
         q_rot,
         k_rot,
         v_chunked,
         kv_mask=mask_chunked,
+        qk_mask=qk_mask_chunked,
         accum_dtype=accum_dtype,
         dropout_rate=dropout_rate,
         deterministic=deterministic,
@@ -338,6 +367,8 @@ class ChunkedAttention(eqx.Module):
         v: Float[Array, "batch seq heads value_dim"],
         cache: AttentionCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -353,12 +384,15 @@ class ChunkedAttention(eqx.Module):
         :param jax.Array v: Value tensor (batch, seq, heads, value_dim).
         :param AttentionCache | None cache: Optional cached K/V from previous tokens.
         :param jax.Array | None mask: Optional mask where True marks valid positions.
+        :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
+        :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :return tuple[jax.Array, AttentionCache | None, jax.Array | None]: Output, updated cache, and new position counter.
         """
         B, L, H, _ = q.shape
+        strict_metadata = segment_ids is not None or position_ids is not None
 
         # Determine current position
         if cache is None:
@@ -376,12 +410,20 @@ class ChunkedAttention(eqx.Module):
                 start_index=position,
                 rotary=self.rotary,
                 mask=mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
                 accum_dtype=self.accum_dtype,
                 dropout_rate=self.attention_dropout,
                 deterministic=deterministic,
                 key=key,
             )
             return out, None, position + L
+
+        if strict_metadata:
+            raise ValueError(
+                "segment_ids/position_ids are only supported for non-cached training calls. "
+                "Disable cache/return_cache for strict packed attention."
+            )
 
         Dv = v.shape[-1]
         cache_size = self.max_cache_len
@@ -1151,6 +1193,8 @@ class MegalodonAttention(eqx.Module):
         x: Float[Array, "batch seq dim"],
         cache: LayerCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -1160,6 +1204,8 @@ class MegalodonAttention(eqx.Module):
         :param jax.Array x: Input tensor of shape (batch, seq, dim).
         :param LayerCache | None cache: Optional layer cache from previous tokens.
         :param jax.Array | None mask: Optional mask where True marks valid positions.
+        :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
+        :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
@@ -1243,6 +1289,8 @@ class MegalodonAttention(eqx.Module):
             v,
             cache=attn_cache,
             mask=mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             return_cache=return_cache,
             deterministic=deterministic,
             key=k1,

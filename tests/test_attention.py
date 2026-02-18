@@ -124,6 +124,20 @@ class TestAttentionPrimitives:
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
 
+    def test_single_chunk_query_key_mask_blocks_cross_segment(self) -> None:
+        """qk_mask should block cross-segment attention links."""
+        q = jnp.ones((1, 4, 1, 2), dtype=jnp.float32)
+        k = jnp.ones((1, 4, 1, 2), dtype=jnp.float32)
+        v = jnp.asarray([[[[1.0]], [[2.0]], [[3.0]], [[4.0]]]], dtype=jnp.float32)
+        segs = jnp.asarray([[1, 1, 2, 2]], dtype=jnp.int32)
+        qk_mask = (
+            (segs[:, :, None] == segs[:, None, :]) & (segs[:, :, None] > 0) & (segs[:, None, :] > 0)
+        )
+
+        out = attention_single_chunk(q, k, v, qk_mask=qk_mask, causal=False)
+        np.testing.assert_allclose(np.array(out[0, 0, 0, 0]), 1.5, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.array(out[0, 3, 0, 0]), 3.5, rtol=1e-5, atol=1e-5)
+
     def test_multi_chunk_shapes(self, random_seed: int) -> None:
         """Test that attention_multi_chunk produces correct output shapes.
 
@@ -175,6 +189,46 @@ class TestAttentionPrimitives:
         # Output should have original sequence length (padding removed)
         assert out.shape == (batch, seq, heads, value_dim)
         assert not jnp.any(jnp.isnan(out))
+
+    def test_multi_chunk_explicit_position_ids_path(self, random_seed: int) -> None:
+        """Explicit position_ids should be honored by rotary in multi-chunk attention."""
+        batch, seq, heads, head_dim, value_dim = 1, 16, 2, 8, 8
+        chunk_size = 8
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim))
+
+        rotary = RotaryEmbedding(dim=head_dim)
+        start_index = jnp.array(0, dtype=jnp.int32)
+        mono_pos = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None, :], (batch, seq))
+        shifted_pos = mono_pos + 100
+
+        out_default = attention_multi_chunk(
+            q, k, v, chunk_size=chunk_size, start_index=start_index, rotary=rotary
+        )
+        out_mono = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+            position_ids=mono_pos,
+        )
+        out_shifted = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+            position_ids=shifted_pos,
+        )
+
+        np.testing.assert_allclose(np.array(out_default), np.array(out_mono), rtol=1e-5, atol=1e-5)
+        assert not np.allclose(np.array(out_default), np.array(out_shifted))
 
 
 # -----------------------------------------------------------------------------
@@ -252,6 +306,27 @@ class TestChunkedAttention:
         assert cache.count == 8
         # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
         assert cache.k.shape[1] == chunk_size
+
+    def test_streaming_rejects_strict_metadata(self, random_seed: int) -> None:
+        """Streaming cache path should reject segment/position strict metadata."""
+        heads, head_dim, value_dim, chunk_size = 2, 8, 8, 8
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+        q = jax.random.normal(k2, (1, 4, heads, head_dim))
+        k = jax.random.normal(k3, (1, 4, heads, head_dim))
+        v = jax.random.normal(k4, (1, 4, heads, value_dim))
+        segs = jnp.asarray([[1, 1, 2, 2]], dtype=jnp.int32)
+        pos = jnp.asarray([[0, 1, 0, 1]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="segment_ids/position_ids"):
+            attn(q, k, v, segment_ids=segs, position_ids=pos, return_cache=True)
 
     def test_streaming_small_l_preserves_dtype_and_cache_count(self, random_seed: int) -> None:
         """Small-L streaming should keep dtype and track cache count without padding.
