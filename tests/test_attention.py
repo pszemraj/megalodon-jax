@@ -138,6 +138,62 @@ class TestAttentionPrimitives:
         np.testing.assert_allclose(np.array(out[0, 0, 0, 0]), 1.5, rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(np.array(out[0, 3, 0, 0]), 3.5, rtol=1e-5, atol=1e-5)
 
+    @pytest.mark.parametrize("chunk_size", [16, 8])
+    def test_repeated_segment_ids_match_unique_run_ids(
+        self, random_seed: int, chunk_size: int
+    ) -> None:
+        """Reused positive ids must isolate exactly like unique per-run ids.
+
+        A packer may legally emit ``[1, 1, 2, 2, 1, 1]``; raw-id equality would
+        let the later ``1`` run attend back to the earlier one. chunk_size=16
+        exercises the single-chunk mask path, 8 the multi-chunk path.
+
+        :param int random_seed: Random seed fixture.
+        :param int chunk_size: Attention chunk size under test.
+        :return None: None.
+        """
+        batch, seq, heads, head_dim, value_dim = 1, 16, 2, 16, 16
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim))
+        rotary = RotaryEmbedding(dim=head_dim)
+        start_index = jnp.array(0, dtype=jnp.int32)
+
+        seg_repeated = jnp.asarray(
+            [[1, 1, 1, 2, 2, 1, 1, 1, 3, 3, 3, 3, 1, 1, 1, 1]], dtype=jnp.int32
+        )
+        seg_unique = jnp.asarray(
+            [[1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]], dtype=jnp.int32
+        )
+        position_ids = jnp.asarray(
+            [[0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3]], dtype=jnp.int32
+        )
+
+        def run(segment_ids: jnp.ndarray) -> jnp.ndarray:
+            """Run chunked attention with the given segment ids.
+
+            :param jnp.ndarray segment_ids: Per-token segment ids.
+            :return jnp.ndarray: Attention output.
+            """
+            return attention_multi_chunk(
+                q,
+                k,
+                v,
+                chunk_size=chunk_size,
+                start_index=start_index,
+                rotary=rotary,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+            )
+
+        np.testing.assert_array_equal(
+            np.array(run(seg_repeated)),
+            np.array(run(seg_unique)),
+            err_msg="Repeated segment ids must isolate the same as unique run ids",
+        )
+
     def test_multi_chunk_shapes(self, random_seed: int) -> None:
         """Test that attention_multi_chunk produces correct output shapes.
 

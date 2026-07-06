@@ -2458,3 +2458,44 @@ class TestPackedMetadata:
             atol=5e-4,
             err_msg="Trivial segmentation should match the unsegmented baseline",
         )
+
+    def test_repeated_segment_ids_isolate_docs(self, random_seed: int) -> None:
+        """A reused positive segment id must not link non-adjacent documents.
+
+        Packers may legally recycle ids within a row (e.g. ``[1..., 2..., 1...]``);
+        isolation is defined by contiguous runs, not raw id values, so doc C
+        must match a standalone run even though it shares doc A's id.
+        """
+        config = small_config()
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_a, k_b, k_c = jax.random.split(key, 4)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        # doc A (id 1, 5) + doc B (id 2, 4) + doc C (id 1 again, 5) + padding (2)
+        ids_a = jax.random.randint(k_a, (1, 5), 0, config.vocab_size)
+        ids_b = jax.random.randint(k_b, (1, 4), 0, config.vocab_size)
+        ids_c = jax.random.randint(k_c, (1, 5), 0, config.vocab_size)
+        input_ids = jnp.concatenate(
+            [ids_a, ids_b, ids_c, jnp.zeros((1, 2), dtype=ids_a.dtype)], axis=1
+        )
+        attention_mask = jnp.asarray([[True] * 14 + [False] * 2])
+        segment_ids = jnp.asarray([[1] * 5 + [2] * 4 + [1] * 5 + [0] * 2], dtype=jnp.int32)
+        position_ids = jnp.asarray(
+            [list(range(5)) + list(range(4)) + list(range(5)) + [0, 0]], dtype=jnp.int32
+        )
+
+        logits_packed, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        logits_c, _ = model(ids_c)
+
+        np.testing.assert_allclose(
+            np.array(logits_packed[:, 9:14, :]),
+            np.array(logits_c),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="Packed doc C logits should match doc C alone despite reused id",
+        )

@@ -145,6 +145,28 @@ def attention_single_chunk(
     return out.astype(q.dtype)
 
 
+def _segment_run_ids(segment_ids: Int[Array, "batch seq"]) -> Int[Array, "batch seq"]:
+    """Convert raw segment ids to per-row contiguous-run indices.
+
+    A packer may legally reuse a positive id for non-adjacent documents
+    (e.g. ``[1, 1, 2, 2, 1, 1]``); comparing raw ids for equality would let
+    the later run attend back to the earlier one. Run indices only compare
+    equal within a single contiguous run, matching the boundary-based reset
+    semantics of ComplexEMA and TimestepNorm.
+
+    :param jax.Array segment_ids: Raw per-token segment ids of shape (batch, seq).
+    :return jax.Array: Run indices (starting at 1) of the same shape.
+    """
+    boundaries = jnp.concatenate(
+        [
+            jnp.ones_like(segment_ids[:, :1], dtype=jnp.bool_),
+            segment_ids[:, 1:] != segment_ids[:, :-1],
+        ],
+        axis=1,
+    )
+    return jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
+
+
 def attention_multi_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch seq heads head_dim"],
@@ -193,8 +215,10 @@ def attention_multi_chunk(
         q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
         qk_mask = None
         if segment_ids is not None:
+            # Compare contiguous runs (ids may repeat); validity from raw ids
+            seg_runs = _segment_run_ids(segment_ids)
             qk_mask = (
-                (segment_ids[:, :, None] == segment_ids[:, None, :])
+                (seg_runs[:, :, None] == seg_runs[:, None, :])
                 & (segment_ids[:, :, None] > 0)
                 & (segment_ids[:, None, :] > 0)
             )
@@ -240,9 +264,12 @@ def attention_multi_chunk(
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
     qk_mask_chunked = None
     if segment_ids is not None:
+        # Run indices are computed on the full (padded) row so equality within
+        # a chunk still means "same contiguous run"; validity from raw ids
+        runs_chunked = _segment_run_ids(segment_ids).reshape(B * num_chunks, chunk_size)
         seg_chunked = segment_ids.reshape(B * num_chunks, chunk_size)
         qk_mask_chunked = (
-            (seg_chunked[:, :, None] == seg_chunked[:, None, :])
+            (runs_chunked[:, :, None] == runs_chunked[:, None, :])
             & (seg_chunked[:, :, None] > 0)
             & (seg_chunked[:, None, :] > 0)
         )
