@@ -145,17 +145,25 @@ def attention_single_chunk(
     return out.astype(q.dtype)
 
 
-def _segment_run_ids(segment_ids: Int[Array, "batch seq"]) -> Int[Array, "batch seq"]:
-    """Convert raw segment ids to per-row contiguous-run indices.
+def _segment_runs_and_local_chunks(
+    segment_ids: Int[Array, "batch seq"], chunk_size: int
+) -> tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]:
+    """Compute contiguous-run indices and run-local chunk indices.
 
-    A packer may legally reuse a positive id for non-adjacent documents
-    (e.g. ``[1, 1, 2, 2, 1, 1]``); comparing raw ids for equality would let
-    the later run attend back to the earlier one. Run indices only compare
-    equal within a single contiguous run, matching the boundary-based reset
-    semantics of ComplexEMA and TimestepNorm.
+    Run indices: a packer may legally reuse a positive id for non-adjacent
+    documents (e.g. ``[1, 1, 2, 2, 1, 1]``); comparing raw ids for equality
+    would let the later run attend back to the earlier one. Run indices only
+    compare equal within a single contiguous run, matching the boundary-based
+    reset semantics of ComplexEMA and TimestepNorm.
+
+    Local chunks: attention chunk boundaries are re-anchored at each run
+    start, so a document that begins mid-chunk gets the same block-diagonal
+    pattern it would have running alone instead of being split at global
+    chunk-grid offsets.
 
     :param jax.Array segment_ids: Raw per-token segment ids of shape (batch, seq).
-    :return jax.Array: Run indices (starting at 1) of the same shape.
+    :param int chunk_size: Attention chunk size.
+    :return tuple: (run indices starting at 1, chunk index within the run).
     """
     boundaries = jnp.concatenate(
         [
@@ -164,7 +172,11 @@ def _segment_run_ids(segment_ids: Int[Array, "batch seq"]) -> Int[Array, "batch 
         ],
         axis=1,
     )
-    return jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
+    run_ids = jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
+    positions = jnp.arange(segment_ids.shape[1], dtype=segment_ids.dtype)[None, :]
+    run_starts = jax.lax.cummax(jnp.where(boundaries, positions, 0), axis=1)
+    local_chunks = (positions - run_starts) // chunk_size
+    return run_ids, local_chunks
 
 
 def attention_multi_chunk(
@@ -215,8 +227,10 @@ def attention_multi_chunk(
         q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
         qk_mask = None
         if segment_ids is not None:
-            # Compare contiguous runs (ids may repeat); validity from raw ids
-            seg_runs = _segment_run_ids(segment_ids)
+            # Compare contiguous runs (ids may repeat); validity from raw ids.
+            # Local chunks are all 0 here (L <= chunk_size), so run equality
+            # alone gives the full same-run, same-local-chunk condition.
+            seg_runs, _ = _segment_runs_and_local_chunks(segment_ids, chunk_size)
             qk_mask = (
                 (seg_runs[:, :, None] == seg_runs[:, None, :])
                 & (segment_ids[:, :, None] > 0)
@@ -262,29 +276,68 @@ def attention_multi_chunk(
     mask_chunked = None
     if mask is not None:
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
-    qk_mask_chunked = None
+
     if segment_ids is not None:
-        # Run indices are computed on the full (padded) row so equality within
-        # a chunk still means "same contiguous run"; validity from raw ids
-        runs_chunked = _segment_run_ids(segment_ids).reshape(B * num_chunks, chunk_size)
-        seg_chunked = segment_ids.reshape(B * num_chunks, chunk_size)
-        qk_mask_chunked = (
-            (runs_chunked[:, :, None] == runs_chunked[:, None, :])
-            & (seg_chunked[:, :, None] > 0)
-            & (seg_chunked[:, None, :] > 0)
+        # Chunk boundaries are re-anchored at each segment start so a packed
+        # document attends exactly as it would running alone, instead of
+        # being split at global chunk-grid offsets. A re-anchored chunk spans
+        # at most chunk_size consecutive positions, so keys/values from the
+        # current + previous global chunk cover every allowed edge; the mask
+        # keeps only same-run, same-local-chunk, valid pairs.
+        run_ids, local_chunks = _segment_runs_and_local_chunks(segment_ids, chunk_size)
+
+        def window_keys(z: jnp.ndarray, fill_value) -> jnp.ndarray:
+            """Prepend each chunk's predecessor along the key axis.
+
+            :param jnp.ndarray z: Per-token array of shape (B, L_padded, ...).
+            :param fill_value: Fill for the first chunk's missing predecessor.
+            :return jnp.ndarray: Windowed array of shape (B*NC, 2*chunk, ...).
+            """
+            zc = z.reshape(B, num_chunks, chunk_size, *z.shape[2:])
+            prev = jnp.concatenate([jnp.full_like(zc[:, :1], fill_value), zc[:, :-1]], axis=1)
+            return jnp.concatenate([prev, zc], axis=2).reshape(
+                B * num_chunks, 2 * chunk_size, *z.shape[2:]
+            )
+
+        runs_q = run_ids.reshape(B * num_chunks, chunk_size)
+        locals_q = local_chunks.reshape(B * num_chunks, chunk_size)
+        seg_q = segment_ids.reshape(B * num_chunks, chunk_size)
+        # Run ids start at 1, so fill 0 can never match a real run
+        runs_k = window_keys(run_ids, 0)
+        locals_k = window_keys(local_chunks, 0)
+        seg_k = window_keys(segment_ids, 0)
+        qk_mask_windowed = (
+            (runs_q[:, :, None] == runs_k[:, None, :])
+            & (locals_q[:, :, None] == locals_k[:, None, :])
+            & (seg_q[:, :, None] > 0)
+            & (seg_k[:, None, :] > 0)
         )
 
-    out_chunked = attention_single_chunk(
-        q_rot,
-        k_rot,
-        v_chunked,
-        kv_mask=mask_chunked,
-        qk_mask=qk_mask_chunked,
-        accum_dtype=accum_dtype,
-        dropout_rate=dropout_rate,
-        deterministic=deterministic,
-        key=key,
-    )
+        # causal=True with L_q < L_kv gives k_pos <= q_pos + chunk_size,
+        # which is exactly global causality for the [prev, current] window
+        out_chunked = attention_single_chunk(
+            q_rot,
+            window_keys(k_rot_full, 0.0),
+            window_keys(v, 0.0),
+            kv_mask=window_keys(mask, False) if mask is not None else None,
+            qk_mask=qk_mask_windowed,
+            accum_dtype=accum_dtype,
+            dropout_rate=dropout_rate,
+            deterministic=deterministic,
+            key=key,
+        )
+    else:
+        out_chunked = attention_single_chunk(
+            q_rot,
+            k_rot,
+            v_chunked,
+            kv_mask=mask_chunked,
+            qk_mask=None,
+            accum_dtype=accum_dtype,
+            dropout_rate=dropout_rate,
+            deterministic=deterministic,
+            key=key,
+        )
 
     # Reshape back: (B * num_chunks, chunk_size, H, Dv) -> (B, L_padded, H, Dv)
     out = out_chunked.reshape(B, L_padded, H, Dv)

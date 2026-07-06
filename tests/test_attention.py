@@ -194,6 +194,58 @@ class TestAttentionPrimitives:
             err_msg="Repeated segment ids must isolate the same as unique run ids",
         )
 
+    def test_unaligned_segment_crossing_chunk_matches_standalone(self, random_seed: int) -> None:
+        """A doc starting mid-chunk must attend exactly as it would run alone.
+
+        With chunk_size=8, doc B occupies global positions 6-15 and crosses
+        the global chunk boundary at position 8. Chunk boundaries must be
+        re-anchored at the segment start (doc-local split at 8, global 14),
+        not inherited from the global grid (doc-local split at 2).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        batch, seq, heads, head_dim, value_dim = 1, 16, 2, 16, 16
+        chunk_size = 8
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim))
+        rotary = RotaryEmbedding(dim=head_dim)
+        start_index = jnp.array(0, dtype=jnp.int32)
+
+        # doc A: positions 0-5 (id 1); doc B: positions 6-15 (id 2)
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 10], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(10))], dtype=jnp.int32)
+
+        out_packed = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        out_alone = attention_multi_chunk(
+            q[:, 6:],
+            k[:, 6:],
+            v[:, 6:],
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+        )
+
+        np.testing.assert_allclose(
+            np.array(out_packed[:, 6:]),
+            np.array(out_alone),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="Doc B packed at an unaligned offset must match doc B alone",
+        )
+
     def test_multi_chunk_shapes(self, random_seed: int) -> None:
         """Test that attention_multi_chunk produces correct output shapes.
 

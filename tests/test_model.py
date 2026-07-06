@@ -2500,6 +2500,46 @@ class TestPackedMetadata:
             err_msg="Packed doc C logits should match doc C alone despite reused id",
         )
 
+    @pytest.mark.parametrize("doc_b_len", [10, 18])
+    def test_packed_isolation_unaligned_doc_crossing_chunks(
+        self, random_seed: int, doc_b_len: int
+    ) -> None:
+        """A doc packed at a non-chunk-aligned offset must match itself run alone.
+
+        chunk_size=8, doc A is 6 tokens, so doc B starts mid-chunk and crosses
+        one (len 10) or two (len 18) global chunk boundaries. Attention chunk
+        boundaries must be re-anchored at the document start, or the packed
+        doc gets a different block-diagonal pattern than it would alone.
+        """
+        config = replace(small_config(), chunk_size=8)
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_a, k_b = jax.random.split(key, 3)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        ids_a = jax.random.randint(k_a, (1, 6), 0, config.vocab_size)
+        ids_b = jax.random.randint(k_b, (1, doc_b_len), 0, config.vocab_size)
+        input_ids = jnp.concatenate([ids_a, ids_b], axis=1)
+        seq = 6 + doc_b_len
+        attention_mask = jnp.ones((1, seq), dtype=jnp.bool_)
+        segment_ids = jnp.asarray([[1] * 6 + [2] * doc_b_len], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(doc_b_len))], dtype=jnp.int32)
+
+        logits_packed, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        logits_b, _ = model(ids_b)
+
+        np.testing.assert_allclose(
+            np.array(logits_packed[:, 6:, :]),
+            np.array(logits_b),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="Unaligned packed doc B logits should match doc B run alone",
+        )
+
     def test_compute_loss_excludes_cross_segment_label_pairs(self, random_seed: int) -> None:
         """Packed loss must equal the valid-pair-weighted mean of per-doc losses.
 
