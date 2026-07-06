@@ -2499,3 +2499,45 @@ class TestPackedMetadata:
             atol=1e-4,
             err_msg="Packed doc C logits should match doc C alone despite reused id",
         )
+
+    def test_compute_loss_excludes_cross_segment_label_pairs(self, random_seed: int) -> None:
+        """Packed loss must equal the valid-pair-weighted mean of per-doc losses.
+
+        Without boundary masking, doc A's last token would be scored on
+        predicting doc B's first token, so packed loss/gradients would differ
+        from running each document alone.
+        """
+        config = small_config()
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_a, k_b = jax.random.split(key, 3)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        # doc A (6) + doc B (7) + padding (3); labels are raw input_ids with
+        # no manual ignore_index at the A->B boundary or padding
+        ids_a = jax.random.randint(k_a, (1, 6), 0, config.vocab_size)
+        ids_b = jax.random.randint(k_b, (1, 7), 0, config.vocab_size)
+        input_ids = jnp.concatenate([ids_a, ids_b, jnp.zeros((1, 3), dtype=ids_a.dtype)], axis=1)
+        attention_mask = jnp.asarray([[True] * 13 + [False] * 3])
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(7)) + [0, 0, 0]], dtype=jnp.int32)
+
+        loss_packed = model.compute_loss(
+            input_ids,
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        loss_a = model.compute_loss(ids_a, ids_a)
+        loss_b = model.compute_loss(ids_b, ids_b)
+
+        # 5 valid shifted pairs inside doc A, 6 inside doc B; the boundary
+        # pair and padding must be excluded automatically
+        expected = (5 * np.array(loss_a) + 6 * np.array(loss_b)) / 11
+        np.testing.assert_allclose(
+            np.array(loss_packed),
+            expected,
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="Packed loss should be the valid-pair-weighted mean of per-doc losses",
+        )

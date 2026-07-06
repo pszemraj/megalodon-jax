@@ -629,6 +629,10 @@ class MegalodonForCausalLM(eqx.Module):
         computation, following HuggingFace Transformers convention. This allows
         padding tokens to be marked with -100 in the labels array.
 
+        When segment_ids is provided, shifted pairs that cross a segment
+        boundary and pairs targeting padding (segment id 0) are excluded
+        automatically - callers do not need to pre-mask boundary labels.
+
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
@@ -679,6 +683,12 @@ class MegalodonForCausalLM(eqx.Module):
         if attention_mask is not None:
             shift_attn_mask = attention_mask[:, 1:]  # (B, L-1)
             valid_mask = valid_mask & shift_attn_mask
+        if segment_ids is not None:
+            # Position i predicts i+1: drop pairs that straddle a segment
+            # boundary and anything in padding (segment id 0), so packed loss
+            # matches running each document alone
+            same_segment = segment_ids[:, :-1] == segment_ids[:, 1:]
+            valid_mask = valid_mask & same_segment & (segment_ids[:, 1:] > 0)
 
         # Validate label bounds only on positions that will be used
         # Prevents silent wrong gradients from JAX index wrapping
