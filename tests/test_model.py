@@ -2312,3 +2312,149 @@ class TestPackedMetadata:
         model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(random_seed))
         assert getattr(model, "supports_segment_reset", False) is True
         assert getattr(model.model, "supports_segment_reset", False) is True
+
+    def test_packed_isolation_matches_standalone_doc(self, random_seed: int) -> None:
+        """Doc B packed after doc A must produce the same logits as doc B alone.
+
+        This is the issue #7 "done" criterion: with strict metadata, no state
+        (attention, ComplexEMA, TimestepNorm) may leak across packed documents.
+        """
+        config = small_config()
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_a, k_b = jax.random.split(key, 3)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        # doc A (6) + doc B (7) + padding (3), single 16-token chunk
+        ids_a = jax.random.randint(k_a, (1, 6), 0, config.vocab_size)
+        ids_b = jax.random.randint(k_b, (1, 7), 0, config.vocab_size)
+        input_ids = jnp.concatenate([ids_a, ids_b, jnp.zeros((1, 3), dtype=ids_a.dtype)], axis=1)
+        attention_mask = jnp.asarray([[True] * 13 + [False] * 3])
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(7)) + [0, 0, 0]], dtype=jnp.int32)
+
+        logits_packed, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        logits_b, _ = model(ids_b)
+
+        np.testing.assert_allclose(
+            np.array(logits_packed[:, 6:13, :]),
+            np.array(logits_b),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="Packed doc B logits should match doc B run alone",
+        )
+
+    def test_gradient_isolation_no_leak_from_doc_a_to_doc_b(self, random_seed: int) -> None:
+        """Loss on doc B tokens must produce zero gradients on doc A embeddings.
+
+        Uses an untied LM head: with tied weights the softmax gradient is dense
+        over every embedding row regardless of state leaks, which would mask the
+        signal this test is after.
+        """
+        config = replace(small_config(), output_size=small_config().vocab_size + 1)
+        key = jax.random.PRNGKey(random_seed)
+        model = MegalodonForCausalLM(config, key=key)
+        assert not model.tied
+
+        # Disjoint token-id ranges so embedding rows are attributable per doc
+        ids_a = jnp.arange(10, 16, dtype=jnp.int32)[None, :]  # doc A: 6 tokens
+        ids_b = jnp.arange(100, 107, dtype=jnp.int32)[None, :]  # doc B: 7 tokens
+        input_ids = jnp.concatenate([ids_a, ids_b, jnp.zeros((1, 3), dtype=jnp.int32)], axis=1)
+        attention_mask = jnp.asarray([[True] * 13 + [False] * 3])
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(7)) + [0, 0, 0]], dtype=jnp.int32)
+
+        # Ignore all doc A predictions plus the A->B boundary pair
+        # (logit at A's last position predicts B's first token)
+        labels = jnp.where(
+            (jnp.arange(16)[None, :] < 7) | (jnp.arange(16)[None, :] >= 13),
+            -100,
+            input_ids,
+        )
+
+        def loss_fn(m: MegalodonForCausalLM) -> jnp.ndarray:
+            """Compute loss restricted to doc B's tokens.
+
+            :param MegalodonForCausalLM m: Model under test.
+            :return jnp.ndarray: Scalar loss value.
+            """
+            return m.compute_loss(
+                input_ids,
+                labels,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+            )
+
+        grads = eqx.filter_grad(loss_fn)(model)
+        embed_grads = np.array(grads.model.embed.weight)
+
+        np.testing.assert_allclose(
+            embed_grads[10:16],
+            0.0,
+            atol=1e-5,
+            err_msg="Doc A embedding rows received gradient from doc B's loss",
+        )
+        # Guard against a vacuously-zero-everywhere pass
+        assert np.max(np.abs(embed_grads[100:107])) > 1e-6
+
+    def test_no_segment_ids_bit_identical_regression(self, random_seed: int) -> None:
+        """Omitting segment_ids must be bit-identical to passing None explicitly."""
+        config = small_config()
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_data = jax.random.split(key)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        input_ids = jax.random.randint(k_data, (2, 12), 0, config.vocab_size)
+        attention_mask = jnp.ones((2, 12), dtype=jnp.bool_)
+
+        logits_base, _ = model(input_ids, attention_mask=attention_mask)
+        logits_none, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=None,
+            position_ids=None,
+        )
+
+        assert np.array_equal(np.array(logits_base), np.array(logits_none))
+
+    def test_trivial_segment_ids_close_to_unsegmented(self, random_seed: int) -> None:
+        """A single segment spanning the valid region must match segment_ids=None.
+
+        Forces every CEMA call in the stack onto the segmented (associative
+        scan) path and every norm onto the segment-local path; a trivial
+        segmentation must agree with the FFT/global baseline at valid positions.
+        """
+        config = replace(small_config(), chunk_size=8)
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_data = jax.random.split(key)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        input_ids = jax.random.randint(k_data, (2, 16), 0, config.vocab_size)
+        attention_mask = jnp.asarray([[True] * 12 + [False] * 4] * 2)
+        segment_ids = attention_mask.astype(jnp.int32)
+        position_ids = jnp.broadcast_to(jnp.arange(16, dtype=jnp.int32)[None, :], (2, 16))
+
+        logits_base, _ = model(input_ids, attention_mask=attention_mask)
+        logits_seg, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+
+        # Padding positions legitimately differ (segment-0 queries attend to
+        # nothing); the valid region must agree. Tolerance is slightly looser
+        # than usual: the segmented scan and cumsum sum in different association
+        # orders, leaving O(1e-4) dust on later-layer activations.
+        np.testing.assert_allclose(
+            np.array(logits_seg[:, :12, :]),
+            np.array(logits_base[:, :12, :]),
+            rtol=1e-3,
+            atol=5e-4,
+            err_msg="Trivial segmentation should match the unsegmented baseline",
+        )
