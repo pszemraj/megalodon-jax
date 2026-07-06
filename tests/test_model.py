@@ -2292,3 +2292,14 @@ class TestPackedMetadata:
             np.array(logits_default[:, 4:, :]),
             np.array(logits_strict[:, 4:, :]),
         )
+
+    def test_cache_or_return_cache_with_segment_ids_raises(self, random_seed: int) -> None:
+        """Strict packed metadata must be rejected on any streaming path."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+
+        input_ids = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=jnp.int32)
+        segment_ids = jnp.ones_like(input_ids, dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="non-cached training"):
+            model(input_ids, segment_ids=segment_ids, return_cache=True)

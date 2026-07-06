@@ -385,6 +385,11 @@ class MegalodonModel(eqx.Module):
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
         # Guard both cache input AND output - streaming path is used in either case
         uses_streaming = layer_return_cache or cache is not None
+        if uses_streaming and (segment_ids is not None or position_ids is not None):
+            raise ValueError(
+                "segment_ids/position_ids are only supported for non-cached training calls. "
+                "Disable cache/return_cache for strict packed attention."
+            )
         if uses_streaming and attention_mask is not None:
             # Check if any position is masked (False = padding)
             # Use eqx.error_if for traced-value-safe conditional errors
@@ -442,8 +447,10 @@ class MegalodonModel(eqx.Module):
                 )
                 new_caches.append(new_cache)
 
-        # Final TimestepNorm
-        x, final_norm_state = self.norm(x, state=final_norm_state, mask=attention_mask)
+        # Final TimestepNorm (segment-aware for packed sequences)
+        x, final_norm_state = self.norm(
+            x, state=final_norm_state, mask=attention_mask, segment_ids=segment_ids
+        )
 
         # Build output cache with stop_gradient to prevent accidental backprop
         # through cache history when cache is fed back under jax.grad

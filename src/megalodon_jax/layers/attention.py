@@ -1229,17 +1229,21 @@ class MegalodonAttention(eqx.Module):
         ema_state = cache.ema.h if cache is not None and cache.ema is not None else None
         attn_cache = cache.attn if cache is not None else None
 
-        # TimestepNorm
-        x_tn, new_norm_state = self.timenorm(x, state=norm_state, mask=mask)
+        # TimestepNorm (segment_ids resets running stats at packed-doc boundaries)
+        x_tn, new_norm_state = self.timenorm(
+            x, state=norm_state, mask=mask, segment_ids=segment_ids
+        )
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
-        # Pass mask to prevent EMA state contamination from padded positions
+        # Pass mask to prevent EMA state contamination from padded positions;
+        # segment_ids resets the EMA state at packed-doc boundaries
         need_ema_state = return_cache or ema_state is not None
         y_cema, h_last = self.cema(
             x_tn.transpose(0, 2, 1),  # (B, D, L)
             h_init=ema_state,
             return_state=need_ema_state,
             mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
+            segment_ids=segment_ids,
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 

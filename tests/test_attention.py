@@ -653,6 +653,53 @@ class TestMegalodonAttention:
         assert not jnp.any(jnp.isnan(grads.wz.weight))
         assert not jnp.any(jnp.isnan(grads.wv.weight))
 
+    def test_segment_ids_isolate_cema_and_timenorm(self, random_seed: int) -> None:
+        """Packed doc B must match doc B alone through the full block.
+
+        Exercises the segment_ids plumbing into TimestepNorm, ComplexEMA, and
+        ChunkedAttention together: with strict metadata, no state (norm stats,
+        EMA state, attention) may leak from doc A into doc B.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        model_dim, z_dim, value_dim = 64, 32, 64
+        num_heads, cema_ndim, chunk_size = 4, 8, 16
+        norm_num_groups = 8
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        attn = MegalodonAttention(
+            model_dim=model_dim,
+            z_dim=z_dim,
+            value_dim=value_dim,
+            num_heads=num_heads,
+            cema_ndim=cema_ndim,
+            chunk_size=chunk_size,
+            norm_num_groups=norm_num_groups,
+            key=k1,
+        )
+
+        # doc A (5) + padding (2) + doc B (6), all within one chunk
+        x_a = jax.random.normal(k2, (1, 5, model_dim))
+        x_b = jax.random.normal(k3, (1, 6, model_dim))
+        x_packed = jnp.concatenate([x_a, jnp.zeros((1, 2, model_dim)), x_b], axis=1)
+        segment_ids = jnp.asarray([[1] * 5 + [0] * 2 + [2] * 6], dtype=jnp.int32)
+        position_ids = jnp.asarray([[0, 1, 2, 3, 4, 0, 0, 0, 1, 2, 3, 4, 5]], dtype=jnp.int32)
+        mask = jnp.asarray([[True] * 5 + [False] * 2 + [True] * 6])
+
+        y_packed, _ = attn(x_packed, mask=mask, segment_ids=segment_ids, position_ids=position_ids)
+        y_b, _ = attn(x_b)
+
+        np.testing.assert_allclose(
+            np.array(y_packed[:, 7:]),
+            np.array(y_b),
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg="Doc B through packed row should match doc B alone",
+        )
+
     def test_streaming_with_cache(self, random_seed: int) -> None:
         """Test MegalodonAttention streaming with cache.
 
