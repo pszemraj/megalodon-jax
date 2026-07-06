@@ -11,6 +11,7 @@
     - [No Fused Kernels](#no-fused-kernels)
     - [No 4D Chunk Parallelism](#no-4d-chunk-parallelism)
     - [Sequential CEMA vs FFT](#sequential-cema-vs-fft)
+    - [Packed-Sequence State Isolation](#packed-sequence-state-isolation)
   - [Optional Experiments](#optional-experiments)
   - [Numerical Stability](#numerical-stability)
     - [TimestepNorm - Kahan Summation Analysis](#timestepnorm---kahan-summation-analysis)
@@ -26,6 +27,7 @@
 
 ## Release Notes
 
+- Unreleased: packed-sequence training with `segment_ids`/`position_ids` now fully isolates documents: strict attention masking plus ComplexEMA and TimestepNorm state resets at segment boundaries (see [Packed-Sequence State Isolation](#packed-sequence-state-isolation)). Models expose `supports_segment_reset = True` for harness capability detection.
 - Unreleased: conversion utilities now live in `megalodon_jax.convert` and require torch; install `megalodon-jax[convert]` and import explicitly.
 - Unreleased: `generate()` no longer accepts a `seed` argument; padded `attention_mask` is rejected for cached generation (`max_new_tokens > 1`, `return_cache=True`, or cache provided).
 - Unreleased: added accum/softmax dtypes, GEMM backend selection, and centralized GEMM ops for future FP8 backends.
@@ -71,6 +73,26 @@ When `return_state=True`, CEMA uses `jax.lax.scan` over timesteps. This is ~6x s
 | 4096    | 1.27ms      | 0.25ms  | 153ms       | 26ms    |
 
 Training uses FFT automatically (`return_state=False`). Sequential path is only for streaming inference where state must be preserved.
+
+### Packed-Sequence State Isolation
+
+Passing `segment_ids` (0 = padding) with `position_ids` isolates packed documents end to end: attention is segment-masked, RoPE positions restart per document, and both ComplexEMA state and TimestepNorm running statistics reset at segment boundaries. Each packed document produces the same outputs (and gradients) as running it alone; verified by exact-zero gradient-isolation tests.
+
+Design notes:
+
+- **Training-only.** Strict metadata is rejected on any streaming path (`cache` or `return_cache`); the model raises before any compute.
+- **CEMA segmented path** defaults to a parallel `jax.lax.associative_scan` over `(A, b)` affine pairs with `A = 0` at boundaries. A sequential `lax.scan` fallback (`ComplexEMA(..., use_associative_segment_scan=False)`) trades speed for minimal memory: the associative path materializes two `(L, B, D, N)` complex64 tensors (see table). The FFT path cannot express resets and is bypassed whenever `segment_ids` is given.
+- **TimestepNorm segmented path** uses a reset-carrying associative scan, not "global cumsum minus value at boundary": the subtraction is exact algebraically but catastrophically cancels in fp32 once earlier segments' magnitudes dwarf the local sums (observed 2e-2 cross-doc contamination on layer-2 activations), and it leaves a gradient path across the boundary.
+- **Capability detection:** harnesses should check `getattr(model, "supports_segment_reset", False)` instead of introspecting `compute_loss`'s signature, which cannot distinguish attention-only isolation from full state isolation.
+
+CEMA path timings (`scratch/benchmark_cema_reset.py`, D=256, N=16, RTX 5090, single trivial segment):
+
+| L    | B   | FFT fwd | assoc fwd | seq fwd | FFT f+b | assoc f+b | seq f+b | A+b mem |
+| ---- | --- | ------- | --------- | ------- | ------- | --------- | ------- | ------- |
+| 1024 | 8   | 0.10ms  | 0.50ms    | 6.3ms   | 0.20ms  | 1.1ms     | 14.8ms  | 537MB   |
+| 4096 | 8   | 0.43ms  | 2.3ms     | 25.3ms  | 0.95ms  | 5.9ms     | 59.3ms  | 2.1GB   |
+
+The associative path is ~5x slower than FFT (training-viable); the sequential fallback is ~10-60x slower than associative on GPU but faster on CPU. Memory scales linearly in `L*B*D*N`; at production dims (D=1024) expect ~4x the table's footprint.
 
 ## Optional Experiments
 
