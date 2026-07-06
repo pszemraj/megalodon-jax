@@ -20,9 +20,12 @@ The recurrence is:
     h[t] = q * h[t-1] + p * x[t]
     y[t] = Re(sum(h[t] * gamma))
 
-Two computation paths are provided:
+Three computation paths are provided:
 - FFT: O(L log L) convolution for training (no state needed)
 - Sequential: O(L) scan for streaming inference (state needed)
+- Segmented: parallel associative scan for packed sequences (segment_ids),
+  resetting the state at segment boundaries; a sequential low-memory
+  fallback is also available.
 """
 
 import math
@@ -30,7 +33,7 @@ import math
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Complex, Float, PRNGKeyArray
+from jaxtyping import Array, Bool, Complex, Float, Int, PRNGKeyArray
 
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
@@ -157,6 +160,81 @@ class ComplexEMA(eqx.Module):
         """
         return a.real * b.real - a.imag * b.imag
 
+    @staticmethod
+    def _segment_boundaries(segment_ids: Int[Array, "batch seq"]) -> Bool[Array, "batch seq"]:
+        """Mark positions where a new segment starts.
+
+        Position 0 always starts a segment; later positions start one when
+        their segment id differs from the previous position's.
+
+        :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs (0 = padding).
+        :return Bool[Array, "batch seq"]: True where the EMA state must reset.
+        """
+        B, L = segment_ids.shape
+        if L == 0:
+            return jnp.zeros((B, 0), dtype=jnp.bool_)
+        return jnp.concatenate(
+            [
+                jnp.ones((B, 1), dtype=jnp.bool_),
+                segment_ids[:, 1:] != segment_ids[:, :-1],
+            ],
+            axis=1,
+        )
+
+    def _forward_segmented(
+        self,
+        x: Float[Array, "batch dim seq"],
+        segment_ids: Int[Array, "batch seq"],
+    ) -> tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]:
+        """Segment-aware EMA via parallel associative scan.
+
+        Each step is an affine map h[t] = A[t] * h[t-1] + b[t] with A[t] = q,
+        except at segment starts where A[t] = 0 so no state crosses document
+        boundaries in packed sequences. Composition of affine maps is
+        associative, so the full trajectory is computed in log depth.
+
+        Materializes (L, B, D, N) complex64 tensors for A and b; for
+        memory-constrained cases use the sequential fallback
+        (``_forward_sequential`` with ``segment_ids``).
+
+        :param Float[Array, "batch dim seq"] x: Input tensor (masked positions pre-zeroed).
+        :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs (0 = padding).
+        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output tensor and final EMA state.
+        """
+        p, q, gamma = self._coeffs()  # (D, N) each
+
+        # (L, B, 1, 1) reset flags broadcasting against coefficient (D, N) axes
+        reset = jnp.moveaxis(self._segment_boundaries(segment_ids), -1, 0)[:, :, None, None]
+
+        # Per-step affine coefficients, (L, B, D, N) complex64
+        x_t = jnp.moveaxis(x.astype(jnp.float32), -1, 0)[:, :, :, None]  # (L, B, D, 1)
+        A = jnp.where(reset, jnp.zeros((), dtype=jnp.complex64), q[None, None, :, :])
+        b = p[None, None, :, :] * x_t.astype(jnp.complex64)
+
+        def combine(
+            left: tuple[Complex[Array, "..."], Complex[Array, "..."]],
+            right: tuple[Complex[Array, "..."], Complex[Array, "..."]],
+        ) -> tuple[Complex[Array, "..."], Complex[Array, "..."]]:
+            """Compose two affine maps (earlier left, later right).
+
+            :param tuple left: Coefficients (A, b) of the earlier map.
+            :param tuple right: Coefficients (A, b) of the later map.
+            :return tuple: Coefficients of the composed map.
+            """
+            A_l, b_l = left
+            A_r, b_r = right
+            return A_r * A_l, A_r * b_l + b_r
+
+        # Inclusive prefix composition; with h[-1] = 0 (guaranteed by the
+        # h_init guard in __call__) the state trajectory is exactly b_cum.
+        _, h_seq = jax.lax.associative_scan(combine, (A, b), axis=0)  # (L, B, D, N)
+
+        y_seq = self._real_of_product(h_seq, gamma[None, None, :, :]).sum(axis=-1)  # (L, B, D)
+        y = jnp.moveaxis(y_seq, 0, -1)  # (B, D, L)
+
+        # Return fp32 - caller handles dtype conversion
+        return y, h_seq[-1]
+
     def _forward_fft(self, x: Float[Array, "batch dim seq"]) -> Float[Array, "batch dim seq"]:
         """FFT-based convolution for training.
 
@@ -230,14 +308,18 @@ class ComplexEMA(eqx.Module):
         self,
         x: Float[Array, "batch dim seq"],
         h_init: Complex[Array, "batch dim ndim"] | None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
     ) -> tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]:
         """Sequential recurrence using lax.scan.
 
         Computes the EMA recurrence h[t] = q * h[t-1] + p * x[t] using
-        jax.lax.scan for efficiency.
+        jax.lax.scan for efficiency. When segment_ids is given, the state is
+        zeroed at segment boundaries (low-memory fallback to the parallel
+        ``_forward_segmented`` path).
 
         :param Float[Array, "batch dim seq"] x: Input tensor.
         :param Complex[Array, "batch dim ndim"] | None h_init: Initial EMA state.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional per-token segment IDs.
         :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output tensor and final EMA state.
         """
         B, D, L = x.shape
@@ -270,7 +352,26 @@ class ComplexEMA(eqx.Module):
 
         # x is (B, D, L), scan over L
         x_transposed = jnp.moveaxis(x.astype(jnp.float32), -1, 0)  # (L, B, D)
-        h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
+        if segment_ids is None:
+            h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
+        else:
+            reset_seq = jnp.moveaxis(self._segment_boundaries(segment_ids), -1, 0)  # (L, B)
+
+            def step_with_reset(
+                h: Complex[Array, "batch dim ndim"],
+                inputs: tuple[Float[Array, "batch dim"], Bool[Array, "batch"]],
+            ) -> tuple[Complex[Array, "batch dim ndim"], Float[Array, "batch dim"]]:
+                """Single EMA step with state reset at segment starts.
+
+                :param Complex[Array, "batch dim ndim"] h: Previous EMA state.
+                :param tuple inputs: Input for the timestep and its reset flag.
+                :return tuple[Complex[Array, "batch dim ndim"], Float[Array, "batch dim"]]: Updated state and output.
+                """
+                x_t, reset_t = inputs
+                h = jnp.where(reset_t[:, None, None], jnp.zeros((), dtype=jnp.complex64), h)
+                return step(h, x_t)
+
+            h_final, y_seq = jax.lax.scan(step_with_reset, h_init, (x_transposed, reset_seq))
         y = jnp.moveaxis(y_seq, 0, -1)  # (B, D, L)
 
         # Return fp32 - caller handles dtype conversion
@@ -282,20 +383,41 @@ class ComplexEMA(eqx.Module):
         h_init: Complex[Array, "batch dim ndim"] | None = None,
         return_state: bool = False,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        use_associative_segment_scan: bool = True,
     ) -> tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]:
         """Apply EMA and optionally return final state.
 
         Automatically selects FFT path (faster) when no state is needed,
-        or sequential path when streaming.
+        or sequential path when streaming. When segment_ids is given (packed
+        sequences), the state resets at segment boundaries via a parallel
+        associative scan; the FFT path cannot express resets and is bypassed.
 
         :param Float[Array, "batch dim seq"] x: Input tensor.
         :param Complex[Array, "batch dim ndim"] | None h_init: Initial EMA state.
         :param bool return_state: Whether to return the final complex state.
         :param Bool[Array, "batch seq"] | None mask: Optional validity mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional per-token segment IDs
+            (0 = padding) for packed-sequence state resets. Training-only:
+            incompatible with h_init.
+        :param bool use_associative_segment_scan: Use the parallel associative scan for
+            the segmented path; False selects the sequential low-memory fallback.
         :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]: Output and optional final state.
         """
+        if segment_ids is not None and h_init is not None:
+            raise ValueError(
+                "segment_ids is not supported together with an incoming EMA state "
+                "(h_init). Packed-sequence resets are a training-only, non-streaming "
+                "feature."
+            )
+
         # Store input dtype for output cast
         input_dtype = x.dtype
+
+        # Positions outside any real segment (padding, id 0) must not contribute
+        if segment_ids is not None:
+            seg_valid = segment_ids > 0
+            mask = seg_valid if mask is None else (mask & seg_valid)
 
         # Zero masked positions to prevent new information from padding entering state.
         # Note: Masked positions still produce output based on decayed prior state
@@ -310,6 +432,13 @@ class ComplexEMA(eqx.Module):
         omega_f32 = self.omega.astype(jnp.float32)
         x_f32 = x.astype(jnp.float32)
         residual = x_f32 * omega_f32[None, :, None]
+
+        if segment_ids is not None:
+            if use_associative_segment_scan:
+                y, h_final = self._forward_segmented(x, segment_ids)
+            else:
+                y, h_final = self._forward_sequential(x, None, segment_ids=segment_ids)
+            return (y + residual).astype(input_dtype), h_final if return_state else None
 
         use_fft = h_init is None and not return_state
         if use_fft:

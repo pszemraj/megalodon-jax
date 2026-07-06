@@ -455,6 +455,179 @@ class TestComplexEMAParity:
         np.testing.assert_array_equal(np.array(y1), np.array(y2))
 
 
+class TestComplexEMASegmentReset:
+    """Tests for packed-sequence state resets in ComplexEMA."""
+
+    @staticmethod
+    def _packed_two_docs(
+        random_seed: int, dim: int = 8, ndim: int = 4
+    ) -> tuple[ComplexEMA, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Build an EMA module plus doc A, doc B, and their packed row.
+
+        Layout: doc A (5 tokens) + padding (2 tokens, segment 0) + doc B (5 tokens).
+
+        :param int random_seed: Random seed fixture value.
+        :param int dim: Hidden dimension.
+        :param int ndim: EMA orders per hidden unit.
+        :return tuple: (ema, x_doc_a, x_doc_b, x_packed, segment_ids).
+        """
+        key = jax.random.PRNGKey(random_seed)
+        k_ema, k_a, k_b = jax.random.split(key, 3)
+        ema = ComplexEMA(dim, ndim, key=k_ema)
+        x_a = jax.random.normal(k_a, (1, dim, 5))
+        x_b = jax.random.normal(k_b, (1, dim, 5))
+        x_packed = jnp.concatenate([x_a, jnp.zeros((1, dim, 2)), x_b], axis=-1)
+        segment_ids = jnp.asarray([[1] * 5 + [0] * 2 + [2] * 5], dtype=jnp.int32)
+        return ema, x_a, x_b, x_packed, segment_ids
+
+    def test_segment_ids_none_matches_baseline(self, random_seed: int) -> None:
+        """Passing segment_ids=None must be bit-identical to omitting it.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+        ema = ComplexEMA(16, 4, key=k1)
+        x = jax.random.normal(k2, (2, 16, 24))
+        mask = jnp.ones((2, 24), dtype=jnp.bool_)
+
+        y_base, _ = ema(x, mask=mask)
+        y_none, _ = ema(x, mask=mask, segment_ids=None)
+
+        np.testing.assert_array_equal(np.array(y_base), np.array(y_none))
+
+    @pytest.mark.parametrize("use_associative", [True, False])
+    def test_segment_reset_matches_per_doc_alone(
+        self, random_seed: int, use_associative: bool
+    ) -> None:
+        """Packed docs with resets must match each doc run alone.
+
+        :param int random_seed: Random seed fixture.
+        :param bool use_associative: Which segmented implementation to test.
+        :return None: None.
+        """
+        ema, x_a, x_b, x_packed, segment_ids = self._packed_two_docs(random_seed)
+
+        y_packed, h_packed = ema(
+            x_packed,
+            segment_ids=segment_ids,
+            return_state=True,
+            use_associative_segment_scan=use_associative,
+        )
+        y_a, _ = ema(x_a)
+        y_b, h_b = ema(x_b, return_state=True)
+
+        np.testing.assert_allclose(
+            np.array(y_packed[..., :5]),
+            np.array(y_a),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Doc A slice should match doc A alone",
+        )
+        np.testing.assert_allclose(
+            np.array(y_packed[..., 7:]),
+            np.array(y_b),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Doc B slice should match doc B alone (no state leak)",
+        )
+        # Returned state is local to the last open segment (doc B)
+        np.testing.assert_allclose(
+            np.array(h_packed),
+            np.array(h_b),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Final state should equal doc B's standalone state",
+        )
+
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+    def test_associative_matches_sequential_reset(self, random_seed: int, dtype: Any) -> None:
+        """Associative and sequential segmented paths must agree.
+
+        :param int random_seed: Random seed fixture.
+        :param Any dtype: Input dtype under test.
+        :return None: None.
+        """
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+        ema = ComplexEMA(32, 8, key=k1)
+        x = jax.random.normal(k2, (2, 32, 40)).astype(dtype)
+        segment_ids = jnp.asarray(
+            [[1] * 16 + [2] * 24, [1] * 8 + [2] * 8 + [0] * 4 + [3] * 20],
+            dtype=jnp.int32,
+        )
+
+        y_assoc, h_assoc = ema(x, segment_ids=segment_ids, return_state=True)
+        y_seq, h_seq = ema(
+            x,
+            segment_ids=segment_ids,
+            return_state=True,
+            use_associative_segment_scan=False,
+        )
+
+        tol = 1e-2 if dtype == jnp.bfloat16 else 1e-5
+        np.testing.assert_allclose(
+            np.array(y_assoc, dtype=np.float32),
+            np.array(y_seq, dtype=np.float32),
+            rtol=tol,
+            atol=tol,
+            err_msg="Associative and sequential reset paths should agree",
+        )
+        np.testing.assert_allclose(
+            np.array(h_assoc),
+            np.array(h_seq),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Final states of both reset paths should agree",
+        )
+
+    @pytest.mark.parametrize("use_associative", [True, False])
+    def test_single_segment_matches_fft(self, random_seed: int, use_associative: bool) -> None:
+        """Trivial single-segment ids must reproduce the FFT path output.
+
+        :param int random_seed: Random seed fixture.
+        :param bool use_associative: Which segmented implementation to test.
+        :return None: None.
+        """
+        dim = 64
+        ndim = 16
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2 = jax.random.split(key)
+        ema = ComplexEMA(dim, ndim, key=k1)
+        batch, seq = 2, 32
+        x = jax.random.normal(k2, (batch, dim, seq))
+        segment_ids = jnp.ones((batch, seq), dtype=jnp.int32)
+
+        y_fft, _ = ema(x)
+        y_seg, _ = ema(
+            x,
+            segment_ids=segment_ids,
+            use_associative_segment_scan=use_associative,
+        )
+
+        np.testing.assert_allclose(
+            np.array(y_seg),
+            np.array(y_fft),
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg="Single-segment reset path should match FFT path",
+        )
+
+    def test_raises_when_segment_ids_with_h_init(self, random_seed: int) -> None:
+        """segment_ids combined with an incoming state must raise.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        ema, _, _, x_packed, segment_ids = self._packed_two_docs(random_seed)
+        h_init = jnp.zeros((1, 8, 4), dtype=jnp.complex64)
+
+        with pytest.raises(ValueError, match="segment_ids"):
+            ema(x_packed, h_init=h_init, segment_ids=segment_ids)
+
+
 class TestPrecisionPolicy:
     """Tests for bf16/fp16 precision handling."""
 
