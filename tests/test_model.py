@@ -2303,3 +2303,12 @@ class TestPackedMetadata:
 
         with pytest.raises(ValueError, match="non-cached training"):
             model(input_ids, segment_ids=segment_ids, return_cache=True)
+
+    def test_supports_segment_reset_flag_present(self, random_seed: int) -> None:
+        """Capability flag must be exposed on classes and instances."""
+        assert MegalodonModel.supports_segment_reset is True
+        assert MegalodonForCausalLM.supports_segment_reset is True
+
+        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(random_seed))
+        assert getattr(model, "supports_segment_reset", False) is True
+        assert getattr(model.model, "supports_segment_reset", False) is True

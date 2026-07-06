@@ -19,7 +19,7 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax
@@ -228,6 +228,11 @@ class MegalodonModel(eqx.Module):
     The final TimestepNorm carries state just like per-layer norms, enabling
     proper streaming normalization across chunks.
     """
+
+    # Capability flag for training harnesses: segment_ids fully isolates packed
+    # documents (attention, ComplexEMA, and TimestepNorm state all reset at
+    # segment boundaries), not just attention masking.
+    supports_segment_reset: ClassVar[bool] = True
 
     embed: eqx.nn.Embedding
     layers: tuple[MegalodonBlock, ...]
@@ -481,6 +486,11 @@ class MegalodonForCausalLM(eqx.Module):
     For tied weights, logits are computed as: hidden @ embed.weight.T
     For untied weights, logits are computed via the lm_head Linear layer.
     """
+
+    # Capability flag for training harnesses: segment_ids fully isolates packed
+    # documents (attention, ComplexEMA, and TimestepNorm state all reset at
+    # segment boundaries), not just attention masking.
+    supports_segment_reset: ClassVar[bool] = True
 
     model: MegalodonModel
     lm_head: eqx.nn.Linear | None  # None when tied
