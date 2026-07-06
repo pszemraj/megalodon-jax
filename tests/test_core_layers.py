@@ -218,6 +218,169 @@ class TestTimestepNormParity:
             assert y.shape == shape
 
 
+class TestTimestepNormSegmentReset:
+    """Tests for packed-sequence stat resets in TimestepNorm."""
+
+    @staticmethod
+    def _packed_two_docs(
+        random_seed: int, dim: int = 16, num_groups: int = 4
+    ) -> tuple[TimestepNorm, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Build a norm module plus doc A, doc B, and their packed row.
+
+        Layout: doc A (5 tokens) + padding (2 tokens, segment 0) + doc B (6 tokens).
+
+        :param int random_seed: Random seed fixture value.
+        :param int dim: Feature dimension.
+        :param int num_groups: Number of normalization groups.
+        :return tuple: (norm, x_doc_a, x_doc_b, x_packed, segment_ids, mask).
+        """
+        norm = TimestepNorm(dim, num_groups)
+        key = jax.random.PRNGKey(random_seed)
+        k_a, k_b = jax.random.split(key)
+        x_a = jax.random.normal(k_a, (1, 5, dim))
+        x_b = jax.random.normal(k_b, (1, 6, dim))
+        x_packed = jnp.concatenate([x_a, jnp.zeros((1, 2, dim)), x_b], axis=1)
+        segment_ids = jnp.asarray([[1] * 5 + [0] * 2 + [2] * 6], dtype=jnp.int32)
+        mask = jnp.asarray([[True] * 5 + [False] * 2 + [True] * 6])
+        return norm, x_a, x_b, x_packed, segment_ids, mask
+
+    def test_segment_ids_none_matches_baseline(self, random_seed: int) -> None:
+        """Passing segment_ids=None must be bit-identical to omitting it.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        norm = TimestepNorm(16, 4)
+        key = jax.random.PRNGKey(random_seed)
+        x = jax.random.normal(key, (2, 12, 16))
+        mask = jnp.ones((2, 12), dtype=jnp.bool_)
+
+        y_base, state_base = norm(x, mask=mask)
+        y_none, state_none = norm(x, mask=mask, segment_ids=None)
+
+        np.testing.assert_array_equal(np.array(y_base), np.array(y_none))
+        np.testing.assert_array_equal(np.array(state_base.count), np.array(state_none.count))
+        np.testing.assert_array_equal(np.array(state_base.mean), np.array(state_none.mean))
+        np.testing.assert_array_equal(np.array(state_base.var), np.array(state_none.var))
+
+    def test_segment_reset_matches_per_doc_alone(self, random_seed: int) -> None:
+        """Packed docs with resets must normalize like each doc alone.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        norm, x_a, x_b, x_packed, segment_ids, mask = self._packed_two_docs(random_seed)
+
+        y_packed, _ = norm(x_packed, mask=mask, segment_ids=segment_ids)
+        y_a, _ = norm(x_a)
+        y_b, _ = norm(x_b)
+
+        np.testing.assert_allclose(
+            np.array(y_packed[:, :5]),
+            np.array(y_a),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Doc A slice should match doc A alone",
+        )
+        np.testing.assert_allclose(
+            np.array(y_packed[:, 7:]),
+            np.array(y_b),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Doc B slice should match doc B alone (no stat leak)",
+        )
+
+    def test_segment_reset_matches_explicit_numpy_welford(self, random_seed: int) -> None:
+        """Compare segmented running stats to an explicit Welford loop with resets.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        dim = 16
+        num_groups = 4
+        group_size = dim // num_groups
+        norm = TimestepNorm(dim, num_groups)
+
+        key = jax.random.PRNGKey(random_seed)
+        x = jax.random.normal(key, (2, 8, dim))
+        segment_ids = jnp.asarray(
+            [
+                [1, 1, 1, 2, 2, 2, 2, 2],
+                [1, 1, 0, 0, 3, 3, 3, 3],
+            ],
+            dtype=jnp.int32,
+        )
+        mask = jnp.asarray(
+            [
+                [True, True, False, True, True, True, True, True],
+                [True, True, False, False, True, True, True, True],
+            ]
+        )
+
+        _, state = norm(x, mask=mask, segment_ids=segment_ids)
+
+        x_np = np.array(x, dtype=np.float32)
+        seg_np = np.array(segment_ids)
+        mask_np = np.array(mask)
+        count = np.zeros((2,), dtype=np.int32)
+        mean = np.zeros((2, num_groups), dtype=np.float32)
+        m2 = np.ones((2, num_groups), dtype=np.float32)
+
+        for t in range(x_np.shape[1]):
+            group_means = x_np[:, t].reshape(2, num_groups, group_size).mean(axis=-1)
+            for b in range(2):
+                if t > 0 and seg_np[b, t] != seg_np[b, t - 1]:
+                    # Segment boundary: fresh state
+                    count[b] = 0
+                    mean[b] = 0.0
+                    m2[b] = 1.0
+                if not mask_np[b, t] or seg_np[b, t] == 0:
+                    continue
+                count[b] += 1
+                delta = group_means[b] - mean[b]
+                mean[b] += delta / count[b]
+                delta2 = group_means[b] - mean[b]
+                m2[b] += delta * delta2
+
+        var = np.where(count[:, None] > 0, m2 / np.maximum(count[:, None], 1), 1.0)
+        var = np.maximum(var, VARIANCE_FLOOR)
+
+        np.testing.assert_array_equal(np.array(state.count), count)
+        np.testing.assert_allclose(np.array(state.mean), mean, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.array(state.var), var, rtol=1e-5, atol=1e-5)
+
+    def test_new_state_is_last_segment_local(self, random_seed: int) -> None:
+        """Returned state must equal running only the last doc with a fresh state.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        norm, _, x_b, x_packed, segment_ids, mask = self._packed_two_docs(random_seed)
+
+        _, state_packed = norm(x_packed, mask=mask, segment_ids=segment_ids)
+        _, state_b = norm(x_b)
+
+        np.testing.assert_array_equal(np.array(state_packed.count), np.array(state_b.count))
+        np.testing.assert_allclose(
+            np.array(state_packed.mean), np.array(state_b.mean), rtol=1e-5, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            np.array(state_packed.var), np.array(state_b.var), rtol=1e-5, atol=1e-5
+        )
+
+    def test_raises_when_segment_ids_with_state(self, random_seed: int) -> None:
+        """segment_ids combined with an incoming state must raise.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        norm, _, _, x_packed, segment_ids, mask = self._packed_two_docs(random_seed)
+        _, state = norm(x_packed, mask=mask)
+
+        with pytest.raises(ValueError, match="segment_ids"):
+            norm(x_packed, state=state, segment_ids=segment_ids)
+
+
 class TestComplexEMAParity:
     """Parity tests for ComplexEMA against PyTorch reference."""
 
