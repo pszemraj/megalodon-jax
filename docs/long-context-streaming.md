@@ -90,8 +90,8 @@ flowchart TD
 
 ## 4) Training vs. Inference
 
-- **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache).
-- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV; RoPE offset advances with absolute position.
+- **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache). Packed rows may pass `segment_ids`/`position_ids` for full per-document isolation (attention masking + EMA/norm state resets); see [dev.md](dev.md#packed-sequence-state-isolation).
+- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV; RoPE offset advances with absolute position. Packed metadata is rejected on any cached/streaming call - the model raises before compute.
 
 ## 5) Padding and Generation
 

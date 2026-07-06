@@ -6,6 +6,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 
 - Pure JAX/Equinox implementation in [src/megalodon_jax](src/megalodon_jax)
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
+- Packed-sequence training with full document isolation: `segment_ids` masks attention, resets EMA/norm state at boundaries, and excludes cross-document label pairs from the loss
 - JAX pytree caches for JIT-compatible streaming inference
 - Weight conversion utilities for PyTorch ↔ JAX interop
 - 150+ tests (200+ cases via parametrization) covering parity with the PyTorch reference
@@ -94,15 +95,38 @@ def loss_fn(model, input_ids, labels):
 grads = loss_fn(model, input_ids, labels)
 ```
 
+### Packed-Sequence Training
+
+Multiple documents can share one row with full isolation - attention, EMA state, and running norm statistics all reset at document boundaries, and the loss automatically skips cross-document label pairs:
+
+```python
+# doc A (3 tokens) + doc B (4 tokens) + padding (1), packed in one row
+input_ids = jnp.array([[5, 6, 7, 8, 9, 10, 11, 0]])
+attention_mask = jnp.array([[True] * 7 + [False]])
+segment_ids = jnp.array([[1, 1, 1, 2, 2, 2, 2, 0]])  # 0 = padding
+position_ids = jnp.array([[0, 1, 2, 0, 1, 2, 3, 0]])  # restart per document
+
+loss = model.compute_loss(
+    input_ids,
+    input_ids,
+    attention_mask=attention_mask,
+    segment_ids=segment_ids,
+    position_ids=position_ids,
+)
+```
+
+Each packed document produces the same outputs (and gradients) as running it alone. Packed metadata is training-only: it is rejected whenever a cache is involved. Harnesses can detect support via `getattr(model, "supports_segment_reset", False)`. See [docs/dev.md](docs/dev.md#packed-sequence-state-isolation) for design notes and benchmarks.
+
 ## Architecture
 
 ### Key Design Decisions
 
 1. **JAX Pytree Caches**: All cache/state objects are registered as JAX pytrees. Position counters are JAX scalar arrays (not Python ints) to prevent recompilation.
 
-2. **Two-Path ComplexEMA**:
+2. **Three-Path ComplexEMA**:
    - FFT path: O(L log L), used during training when no state needed
    - Sequential scan: O(L), maintains complex hidden state for streaming
+   - Segmented associative scan: O(L log L) work, resets state at document boundaries for packed training
 
 3. **Normalized Attention**: Q/K use per-head RMSNorm before affine transform. Attention uses `scale=1.0` (no `/sqrt(d_head)` scaling).
 
@@ -153,6 +177,7 @@ src/megalodon_jax/
 - Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
 - No 4D chunk parallelism (out of scope for single-device)
 - Cached decoding does not support padded batches
+- Packed-sequence metadata (`segment_ids`/`position_ids`) is training-only; rejected on cached/streaming calls
 - CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
 
 ## Testing
