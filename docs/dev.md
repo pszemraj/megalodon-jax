@@ -89,7 +89,7 @@ Design notes:
 - **Loss boundary masking is automatic.** `compute_loss(..., segment_ids=...)` excludes shifted label pairs that cross a segment boundary and pairs targeting padding (segment id 0); callers do not need to pre-set `ignore_index` at document joins.
 - **Capability detection:** harnesses should check `getattr(model, "supports_segment_reset", False)` instead of introspecting `compute_loss`'s signature, which cannot distinguish attention-only isolation from full state isolation.
 
-CEMA path timings (`scratch/benchmark_cema_reset.py`, D=256, N=16, RTX 5090, single trivial segment):
+CEMA path timings ([benchmarks/benchmark_cema_reset.py](../benchmarks/benchmark_cema_reset.py), D=256, N=16, RTX 5090, single trivial segment):
 
 | L    | B   | FFT fwd | assoc fwd | seq fwd | FFT f+b | assoc f+b | seq f+b | A+b mem |
 | ---- | --- | ------- | --------- | ------- | ------- | --------- | ------- | ------- |
