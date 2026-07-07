@@ -380,6 +380,37 @@ class TestTimestepNormSegmentReset:
         with pytest.raises(ValueError, match="segment_ids"):
             norm(x_packed, state=state, segment_ids=segment_ids)
 
+    def test_state_with_trailing_padding_matches_last_doc(self, random_seed: int) -> None:
+        """Trailing padding must not blank the returned state.
+
+        Regression: the state was read at position L-1, which for a row ending
+        in padding (segment 0) is the fresh-reset baseline (count=0, mean=0,
+        var=1) rather than the last document's statistics.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        dim = 16
+        norm = TimestepNorm(dim, 4)
+        key = jax.random.PRNGKey(random_seed)
+        k_a, k_b = jax.random.split(key)
+        x_a = jax.random.normal(k_a, (1, 5, dim))
+        x_b = jax.random.normal(k_b, (1, 6, dim))
+        x_packed = jnp.concatenate([x_a, x_b, jnp.zeros((1, 3, dim))], axis=1)
+        segment_ids = jnp.asarray([[1] * 5 + [2] * 6 + [0] * 3], dtype=jnp.int32)
+        mask = jnp.asarray([[True] * 11 + [False] * 3])
+
+        _, state_packed = norm(x_packed, mask=mask, segment_ids=segment_ids)
+        _, state_b = norm(x_b)
+
+        np.testing.assert_array_equal(np.array(state_packed.count), np.array(state_b.count))
+        np.testing.assert_allclose(
+            np.array(state_packed.mean), np.array(state_b.mean), rtol=1e-5, atol=1e-5
+        )
+        np.testing.assert_allclose(
+            np.array(state_packed.var), np.array(state_b.var), rtol=1e-5, atol=1e-5
+        )
+
 
 class TestComplexEMAParity:
     """Parity tests for ComplexEMA against PyTorch reference."""
@@ -789,6 +820,46 @@ class TestComplexEMASegmentReset:
 
         with pytest.raises(ValueError, match="segment_ids"):
             ema(x_packed, h_init=h_init, segment_ids=segment_ids)
+
+    @pytest.mark.parametrize("use_associative", [True, False])
+    def test_state_with_trailing_padding_matches_last_doc(
+        self, random_seed: int, use_associative: bool
+    ) -> None:
+        """Trailing padding must not zero the returned EMA state.
+
+        Regression: the state was read at position L-1; the padding run's
+        boundary reset left it all-zero instead of the last document's
+        standalone state.
+
+        :param int random_seed: Random seed fixture.
+        :param bool use_associative: Which segmented implementation to test.
+        :return None: None.
+        """
+        dim, ndim = 8, 4
+        key = jax.random.PRNGKey(random_seed)
+        k_ema, k_a, k_b = jax.random.split(key, 3)
+        ema = ComplexEMA(dim, ndim, key=k_ema)
+        x_a = jax.random.normal(k_a, (1, dim, 5))
+        x_b = jax.random.normal(k_b, (1, dim, 5))
+        x_packed = jnp.concatenate([x_a, x_b, jnp.zeros((1, dim, 3))], axis=-1)
+        segment_ids = jnp.asarray([[1] * 5 + [2] * 5 + [0] * 3], dtype=jnp.int32)
+
+        _, h_packed = ema(
+            x_packed,
+            segment_ids=segment_ids,
+            return_state=True,
+            use_associative_segment_scan=use_associative,
+        )
+        _, h_b = ema(x_b, return_state=True)
+
+        assert np.abs(np.array(h_packed)).max() > 0.0, "Returned state should not be all-zero"
+        np.testing.assert_allclose(
+            np.array(h_packed),
+            np.array(h_b),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Final state should equal doc B's standalone state despite trailing padding",
+        )
 
 
 class TestPrecisionPolicy:

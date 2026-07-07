@@ -2304,6 +2304,28 @@ class TestPackedMetadata:
         with pytest.raises(ValueError, match="non-cached training"):
             model(input_ids, segment_ids=segment_ids, return_cache=True)
 
+    def test_return_cache_with_segment_ids_raises_nondeterministic(self, random_seed: int) -> None:
+        """The cache rejection must hold under deterministic=False too.
+
+        Regression: the guard was gated on ``return_cache and deterministic``,
+        so dropout-mode calls silently returned a ModelCache carrying
+        segmented final-norm state instead of raising.
+        """
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+
+        input_ids = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=jnp.int32)
+        segment_ids = jnp.ones_like(input_ids, dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="non-cached training"):
+            model(
+                input_ids,
+                segment_ids=segment_ids,
+                return_cache=True,
+                deterministic=False,
+                key=jax.random.PRNGKey(0),
+            )
+
     def test_supports_segment_reset_flag_present(self, random_seed: int) -> None:
         """Capability flag must be exposed on classes and instances."""
         assert MegalodonModel.supports_segment_reset is True
@@ -2346,6 +2368,56 @@ class TestPackedMetadata:
             rtol=1e-4,
             atol=1e-4,
             err_msg="Packed doc B logits should match doc B run alone",
+        )
+
+    def test_position_ids_derived_from_segment_ids(self, random_seed: int) -> None:
+        """Omitting position_ids must derive per-document RoPE positions.
+
+        Regression: segment_ids without position_ids silently kept continuous
+        global RoPE phases across document boundaries while attention was
+        still isolated, so packed docs no longer matched running alone.
+        """
+        config = small_config()
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_a, k_b = jax.random.split(key, 3)
+        model = MegalodonForCausalLM(config, key=k_model)
+
+        # doc A (6) + doc B (7) + padding (3), single 16-token chunk
+        ids_a = jax.random.randint(k_a, (1, 6), 0, config.vocab_size)
+        ids_b = jax.random.randint(k_b, (1, 7), 0, config.vocab_size)
+        input_ids = jnp.concatenate([ids_a, ids_b, jnp.zeros((1, 3), dtype=ids_a.dtype)], axis=1)
+        attention_mask = jnp.asarray([[True] * 13 + [False] * 3])
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(7)) + [0, 0, 0]], dtype=jnp.int32)
+
+        logits_derived, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+        )
+        logits_explicit, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        logits_b, _ = model(ids_b)
+
+        # Valid region matches the explicit-position_ids call (padding may
+        # differ: derived pad positions are run-local, the explicit ones are 0)
+        np.testing.assert_allclose(
+            np.array(logits_derived[:, :13, :]),
+            np.array(logits_explicit[:, :13, :]),
+            rtol=1e-5,
+            atol=1e-5,
+            err_msg="Derived position_ids should reproduce explicit per-doc positions",
+        )
+        np.testing.assert_allclose(
+            np.array(logits_derived[:, 6:13, :]),
+            np.array(logits_b),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="Packed doc B logits should match doc B alone without explicit position_ids",
         )
 
     def test_gradient_isolation_no_leak_from_doc_a_to_doc_b(self, random_seed: int) -> None:
