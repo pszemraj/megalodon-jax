@@ -389,12 +389,17 @@ class MegalodonModel(eqx.Module):
         # - ComplexEMA and TimestepNorm have mask support for prefill, but
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
         # Guard both cache input AND output - streaming path is used in either case
-        uses_streaming = layer_return_cache or cache is not None
-        if uses_streaming and (segment_ids is not None or position_ids is not None):
+        # Packed metadata gates on raw return_cache, not layer_return_cache:
+        # with deterministic=False the layers skip caching, but a ModelCache is
+        # still assembled below and would carry segmented final-norm state.
+        if (return_cache or cache is not None) and (
+            segment_ids is not None or position_ids is not None
+        ):
             raise ValueError(
                 "segment_ids/position_ids are only supported for non-cached training calls. "
                 "Disable cache/return_cache for strict packed attention."
             )
+        uses_streaming = layer_return_cache or cache is not None
         if uses_streaming and attention_mask is not None:
             # Check if any position is masked (False = padding)
             # Use eqx.error_if for traced-value-safe conditional errors
