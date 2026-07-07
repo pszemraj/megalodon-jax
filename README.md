@@ -104,7 +104,9 @@ Multiple documents can share one row with full isolation - attention, EMA state,
 input_ids = jnp.array([[5, 6, 7, 8, 9, 10, 11, 0]])
 attention_mask = jnp.array([[True] * 7 + [False]])
 segment_ids = jnp.array([[1, 1, 1, 2, 2, 2, 2, 0]])  # 0 = padding
-position_ids = jnp.array([[0, 1, 2, 0, 1, 2, 3, 0]])  # restart per document
+# Optional: RoPE positions restarting per document. When omitted, they are
+# derived from segment_ids automatically.
+position_ids = jnp.array([[0, 1, 2, 0, 1, 2, 3, 0]])
 
 loss = model.compute_loss(
     input_ids,
