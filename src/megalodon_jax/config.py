@@ -60,6 +60,10 @@ class MegalodonConfig:
     max_positions: int = 1_000_000
     init_mode: InitMode = "gaussian"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
+    # Segmented CEMA path for packed sequences: parallel associative scan
+    # (fast, materializes (L, B, D, N) complex64 tensors) vs sequential scan
+    # (10-60x slower on GPU, O(1) extra memory). Only affects segment_ids runs.
+    use_associative_segment_scan: bool = True
     output_size: int = -1  # LM head size; -1 ties to vocab_size
     param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
     compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations

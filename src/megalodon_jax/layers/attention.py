@@ -1182,6 +1182,7 @@ class MegalodonAttention(eqx.Module):
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
     gemm_backend: str = eqx.field(static=True)
+    use_associative_segment_scan: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1204,6 +1205,7 @@ class MegalodonAttention(eqx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         accum_dtype: jnp.dtype = jnp.float32,
         gemm_backend: str = "default",
+        use_associative_segment_scan: bool = True,
         *,
         key: PRNGKeyArray,
     ):
@@ -1228,6 +1230,9 @@ class MegalodonAttention(eqx.Module):
         :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
         :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
         :param str gemm_backend: GEMM backend selector.
+        :param bool use_associative_segment_scan: Segmented CEMA implementation for
+            packed sequences: parallel associative scan (default) or the
+            sequential low-memory fallback.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.model_dim = model_dim
@@ -1243,6 +1248,7 @@ class MegalodonAttention(eqx.Module):
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
         self.gemm_backend = gemm_backend
+        self.use_associative_segment_scan = use_associative_segment_scan
 
         # Split keys
         keys = jax.random.split(key, 9)
@@ -1334,6 +1340,7 @@ class MegalodonAttention(eqx.Module):
             return_state=need_ema_state,
             mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
             segment_ids=segment_ids,
+            use_associative_segment_scan=self.use_associative_segment_scan,
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 

@@ -15,7 +15,7 @@ The JAX version provides three numerically equivalent paths:
 
 2. **Sequential path (streaming)** When `h_init` is provided or `return_state=True`, ComplexEMA runs the recurrence with `jax.lax.scan` (O(L)). The final complex state is returned only when `return_state=True`.
 
-3. **Segmented path (packed training)** When `segment_ids` is provided, the EMA state resets at every segment boundary so packed documents cannot leak into each other. The default implementation is a parallel `jax.lax.associative_scan` over `(A, b)` affine pairs with `A = 0` at boundaries; a sequential low-memory fallback is available via `use_associative_segment_scan=False`. The FFT path cannot express resets and is bypassed. See [dev.md](dev.md#packed-sequence-state-isolation) for benchmarks and design notes.
+3. **Segmented path (packed training)** When `segment_ids` is provided, the EMA state resets at every segment boundary so packed documents cannot leak into each other. The default implementation is a parallel `jax.lax.associative_scan` over `(A, b)` affine pairs with `A = 0` at boundaries; a sequential low-memory fallback is available via `MegalodonConfig(use_associative_segment_scan=False)` (threaded down to every layer's CEMA). The FFT path cannot express resets and is bypassed. See [dev.md](dev.md#packed-sequence-state-isolation) for benchmarks and design notes.
 
 ### Path Selection
 

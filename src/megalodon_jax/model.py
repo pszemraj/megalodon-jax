@@ -141,6 +141,7 @@ class MegalodonBlock(eqx.Module):
             compute_dtype=config.compute_dtype,
             accum_dtype=config.accum_dtype,
             gemm_backend=config.gemm_backend,
+            use_associative_segment_scan=config.use_associative_segment_scan,
             key=k1,
         )
 

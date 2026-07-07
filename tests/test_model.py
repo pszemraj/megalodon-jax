@@ -2420,6 +2420,39 @@ class TestPackedMetadata:
             err_msg="Packed doc B logits should match doc B alone without explicit position_ids",
         )
 
+    def test_sequential_segment_scan_config_matches_associative(self, random_seed: int) -> None:
+        """The config-selected sequential CEMA fallback must match the default path.
+
+        use_associative_segment_scan=False threads from MegalodonConfig down to
+        every layer's CEMA call, selecting the low-memory sequential scan; on a
+        packed batch it must agree with the associative default.
+        """
+        key = jax.random.PRNGKey(random_seed)
+        k_model, k_data = jax.random.split(key)
+        config_assoc = small_config()
+        config_seq = replace(config_assoc, use_associative_segment_scan=False)
+        # Same key -> identical weights; only the segmented scan impl differs
+        model_assoc = MegalodonForCausalLM(config_assoc, key=k_model)
+        model_seq = MegalodonForCausalLM(config_seq, key=k_model)
+        assert model_seq.model.layers[0].attn.use_associative_segment_scan is False
+
+        input_ids = jax.random.randint(k_data, (1, 16), 0, config_assoc.vocab_size)
+        attention_mask = jnp.asarray([[True] * 13 + [False] * 3])
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3], dtype=jnp.int32)
+
+        logits_assoc, _ = model_assoc(
+            input_ids, attention_mask=attention_mask, segment_ids=segment_ids
+        )
+        logits_seq, _ = model_seq(input_ids, attention_mask=attention_mask, segment_ids=segment_ids)
+
+        np.testing.assert_allclose(
+            np.array(logits_assoc[:, :13, :]),
+            np.array(logits_seq[:, :13, :]),
+            rtol=1e-4,
+            atol=1e-4,
+            err_msg="Sequential segmented CEMA (via config) should match associative default",
+        )
+
     def test_gradient_isolation_no_leak_from_doc_a_to_doc_b(self, random_seed: int) -> None:
         """Loss on doc B tokens must produce zero gradients on doc A embeddings.
 
