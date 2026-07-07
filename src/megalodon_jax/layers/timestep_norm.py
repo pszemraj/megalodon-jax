@@ -101,7 +101,10 @@ class TimestepNorm(eqx.Module):
 
         When segment_ids is given (packed sequences), the running statistics
         reset at each segment boundary so every packed document normalizes
-        exactly as if run alone with a fresh state.
+        exactly as if run alone with a fresh state. The returned state is
+        anchored at each row's last valid (non-padding, unmasked) token, so
+        trailing padding does not blank it; rows with no valid tokens return
+        the fresh-state baseline (count=0, mean=0, var=1).
 
         :param Float[Array, "batch seq dim"] x: Input tensor.
         :param NormState | None state: Previous running statistics.
@@ -306,10 +309,20 @@ class TimestepNorm(eqx.Module):
         # would corrupt the Welford sufficient statistic (m2 = var * count).
         if segment_ids is None:
             new_count = prev_count + mask.astype(jnp.int32).sum(axis=1)
+            mean_out = mean_t[:, -1, :]
+            var_out = var_t[:, -1, :]
         else:
-            new_count = count_t[:, -1].astype(jnp.int32)
-        mean_out = mean_t[:, -1, :]
-        var_out = var_t[:, -1, :]
+            # Anchor at each row's last real token: trailing padding (id 0)
+            # starts its own run, so stats at position L-1 would be the
+            # fresh-reset baseline instead of the last document's.
+            positions = jnp.arange(L, dtype=jnp.int32)
+            last_valid = jnp.max(jnp.where(valid > 0, positions[None, :], -1), axis=1)  # (B,)
+            has_valid = last_valid >= 0
+            idx = jnp.maximum(last_valid, 0)
+            batch_idx = jnp.arange(B)
+            new_count = jnp.where(has_valid, count_t[batch_idx, idx], 0.0).astype(jnp.int32)
+            mean_out = jnp.where(has_valid[:, None], mean_t[batch_idx, idx], 0.0)
+            var_out = jnp.where(has_valid[:, None], var_t[batch_idx, idx], 1.0)
 
         new_state = NormState(count=new_count, mean=mean_out, var=var_out)
         return y, new_state
