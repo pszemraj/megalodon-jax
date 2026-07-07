@@ -199,7 +199,9 @@ class ComplexEMA(eqx.Module):
 
         :param Float[Array, "batch dim seq"] x: Input tensor (masked positions pre-zeroed).
         :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs (0 = padding).
-        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output tensor and final EMA state.
+        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output
+            tensor and final EMA state, anchored at each row's last non-padding
+            token (zeros for all-padding rows).
         """
         p, q, gamma = self._coeffs()  # (D, N) each
 
@@ -232,8 +234,20 @@ class ComplexEMA(eqx.Module):
         y_seq = self._real_of_product(h_seq, gamma[None, None, :, :]).sum(axis=-1)  # (L, B, D)
         y = jnp.moveaxis(y_seq, 0, -1)  # (B, D, L)
 
+        # Anchor the final state at each row's last real token: trailing
+        # padding (id 0) starts its own run and resets the scan, so h_seq[-1]
+        # would report the padding run's zero state instead of the last
+        # document's.
+        B, L = segment_ids.shape
+        positions = jnp.arange(L, dtype=jnp.int32)
+        last_valid = jnp.max(jnp.where(segment_ids > 0, positions[None, :], -1), axis=1)  # (B,)
+        h_final = h_seq[jnp.maximum(last_valid, 0), jnp.arange(B)]  # (B, D, N)
+        h_final = jnp.where(
+            (last_valid >= 0)[:, None, None], h_final, jnp.zeros((), dtype=h_final.dtype)
+        )
+
         # Return fp32 - caller handles dtype conversion
-        return y, h_seq[-1]
+        return y, h_final
 
     def _forward_fft(self, x: Float[Array, "batch dim seq"]) -> Float[Array, "batch dim seq"]:
         """FFT-based convolution for training.
@@ -320,7 +334,9 @@ class ComplexEMA(eqx.Module):
         :param Float[Array, "batch dim seq"] x: Input tensor.
         :param Complex[Array, "batch dim ndim"] | None h_init: Initial EMA state.
         :param Int[Array, "batch seq"] | None segment_ids: Optional per-token segment IDs.
-        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output tensor and final EMA state.
+        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"]]: Output
+            tensor and final EMA state; with segment_ids the state is anchored
+            at each row's last non-padding token (zeros for all-padding rows).
         """
         B, D, L = x.shape
         N = self.ndim
@@ -356,22 +372,37 @@ class ComplexEMA(eqx.Module):
             h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
         else:
             reset_seq = jnp.moveaxis(self._segment_boundaries(segment_ids), -1, 0)  # (L, B)
+            valid_seq = jnp.moveaxis(segment_ids > 0, -1, 0)  # (L, B)
 
             def step_with_reset(
-                h: Complex[Array, "batch dim ndim"],
-                inputs: tuple[Float[Array, "batch dim"], Bool[Array, "batch"]],
-            ) -> tuple[Complex[Array, "batch dim ndim"], Float[Array, "batch dim"]]:
+                carry: tuple[Complex[Array, "batch dim ndim"], Complex[Array, "batch dim ndim"]],
+                inputs: tuple[
+                    Float[Array, "batch dim"], Bool[Array, "batch"], Bool[Array, "batch"]
+                ],
+            ) -> tuple[
+                tuple[Complex[Array, "batch dim ndim"], Complex[Array, "batch dim ndim"]],
+                Float[Array, "batch dim"],
+            ]:
                 """Single EMA step with state reset at segment starts.
 
-                :param Complex[Array, "batch dim ndim"] h: Previous EMA state.
-                :param tuple inputs: Input for the timestep and its reset flag.
-                :return tuple[Complex[Array, "batch dim ndim"], Float[Array, "batch dim"]]: Updated state and output.
-                """
-                x_t, reset_t = inputs
-                h = jnp.where(reset_t[:, None, None], jnp.zeros((), dtype=jnp.complex64), h)
-                return step(h, x_t)
+                Alongside the running state, the carry tracks the state at the
+                last real token so trailing padding (whose reset zeroes the
+                running state) does not blank the returned final state.
 
-            h_final, y_seq = jax.lax.scan(step_with_reset, h_init, (x_transposed, reset_seq))
+                :param tuple carry: (running state, state at last real token).
+                :param tuple inputs: Input, reset flag, and validity flag for the timestep.
+                :return tuple: Updated carry and output.
+                """
+                h, h_anchor = carry
+                x_t, reset_t, valid_t = inputs
+                h = jnp.where(reset_t[:, None, None], jnp.zeros((), dtype=jnp.complex64), h)
+                h_new, y_t = step(h, x_t)
+                h_anchor = jnp.where(valid_t[:, None, None], h_new, h_anchor)
+                return (h_new, h_anchor), y_t
+
+            (_, h_final), y_seq = jax.lax.scan(
+                step_with_reset, (h_init, h_init), (x_transposed, reset_seq, valid_seq)
+            )
         y = jnp.moveaxis(y_seq, 0, -1)  # (B, D, L)
 
         # Return fp32 - caller handles dtype conversion
@@ -402,7 +433,10 @@ class ComplexEMA(eqx.Module):
             incompatible with h_init.
         :param bool use_associative_segment_scan: Use the parallel associative scan for
             the segmented path; False selects the sequential low-memory fallback.
-        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]: Output and optional final state.
+        :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]: Output
+            and optional final state; with segment_ids the state is anchored at
+            each row's last non-padding token so trailing padding does not
+            zero it.
         """
         if segment_ids is not None and h_init is not None:
             raise ValueError(
