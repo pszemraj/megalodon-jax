@@ -145,10 +145,10 @@ def attention_single_chunk(
     return out.astype(q.dtype)
 
 
-def _segment_runs_and_local_chunks(
-    segment_ids: Int[Array, "batch seq"], chunk_size: int
+def _segment_runs_and_local_positions(
+    segment_ids: Int[Array, "batch seq"],
 ) -> tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]:
-    """Compute contiguous-run indices and run-local chunk indices.
+    """Compute contiguous-run indices and run-local positions.
 
     Run indices: a packer may legally reuse a positive id for non-adjacent
     documents (e.g. ``[1, 1, 2, 2, 1, 1]``); comparing raw ids for equality
@@ -156,14 +156,14 @@ def _segment_runs_and_local_chunks(
     compare equal within a single contiguous run, matching the boundary-based
     reset semantics of ComplexEMA and TimestepNorm.
 
-    Local chunks: attention chunk boundaries are re-anchored at each run
-    start, so a document that begins mid-chunk gets the same block-diagonal
-    pattern it would have running alone instead of being split at global
-    chunk-grid offsets.
+    Local positions: offsets from each run's first token. Dividing by the
+    chunk size re-anchors attention chunk boundaries at each run start, and
+    they double as the default RoPE positions for packed rows, so a document
+    that begins mid-chunk gets the same block-diagonal pattern and rotary
+    phases it would have running alone.
 
     :param jax.Array segment_ids: Raw per-token segment ids of shape (batch, seq).
-    :param int chunk_size: Attention chunk size.
-    :return tuple: (run indices starting at 1, chunk index within the run).
+    :return tuple: (run indices starting at 1, position offset within the run).
     """
     boundaries = jnp.concatenate(
         [
@@ -175,8 +175,7 @@ def _segment_runs_and_local_chunks(
     run_ids = jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
     positions = jnp.arange(segment_ids.shape[1], dtype=segment_ids.dtype)[None, :]
     run_starts = jax.lax.cummax(jnp.where(boundaries, positions, 0), axis=1)
-    local_chunks = (positions - run_starts) // chunk_size
-    return run_ids, local_chunks
+    return run_ids, positions - run_starts
 
 
 def attention_multi_chunk(
@@ -209,6 +208,8 @@ def attention_multi_chunk(
     :param jax.Array | None mask: Optional mask where True marks valid positions.
     :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
     :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
+        When omitted with segment_ids given, per-document positions (restarting
+        at each segment start) are derived automatically.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
@@ -222,6 +223,12 @@ def attention_multi_chunk(
     if L == 0:
         return jnp.zeros((B, L, H, Dv), dtype=q.dtype)
 
+    if segment_ids is not None and position_ids is None:
+        # RoPE must restart at each packed document: without explicit
+        # position_ids a packed row would silently keep continuous global
+        # phases across boundaries while the mask still isolates attention.
+        _, position_ids = _segment_runs_and_local_positions(segment_ids)
+
     if L <= chunk_size:
         # Single chunk: apply RoPE and attention directly.
         q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
@@ -230,7 +237,7 @@ def attention_multi_chunk(
             # Compare contiguous runs (ids may repeat); validity from raw ids.
             # Local chunks are all 0 here (L <= chunk_size), so run equality
             # alone gives the full same-run, same-local-chunk condition.
-            seg_runs, _ = _segment_runs_and_local_chunks(segment_ids, chunk_size)
+            seg_runs, _ = _segment_runs_and_local_positions(segment_ids)
             qk_mask = (
                 (seg_runs[:, :, None] == seg_runs[:, None, :])
                 & (segment_ids[:, :, None] > 0)
@@ -284,7 +291,8 @@ def attention_multi_chunk(
         # at most chunk_size consecutive positions, so keys/values from the
         # current + previous global chunk cover every allowed edge; the mask
         # keeps only same-run, same-local-chunk, valid pairs.
-        run_ids, local_chunks = _segment_runs_and_local_chunks(segment_ids, chunk_size)
+        run_ids, local_positions = _segment_runs_and_local_positions(segment_ids)
+        local_chunks = local_positions // chunk_size
 
         def window_keys(z: jnp.ndarray, fill_value) -> jnp.ndarray:
             """Prepend each chunk's predecessor along the key axis.
