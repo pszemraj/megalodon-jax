@@ -124,6 +124,128 @@ class TestAttentionPrimitives:
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
 
+    def test_single_chunk_query_key_mask_blocks_cross_segment(self) -> None:
+        """qk_mask should block cross-segment attention links."""
+        q = jnp.ones((1, 4, 1, 2), dtype=jnp.float32)
+        k = jnp.ones((1, 4, 1, 2), dtype=jnp.float32)
+        v = jnp.asarray([[[[1.0]], [[2.0]], [[3.0]], [[4.0]]]], dtype=jnp.float32)
+        segs = jnp.asarray([[1, 1, 2, 2]], dtype=jnp.int32)
+        qk_mask = (
+            (segs[:, :, None] == segs[:, None, :]) & (segs[:, :, None] > 0) & (segs[:, None, :] > 0)
+        )
+
+        out = attention_single_chunk(q, k, v, qk_mask=qk_mask, causal=False)
+        np.testing.assert_allclose(np.array(out[0, 0, 0, 0]), 1.5, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(np.array(out[0, 3, 0, 0]), 3.5, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("chunk_size", [16, 8])
+    def test_repeated_segment_ids_match_unique_run_ids(
+        self, random_seed: int, chunk_size: int
+    ) -> None:
+        """Reused positive ids must isolate exactly like unique per-run ids.
+
+        A packer may legally emit ``[1, 1, 2, 2, 1, 1]``; raw-id equality would
+        let the later ``1`` run attend back to the earlier one. chunk_size=16
+        exercises the single-chunk mask path, 8 the multi-chunk path.
+
+        :param int random_seed: Random seed fixture.
+        :param int chunk_size: Attention chunk size under test.
+        :return None: None.
+        """
+        batch, seq, heads, head_dim, value_dim = 1, 16, 2, 16, 16
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim))
+        rotary = RotaryEmbedding(dim=head_dim)
+        start_index = jnp.array(0, dtype=jnp.int32)
+
+        seg_repeated = jnp.asarray(
+            [[1, 1, 1, 2, 2, 1, 1, 1, 3, 3, 3, 3, 1, 1, 1, 1]], dtype=jnp.int32
+        )
+        seg_unique = jnp.asarray(
+            [[1, 1, 1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5]], dtype=jnp.int32
+        )
+        position_ids = jnp.asarray(
+            [[0, 1, 2, 0, 1, 0, 1, 2, 0, 1, 2, 3, 0, 1, 2, 3]], dtype=jnp.int32
+        )
+
+        def run(segment_ids: jnp.ndarray) -> jnp.ndarray:
+            """Run chunked attention with the given segment ids.
+
+            :param jnp.ndarray segment_ids: Per-token segment ids.
+            :return jnp.ndarray: Attention output.
+            """
+            return attention_multi_chunk(
+                q,
+                k,
+                v,
+                chunk_size=chunk_size,
+                start_index=start_index,
+                rotary=rotary,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+            )
+
+        np.testing.assert_array_equal(
+            np.array(run(seg_repeated)),
+            np.array(run(seg_unique)),
+            err_msg="Repeated segment ids must isolate the same as unique run ids",
+        )
+
+    def test_unaligned_segment_crossing_chunk_matches_standalone(self, random_seed: int) -> None:
+        """A doc starting mid-chunk must attend exactly as it would run alone.
+
+        With chunk_size=8, doc B occupies global positions 6-15 and crosses
+        the global chunk boundary at position 8. Chunk boundaries must be
+        re-anchored at the segment start (doc-local split at 8, global 14),
+        not inherited from the global grid (doc-local split at 2).
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        batch, seq, heads, head_dim, value_dim = 1, 16, 2, 16, 16
+        chunk_size = 8
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim))
+        rotary = RotaryEmbedding(dim=head_dim)
+        start_index = jnp.array(0, dtype=jnp.int32)
+
+        # doc A: positions 0-5 (id 1); doc B: positions 6-15 (id 2)
+        segment_ids = jnp.asarray([[1] * 6 + [2] * 10], dtype=jnp.int32)
+        position_ids = jnp.asarray([list(range(6)) + list(range(10))], dtype=jnp.int32)
+
+        out_packed = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+        )
+        out_alone = attention_multi_chunk(
+            q[:, 6:],
+            k[:, 6:],
+            v[:, 6:],
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+        )
+
+        np.testing.assert_allclose(
+            np.array(out_packed[:, 6:]),
+            np.array(out_alone),
+            rtol=1e-5,
+            atol=1e-6,
+            err_msg="Doc B packed at an unaligned offset must match doc B alone",
+        )
+
     def test_multi_chunk_shapes(self, random_seed: int) -> None:
         """Test that attention_multi_chunk produces correct output shapes.
 
@@ -175,6 +297,46 @@ class TestAttentionPrimitives:
         # Output should have original sequence length (padding removed)
         assert out.shape == (batch, seq, heads, value_dim)
         assert not jnp.any(jnp.isnan(out))
+
+    def test_multi_chunk_explicit_position_ids_path(self, random_seed: int) -> None:
+        """Explicit position_ids should be honored by rotary in multi-chunk attention."""
+        batch, seq, heads, head_dim, value_dim = 1, 16, 2, 8, 8
+        chunk_size = 8
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+        q = jax.random.normal(k1, (batch, seq, heads, head_dim))
+        k = jax.random.normal(k2, (batch, seq, heads, head_dim))
+        v = jax.random.normal(k3, (batch, seq, heads, value_dim))
+
+        rotary = RotaryEmbedding(dim=head_dim)
+        start_index = jnp.array(0, dtype=jnp.int32)
+        mono_pos = jnp.broadcast_to(jnp.arange(seq, dtype=jnp.int32)[None, :], (batch, seq))
+        shifted_pos = mono_pos + 100
+
+        out_default = attention_multi_chunk(
+            q, k, v, chunk_size=chunk_size, start_index=start_index, rotary=rotary
+        )
+        out_mono = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+            position_ids=mono_pos,
+        )
+        out_shifted = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=start_index,
+            rotary=rotary,
+            position_ids=shifted_pos,
+        )
+
+        np.testing.assert_allclose(np.array(out_default), np.array(out_mono), rtol=1e-5, atol=1e-5)
+        assert not np.allclose(np.array(out_default), np.array(out_shifted))
 
 
 # -----------------------------------------------------------------------------
@@ -252,6 +414,27 @@ class TestChunkedAttention:
         assert cache.count == 8
         # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
         assert cache.k.shape[1] == chunk_size
+
+    def test_streaming_rejects_strict_metadata(self, random_seed: int) -> None:
+        """Streaming cache path should reject segment/position strict metadata."""
+        heads, head_dim, value_dim, chunk_size = 2, 8, 8, 8
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        attn = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k1,
+        )
+        q = jax.random.normal(k2, (1, 4, heads, head_dim))
+        k = jax.random.normal(k3, (1, 4, heads, head_dim))
+        v = jax.random.normal(k4, (1, 4, heads, value_dim))
+        segs = jnp.asarray([[1, 1, 2, 2]], dtype=jnp.int32)
+        pos = jnp.asarray([[0, 1, 0, 1]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="segment_ids/position_ids"):
+            attn(q, k, v, segment_ids=segs, position_ids=pos, return_cache=True)
 
     def test_streaming_small_l_preserves_dtype_and_cache_count(self, random_seed: int) -> None:
         """Small-L streaming should keep dtype and track cache count without padding.
@@ -577,6 +760,53 @@ class TestMegalodonAttention:
         assert not jnp.any(jnp.isnan(grads.beta))
         assert not jnp.any(jnp.isnan(grads.wz.weight))
         assert not jnp.any(jnp.isnan(grads.wv.weight))
+
+    def test_segment_ids_isolate_cema_and_timenorm(self, random_seed: int) -> None:
+        """Packed doc B must match doc B alone through the full block.
+
+        Exercises the segment_ids plumbing into TimestepNorm, ComplexEMA, and
+        ChunkedAttention together: with strict metadata, no state (norm stats,
+        EMA state, attention) may leak from doc A into doc B.
+
+        :param int random_seed: Random seed fixture.
+        :return None: None.
+        """
+        model_dim, z_dim, value_dim = 64, 32, 64
+        num_heads, cema_ndim, chunk_size = 4, 8, 16
+        norm_num_groups = 8
+
+        key = jax.random.PRNGKey(random_seed)
+        k1, k2, k3 = jax.random.split(key, 3)
+
+        attn = MegalodonAttention(
+            model_dim=model_dim,
+            z_dim=z_dim,
+            value_dim=value_dim,
+            num_heads=num_heads,
+            cema_ndim=cema_ndim,
+            chunk_size=chunk_size,
+            norm_num_groups=norm_num_groups,
+            key=k1,
+        )
+
+        # doc A (5) + padding (2) + doc B (6), all within one chunk
+        x_a = jax.random.normal(k2, (1, 5, model_dim))
+        x_b = jax.random.normal(k3, (1, 6, model_dim))
+        x_packed = jnp.concatenate([x_a, jnp.zeros((1, 2, model_dim)), x_b], axis=1)
+        segment_ids = jnp.asarray([[1] * 5 + [0] * 2 + [2] * 6], dtype=jnp.int32)
+        position_ids = jnp.asarray([[0, 1, 2, 3, 4, 0, 0, 0, 1, 2, 3, 4, 5]], dtype=jnp.int32)
+        mask = jnp.asarray([[True] * 5 + [False] * 2 + [True] * 6])
+
+        y_packed, _ = attn(x_packed, mask=mask, segment_ids=segment_ids, position_ids=position_ids)
+        y_b, _ = attn(x_b)
+
+        np.testing.assert_allclose(
+            np.array(y_packed[:, 7:]),
+            np.array(y_b),
+            rtol=1e-4,
+            atol=1e-5,
+            err_msg="Doc B through packed row should match doc B alone",
+        )
 
     def test_streaming_with_cache(self, random_seed: int) -> None:
         """Test MegalodonAttention streaming with cache.

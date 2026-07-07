@@ -19,7 +19,7 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
-from typing import Any
+from typing import Any, ClassVar
 
 import equinox as eqx
 import jax
@@ -38,6 +38,8 @@ def _checkpointed_layer(
     layer: "MegalodonBlock",
     x: Float[Array, "batch seq dim"],
     mask: Bool[Array, "batch seq"] | None,
+    segment_ids: Int[Array, "batch seq"] | None,
+    position_ids: Int[Array, "batch seq"] | None,
     key: PRNGKeyArray | None,
 ) -> Float[Array, "batch seq dim"]:
     """Execute layer without caching for gradient checkpointing.
@@ -48,10 +50,23 @@ def _checkpointed_layer(
     :param MegalodonBlock layer: Block to execute.
     :param Float[Array, "batch seq dim"] x: Input activations.
     :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
+    :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+    :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+        When omitted with segment_ids given, document-local positions
+        (restarting at each segment start) are derived automatically.
     :param PRNGKeyArray | None key: Optional dropout key.
     :return Float[Array, "batch seq dim"]: Output activations.
     """
-    out, _ = layer(x, cache=None, mask=mask, return_cache=False, deterministic=False, key=key)
+    out, _ = layer(
+        x,
+        cache=None,
+        mask=mask,
+        segment_ids=segment_ids,
+        position_ids=position_ids,
+        return_cache=False,
+        deterministic=False,
+        key=key,
+    )
     return out
 
 
@@ -126,6 +141,7 @@ class MegalodonBlock(eqx.Module):
             compute_dtype=config.compute_dtype,
             accum_dtype=config.accum_dtype,
             gemm_backend=config.gemm_backend,
+            use_associative_segment_scan=config.use_associative_segment_scan,
             key=k1,
         )
 
@@ -151,6 +167,8 @@ class MegalodonBlock(eqx.Module):
         x: Float[Array, "batch seq dim"],
         cache: LayerCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -160,6 +178,10 @@ class MegalodonBlock(eqx.Module):
         :param Float[Array, "batch seq dim"] x: Input activations.
         :param LayerCache | None cache: Optional layer cache.
         :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
@@ -179,6 +201,8 @@ class MegalodonBlock(eqx.Module):
             x,
             cache=cache,
             mask=mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             return_cache=return_cache,
             deterministic=deterministic,
             key=k_attn,
@@ -209,6 +233,11 @@ class MegalodonModel(eqx.Module):
     The final TimestepNorm carries state just like per-layer norms, enabling
     proper streaming normalization across chunks.
     """
+
+    # Capability flag for training harnesses: segment_ids fully isolates packed
+    # documents (attention, ComplexEMA, and TimestepNorm state all reset at
+    # segment boundaries), not just attention masking.
+    supports_segment_reset: ClassVar[bool] = True
 
     embed: eqx.nn.Embedding
     layers: tuple[MegalodonBlock, ...]
@@ -283,6 +312,8 @@ class MegalodonModel(eqx.Module):
         self,
         input_ids: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         cache: ModelCache | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
@@ -292,6 +323,10 @@ class MegalodonModel(eqx.Module):
 
         :param Int[Array, "batch seq"] input_ids: Token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param ModelCache | None cache: Optional model cache.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
@@ -361,6 +396,16 @@ class MegalodonModel(eqx.Module):
         # - ComplexEMA and TimestepNorm have mask support for prefill, but
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
         # Guard both cache input AND output - streaming path is used in either case
+        # Packed metadata gates on raw return_cache, not layer_return_cache:
+        # with deterministic=False the layers skip caching, but a ModelCache is
+        # still assembled below and would carry segmented final-norm state.
+        if (return_cache or cache is not None) and (
+            segment_ids is not None or position_ids is not None
+        ):
+            raise ValueError(
+                "segment_ids/position_ids are only supported for non-cached training calls. "
+                "Disable cache/return_cache for strict packed attention."
+            )
         uses_streaming = layer_return_cache or cache is not None
         if uses_streaming and attention_mask is not None:
             # Check if any position is masked (False = padding)
@@ -401,7 +446,9 @@ class MegalodonModel(eqx.Module):
         for layer, layer_cache, layer_key in zip(self.layers, layer_caches, keys):
             if use_ckpt:
                 # Checkpointed path: disable cache during training
-                x = _checkpointed_layer(layer, x, attention_mask, layer_key)
+                x = _checkpointed_layer(
+                    layer, x, attention_mask, segment_ids, position_ids, layer_key
+                )
                 new_caches.append(None)
             else:
                 # Standard path with optional caching
@@ -409,14 +456,18 @@ class MegalodonModel(eqx.Module):
                     x,
                     cache=layer_cache,
                     mask=attention_mask,
+                    segment_ids=segment_ids,
+                    position_ids=position_ids,
                     return_cache=layer_return_cache,
                     deterministic=deterministic,
                     key=layer_key,
                 )
                 new_caches.append(new_cache)
 
-        # Final TimestepNorm
-        x, final_norm_state = self.norm(x, state=final_norm_state, mask=attention_mask)
+        # Final TimestepNorm (segment-aware for packed sequences)
+        x, final_norm_state = self.norm(
+            x, state=final_norm_state, mask=attention_mask, segment_ids=segment_ids
+        )
 
         # Build output cache with stop_gradient to prevent accidental backprop
         # through cache history when cache is fed back under jax.grad
@@ -447,6 +498,11 @@ class MegalodonForCausalLM(eqx.Module):
     For tied weights, logits are computed as: hidden @ embed.weight.T
     For untied weights, logits are computed via the lm_head Linear layer.
     """
+
+    # Capability flag for training harnesses: segment_ids fully isolates packed
+    # documents (attention, ComplexEMA, and TimestepNorm state all reset at
+    # segment boundaries), not just attention masking.
+    supports_segment_reset: ClassVar[bool] = True
 
     model: MegalodonModel
     lm_head: eqx.nn.Linear | None  # None when tied
@@ -500,6 +556,8 @@ class MegalodonForCausalLM(eqx.Module):
         self,
         input_ids: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         cache: ModelCache | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
@@ -509,6 +567,10 @@ class MegalodonForCausalLM(eqx.Module):
 
         :param Int[Array, "batch seq"] input_ids: Token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param ModelCache | None cache: Optional model cache.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
@@ -529,6 +591,8 @@ class MegalodonForCausalLM(eqx.Module):
         hidden, cache = self.model(
             input_ids,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             cache=cache,
             return_cache=return_cache,
             deterministic=deterministic,
@@ -564,6 +628,8 @@ class MegalodonForCausalLM(eqx.Module):
         input_ids: Int[Array, "batch seq"],
         labels: Int[Array, "batch seq"],
         attention_mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         ignore_index: int = -100,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -577,9 +643,17 @@ class MegalodonForCausalLM(eqx.Module):
         computation, following HuggingFace Transformers convention. This allows
         padding tokens to be marked with -100 in the labels array.
 
+        When segment_ids is provided, shifted pairs that cross a segment
+        boundary and pairs targeting padding (segment id 0) are excluded
+        automatically - callers do not need to pre-mask boundary labels.
+
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param int ignore_index: Label value to ignore in loss computation.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
@@ -601,6 +675,8 @@ class MegalodonForCausalLM(eqx.Module):
         logits, _ = self(
             input_ids,
             attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             cache=None,
             return_cache=False,
             deterministic=deterministic,
@@ -623,6 +699,12 @@ class MegalodonForCausalLM(eqx.Module):
         if attention_mask is not None:
             shift_attn_mask = attention_mask[:, 1:]  # (B, L-1)
             valid_mask = valid_mask & shift_attn_mask
+        if segment_ids is not None:
+            # Position i predicts i+1: drop pairs that straddle a segment
+            # boundary and anything in padding (segment id 0), so packed loss
+            # matches running each document alone
+            same_segment = segment_ids[:, :-1] == segment_ids[:, 1:]
+            valid_mask = valid_mask & same_segment & (segment_ids[:, 1:] > 0)
 
         # Validate label bounds only on positions that will be used
         # Prevents silent wrong gradients from JAX index wrapping

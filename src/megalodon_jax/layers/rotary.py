@@ -63,29 +63,32 @@ class RotaryEmbedding(eqx.Module):
         q: Float[Array, "batch seq heads dim"],
         k: Float[Array, "batch seq heads dim"],
         start_index: Int[Array, ""],  # JAX scalar, NOT Python int
+        position_ids: Int[Array, "batch seq"] | None = None,
     ) -> tuple[Float[Array, "batch seq heads dim"], Float[Array, "batch seq heads dim"]]:
         """Apply rotary embedding to query and key tensors.
 
         :param Float[Array, "batch seq heads dim"] q: Query tensor.
         :param Float[Array, "batch seq heads dim"] k: Key tensor.
         :param Int[Array, ""] start_index: Absolute position offset (JAX scalar).
+        :param Int[Array, "batch seq"] | None position_ids: Optional explicit per-token positions.
         :return tuple[Float[Array, "batch seq heads dim"], Float[Array, "batch seq heads dim"]]: Rotated query and key tensors.
         """
+        batch_size = q.shape[0]
         seq_len = q.shape[1]
 
-        # Compute positions: [start_index, start_index+1, ..., start_index+seq_len-1]
-        positions = jnp.arange(seq_len, dtype=jnp.float32) + start_index.astype(jnp.float32)
-
-        # Compute angles in fp32: (seq, half_dim)
-        angles = positions[:, None] * self.inv_freq[None, :]
-
-        # Compute cos/sin in fp32 for numerical stability
-        cos = jnp.cos(angles)  # (seq, half_dim)
-        sin = jnp.sin(angles)  # (seq, half_dim)
-
-        # Reshape for broadcasting: (1, seq, 1, half_dim)
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
+        if position_ids is None:
+            # Compute positions: [start_index, start_index+1, ..., start_index+seq_len-1]
+            positions = jnp.arange(seq_len, dtype=jnp.float32) + start_index.astype(jnp.float32)
+            angles = positions[:, None] * self.inv_freq[None, :]  # (seq, half_dim)
+            cos = jnp.cos(angles)[None, :, None, :]  # (1, seq, 1, half_dim)
+            sin = jnp.sin(angles)[None, :, None, :]  # (1, seq, 1, half_dim)
+        else:
+            positions = position_ids.astype(jnp.float32)
+            angles = positions[:, :, None] * self.inv_freq[None, None, :]  # (B, seq, half_dim)
+            cos = jnp.cos(angles)[:, :, None, :]  # (B, seq, 1, half_dim)
+            sin = jnp.sin(angles)[:, :, None, :]  # (B, seq, 1, half_dim)
+            cos = jnp.broadcast_to(cos, (batch_size, seq_len, 1, self.dim // 2))
+            sin = jnp.broadcast_to(sin, (batch_size, seq_len, 1, self.dim // 2))
 
         # Split into real/imag pairs (first half, second half)
         half = self.dim // 2

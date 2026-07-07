@@ -36,6 +36,7 @@ from megalodon_jax.config import InitMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
+from megalodon_jax.layers.segments import segment_runs_and_local_positions
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.ops import linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
@@ -51,6 +52,7 @@ def attention_single_chunk(
     k: Float[Array, "batch kv_seq heads head_dim"],
     v: Float[Array, "batch kv_seq heads value_dim"],
     kv_mask: Bool[Array, "batch kv_seq"] | None = None,
+    qk_mask: Bool[Array, "batch seq kv_seq"] | None = None,
     accum_dtype: jnp.dtype = jnp.float32,
     causal: bool = True,
     dropout_rate: float = 0.0,
@@ -67,6 +69,7 @@ def attention_single_chunk(
     :param jax.Array k: Key tensor of shape (batch, kv_seq, heads, head_dim).
     :param jax.Array v: Value tensor of shape (batch, kv_seq, heads, value_dim).
     :param jax.Array | None kv_mask: Optional mask where True marks valid positions.
+    :param jax.Array | None qk_mask: Optional per-query/per-key boolean mask.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param bool causal: Whether to apply causal masking.
     :param float dropout_rate: Attention dropout rate.
@@ -115,6 +118,8 @@ def attention_single_chunk(
         # kv_mask: (B, L_kv) with True for valid positions
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
         scores = jnp.where(kv_mask_expanded, scores, neg_inf)
+    if qk_mask is not None:
+        scores = jnp.where(qk_mask[:, None, :, :], scores, neg_inf)
 
     # Softmax with NaN guard for fully-masked queries
     # If all keys are masked for a query, softmax(all -inf) = NaN
@@ -149,6 +154,8 @@ def attention_multi_chunk(
     start_index: Int[Array, ""],
     rotary: RotaryEmbedding,
     mask: Bool[Array, "batch seq"] | None = None,
+    segment_ids: Int[Array, "batch seq"] | None = None,
+    position_ids: Int[Array, "batch seq"] | None = None,
     accum_dtype: jnp.dtype = jnp.float32,
     dropout_rate: float = 0.0,
     deterministic: bool = True,
@@ -167,6 +174,10 @@ def attention_multi_chunk(
     :param jax.Array start_index: Absolute position offset for RoPE (JAX scalar).
     :param RotaryEmbedding rotary: RotaryEmbedding module for position encoding.
     :param jax.Array | None mask: Optional mask where True marks valid positions.
+    :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
+    :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
+        When omitted with segment_ids given, per-document positions (restarting
+        at each segment start) are derived automatically.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
     :param float dropout_rate: Attention dropout rate.
     :param bool deterministic: If True, skip dropout.
@@ -180,14 +191,32 @@ def attention_multi_chunk(
     if L == 0:
         return jnp.zeros((B, L, H, Dv), dtype=q.dtype)
 
+    if segment_ids is not None and position_ids is None:
+        # RoPE must restart at each packed document: without explicit
+        # position_ids a packed row would silently keep continuous global
+        # phases across boundaries while the mask still isolates attention.
+        _, position_ids = segment_runs_and_local_positions(segment_ids)
+
     if L <= chunk_size:
-        # Single chunk: apply RoPE and attention directly
-        q_rot, k_rot = rotary(q, k, start_index)
+        # Single chunk: apply RoPE and attention directly.
+        q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
+        qk_mask = None
+        if segment_ids is not None:
+            # Compare contiguous runs (ids may repeat); validity from raw ids.
+            # Local chunks are all 0 here (L <= chunk_size), so run equality
+            # alone gives the full same-run, same-local-chunk condition.
+            seg_runs, _ = segment_runs_and_local_positions(segment_ids)
+            qk_mask = (
+                (seg_runs[:, :, None] == seg_runs[:, None, :])
+                & (segment_ids[:, :, None] > 0)
+                & (segment_ids[:, None, :] > 0)
+            )
         return attention_single_chunk(
             q_rot,
             k_rot,
             v,
             kv_mask=mask,
+            qk_mask=qk_mask,
             accum_dtype=accum_dtype,
             causal=True,
             dropout_rate=dropout_rate,
@@ -203,12 +232,16 @@ def attention_multi_chunk(
         v = jnp.pad(v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
         if mask is not None:
             mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
+        if segment_ids is not None:
+            segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        if position_ids is not None:
+            position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
 
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
 
     # Apply RoPE once with absolute positions, then reshape into chunks.
-    q_rot_full, k_rot_full = rotary(q, k, start_index)
+    q_rot_full, k_rot_full = rotary(q, k, start_index, position_ids=position_ids)
     q_rot = q_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     k_rot = k_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     v_chunked = v.reshape(B, num_chunks, chunk_size, H, Dv).reshape(
@@ -219,16 +252,68 @@ def attention_multi_chunk(
     if mask is not None:
         mask_chunked = mask.reshape(B * num_chunks, chunk_size)
 
-    out_chunked = attention_single_chunk(
-        q_rot,
-        k_rot,
-        v_chunked,
-        kv_mask=mask_chunked,
-        accum_dtype=accum_dtype,
-        dropout_rate=dropout_rate,
-        deterministic=deterministic,
-        key=key,
-    )
+    if segment_ids is not None:
+        # Chunk boundaries are re-anchored at each segment start so a packed
+        # document attends exactly as it would running alone, instead of
+        # being split at global chunk-grid offsets. A re-anchored chunk spans
+        # at most chunk_size consecutive positions, so keys/values from the
+        # current + previous global chunk cover every allowed edge; the mask
+        # keeps only same-run, same-local-chunk, valid pairs.
+        run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
+        local_chunks = local_positions // chunk_size
+
+        def window_keys(z: jnp.ndarray, fill_value) -> jnp.ndarray:
+            """Prepend each chunk's predecessor along the key axis.
+
+            :param jnp.ndarray z: Per-token array of shape (B, L_padded, ...).
+            :param fill_value: Fill for the first chunk's missing predecessor.
+            :return jnp.ndarray: Windowed array of shape (B*NC, 2*chunk, ...).
+            """
+            zc = z.reshape(B, num_chunks, chunk_size, *z.shape[2:])
+            prev = jnp.concatenate([jnp.full_like(zc[:, :1], fill_value), zc[:, :-1]], axis=1)
+            return jnp.concatenate([prev, zc], axis=2).reshape(
+                B * num_chunks, 2 * chunk_size, *z.shape[2:]
+            )
+
+        runs_q = run_ids.reshape(B * num_chunks, chunk_size)
+        locals_q = local_chunks.reshape(B * num_chunks, chunk_size)
+        seg_q = segment_ids.reshape(B * num_chunks, chunk_size)
+        # Run ids start at 1, so fill 0 can never match a real run
+        runs_k = window_keys(run_ids, 0)
+        locals_k = window_keys(local_chunks, 0)
+        seg_k = window_keys(segment_ids, 0)
+        qk_mask_windowed = (
+            (runs_q[:, :, None] == runs_k[:, None, :])
+            & (locals_q[:, :, None] == locals_k[:, None, :])
+            & (seg_q[:, :, None] > 0)
+            & (seg_k[:, None, :] > 0)
+        )
+
+        # causal=True with L_q < L_kv gives k_pos <= q_pos + chunk_size,
+        # which is exactly global causality for the [prev, current] window
+        out_chunked = attention_single_chunk(
+            q_rot,
+            window_keys(k_rot_full, 0.0),
+            window_keys(v, 0.0),
+            kv_mask=window_keys(mask, False) if mask is not None else None,
+            qk_mask=qk_mask_windowed,
+            accum_dtype=accum_dtype,
+            dropout_rate=dropout_rate,
+            deterministic=deterministic,
+            key=key,
+        )
+    else:
+        out_chunked = attention_single_chunk(
+            q_rot,
+            k_rot,
+            v_chunked,
+            kv_mask=mask_chunked,
+            qk_mask=None,
+            accum_dtype=accum_dtype,
+            dropout_rate=dropout_rate,
+            deterministic=deterministic,
+            key=key,
+        )
 
     # Reshape back: (B * num_chunks, chunk_size, H, Dv) -> (B, L_padded, H, Dv)
     out = out_chunked.reshape(B, L_padded, H, Dv)
@@ -338,6 +423,8 @@ class ChunkedAttention(eqx.Module):
         v: Float[Array, "batch seq heads value_dim"],
         cache: AttentionCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -353,12 +440,16 @@ class ChunkedAttention(eqx.Module):
         :param jax.Array v: Value tensor (batch, seq, heads, value_dim).
         :param AttentionCache | None cache: Optional cached K/V from previous tokens.
         :param jax.Array | None mask: Optional mask where True marks valid positions.
+        :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
+        :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
+            When omitted with segment_ids given, document-local positions are derived.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :return tuple[jax.Array, AttentionCache | None, jax.Array | None]: Output, updated cache, and new position counter.
         """
         B, L, H, _ = q.shape
+        strict_metadata = segment_ids is not None or position_ids is not None
 
         # Determine current position
         if cache is None:
@@ -376,12 +467,20 @@ class ChunkedAttention(eqx.Module):
                 start_index=position,
                 rotary=self.rotary,
                 mask=mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
                 accum_dtype=self.accum_dtype,
                 dropout_rate=self.attention_dropout,
                 deterministic=deterministic,
                 key=key,
             )
             return out, None, position + L
+
+        if strict_metadata:
+            raise ValueError(
+                "segment_ids/position_ids are only supported for non-cached training calls. "
+                "Disable cache/return_cache for strict packed attention."
+            )
 
         Dv = v.shape[-1]
         cache_size = self.max_cache_len
@@ -1051,6 +1150,7 @@ class MegalodonAttention(eqx.Module):
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
     gemm_backend: str = eqx.field(static=True)
+    use_associative_segment_scan: bool = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1073,6 +1173,7 @@ class MegalodonAttention(eqx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         accum_dtype: jnp.dtype = jnp.float32,
         gemm_backend: str = "default",
+        use_associative_segment_scan: bool = True,
         *,
         key: PRNGKeyArray,
     ):
@@ -1097,6 +1198,9 @@ class MegalodonAttention(eqx.Module):
         :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
         :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
         :param str gemm_backend: GEMM backend selector.
+        :param bool use_associative_segment_scan: Segmented CEMA implementation for
+            packed sequences: parallel associative scan (default) or the
+            sequential low-memory fallback.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
         self.model_dim = model_dim
@@ -1112,6 +1216,7 @@ class MegalodonAttention(eqx.Module):
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
         self.gemm_backend = gemm_backend
+        self.use_associative_segment_scan = use_associative_segment_scan
 
         # Split keys
         keys = jax.random.split(key, 9)
@@ -1151,6 +1256,8 @@ class MegalodonAttention(eqx.Module):
         x: Float[Array, "batch seq dim"],
         cache: LayerCache | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
+        segment_ids: Int[Array, "batch seq"] | None = None,
+        position_ids: Int[Array, "batch seq"] | None = None,
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
@@ -1160,6 +1267,9 @@ class MegalodonAttention(eqx.Module):
         :param jax.Array x: Input tensor of shape (batch, seq, dim).
         :param LayerCache | None cache: Optional layer cache from previous tokens.
         :param jax.Array | None mask: Optional mask where True marks valid positions.
+        :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
+        :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
+            When omitted with segment_ids given, document-local positions are derived.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
@@ -1183,17 +1293,22 @@ class MegalodonAttention(eqx.Module):
         ema_state = cache.ema.h if cache is not None and cache.ema is not None else None
         attn_cache = cache.attn if cache is not None else None
 
-        # TimestepNorm
-        x_tn, new_norm_state = self.timenorm(x, state=norm_state, mask=mask)
+        # TimestepNorm (segment_ids resets running stats at packed-doc boundaries)
+        x_tn, new_norm_state = self.timenorm(
+            x, state=norm_state, mask=mask, segment_ids=segment_ids
+        )
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
-        # Pass mask to prevent EMA state contamination from padded positions
+        # Pass mask to prevent EMA state contamination from padded positions;
+        # segment_ids resets the EMA state at packed-doc boundaries
         need_ema_state = return_cache or ema_state is not None
         y_cema, h_last = self.cema(
             x_tn.transpose(0, 2, 1),  # (B, D, L)
             h_init=ema_state,
             return_state=need_ema_state,
             mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
+            segment_ids=segment_ids,
+            use_associative_segment_scan=self.use_associative_segment_scan,
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
@@ -1243,6 +1358,8 @@ class MegalodonAttention(eqx.Module):
             v,
             cache=attn_cache,
             mask=mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
             return_cache=return_cache,
             deterministic=deterministic,
             key=k1,

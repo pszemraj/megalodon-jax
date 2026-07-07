@@ -14,6 +14,8 @@ This doc tracks the **intentional** or **pragmatic** deviations in the JAX imple
 
 - **Optional sliding KV window (opt-in).** Training attention remains block-diagonal per chunk. Streaming inference is chunk-local by default (`max_cache_len = chunk_size`). Set `max_cache_len` above `chunk_size` to enable a sliding KV window; long-range context is still primarily carried by EMA + TimestepNorm state.
 
+- **Packed-sequence resets are training-only.** The paper does not discuss packed (multi-document) training. This implementation adds `segment_ids`/`position_ids` that reset attention, CEMA state, and TimestepNorm statistics at document boundaries, but only on the non-cached training path - strict metadata is rejected whenever a cache is involved, mirroring the streaming/chunk-parallel split above.
+
 ## Parameterization / Stability Tweaks
 
 - **TimestepNorm variance floor.** A small variance floor is enforced in TimestepNorm (`VARIANCE_FLOOR=1e-6`) to prevent division instability in early training steps.
