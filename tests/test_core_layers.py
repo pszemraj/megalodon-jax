@@ -11,8 +11,50 @@ import numpy as np
 import pytest
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
+from megalodon_jax.layers.segments import segment_boundaries, segment_runs_and_local_positions
 from megalodon_jax.layers.timestep_norm import VARIANCE_FLOOR
 from tests.utils import require_torch_modeling, to_jax
+
+
+class TestSegmentHelpers:
+    """Tests for the shared segment-metadata helpers.
+
+    These define the single boundary semantics consumed by attention masking,
+    ComplexEMA resets, and TimestepNorm resets.
+    """
+
+    def test_boundaries_basic_and_repeated_ids(self) -> None:
+        """Boundaries fire at position 0 and every id change, including reuse.
+
+        :return None: None.
+        """
+        segment_ids = jnp.asarray([[1, 1, 2, 2, 1, 1], [1, 1, 1, 0, 0, 2]], dtype=jnp.int32)
+        expected = np.asarray(
+            [
+                [True, False, True, False, True, False],
+                [True, False, False, True, False, True],
+            ]
+        )
+        np.testing.assert_array_equal(np.array(segment_boundaries(segment_ids)), expected)
+
+    def test_boundaries_empty_sequence(self) -> None:
+        """L=0 input must return an empty (B, 0) boolean array, not crash.
+
+        :return None: None.
+        """
+        out = segment_boundaries(jnp.zeros((3, 0), dtype=jnp.int32))
+        assert out.shape == (3, 0)
+        assert out.dtype == jnp.bool_
+
+    def test_runs_and_local_positions(self) -> None:
+        """Run ids restart counting per contiguous run; local positions restart at 0.
+
+        :return None: None.
+        """
+        segment_ids = jnp.asarray([[1, 1, 2, 2, 2, 1, 0, 0]], dtype=jnp.int32)
+        run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
+        np.testing.assert_array_equal(np.array(run_ids), [[1, 1, 2, 2, 2, 3, 4, 4]])
+        np.testing.assert_array_equal(np.array(local_positions), [[0, 1, 0, 1, 2, 0, 0, 1]])
 
 
 class TestTimestepNormParity:

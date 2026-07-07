@@ -35,6 +35,8 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Complex, Float, Int, PRNGKeyArray
 
+from megalodon_jax.layers.segments import segment_boundaries
+
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
 
@@ -160,27 +162,6 @@ class ComplexEMA(eqx.Module):
         """
         return a.real * b.real - a.imag * b.imag
 
-    @staticmethod
-    def _segment_boundaries(segment_ids: Int[Array, "batch seq"]) -> Bool[Array, "batch seq"]:
-        """Mark positions where a new segment starts.
-
-        Position 0 always starts a segment; later positions start one when
-        their segment id differs from the previous position's.
-
-        :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs (0 = padding).
-        :return Bool[Array, "batch seq"]: True where the EMA state must reset.
-        """
-        B, L = segment_ids.shape
-        if L == 0:
-            return jnp.zeros((B, 0), dtype=jnp.bool_)
-        return jnp.concatenate(
-            [
-                jnp.ones((B, 1), dtype=jnp.bool_),
-                segment_ids[:, 1:] != segment_ids[:, :-1],
-            ],
-            axis=1,
-        )
-
     def _forward_segmented(
         self,
         x: Float[Array, "batch dim seq"],
@@ -206,7 +187,7 @@ class ComplexEMA(eqx.Module):
         p, q, gamma = self._coeffs()  # (D, N) each
 
         # (L, B, 1, 1) reset flags broadcasting against coefficient (D, N) axes
-        reset = jnp.moveaxis(self._segment_boundaries(segment_ids), -1, 0)[:, :, None, None]
+        reset = jnp.moveaxis(segment_boundaries(segment_ids), -1, 0)[:, :, None, None]
 
         # Per-step affine coefficients, (L, B, D, N) complex64
         x_t = jnp.moveaxis(x.astype(jnp.float32), -1, 0)[:, :, :, None]  # (L, B, D, 1)
@@ -371,7 +352,7 @@ class ComplexEMA(eqx.Module):
         if segment_ids is None:
             h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
         else:
-            reset_seq = jnp.moveaxis(self._segment_boundaries(segment_ids), -1, 0)  # (L, B)
+            reset_seq = jnp.moveaxis(segment_boundaries(segment_ids), -1, 0)  # (L, B)
             valid_seq = jnp.moveaxis(segment_ids > 0, -1, 0)  # (L, B)
 
             def step_with_reset(

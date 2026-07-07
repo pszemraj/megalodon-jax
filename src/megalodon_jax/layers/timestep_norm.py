@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.layers.segments import segment_boundaries
 from megalodon_jax.types import NormState
 
 # Variance floor to prevent division instability in early training
@@ -224,16 +225,10 @@ class TimestepNorm(eqx.Module):
             # Floor variance to prevent instability
             var_t = jnp.maximum(var_t, VARIANCE_FLOOR)
         else:
-            # Segment-local Welford: subtract each segment's pre-start cumulative
-            # value so statistics restart at every boundary, reproducing exactly
-            # a fresh state (count=0, mean=0, var=1 <=> M2 baseline 1.0) per doc.
-            is_boundary = jnp.concatenate(
-                [
-                    jnp.ones((B, 1), dtype=jnp.bool_),
-                    segment_ids[:, 1:] != segment_ids[:, :-1],
-                ],
-                axis=1,
-            )  # (B, L)
+            # Segment-local Welford: restart statistics at every boundary,
+            # reproducing exactly a fresh state (count=0, mean=0, var=1 <=>
+            # M2 baseline 1.0) per doc.
+            is_boundary = segment_boundaries(segment_ids)  # (B, L)
 
             def _segmented_cumsum(z: Float[Array, "batch seq *rest"]) -> Float[Array, "..."]:
                 """Inclusive cumsum that restarts at segment boundaries.

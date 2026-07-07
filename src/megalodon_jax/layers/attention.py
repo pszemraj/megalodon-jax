@@ -36,6 +36,7 @@ from megalodon_jax.config import InitMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
+from megalodon_jax.layers.segments import segment_runs_and_local_positions
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.ops import linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
@@ -145,39 +146,6 @@ def attention_single_chunk(
     return out.astype(q.dtype)
 
 
-def _segment_runs_and_local_positions(
-    segment_ids: Int[Array, "batch seq"],
-) -> tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]:
-    """Compute contiguous-run indices and run-local positions.
-
-    Run indices: a packer may legally reuse a positive id for non-adjacent
-    documents (e.g. ``[1, 1, 2, 2, 1, 1]``); comparing raw ids for equality
-    would let the later run attend back to the earlier one. Run indices only
-    compare equal within a single contiguous run, matching the boundary-based
-    reset semantics of ComplexEMA and TimestepNorm.
-
-    Local positions: offsets from each run's first token. Dividing by the
-    chunk size re-anchors attention chunk boundaries at each run start, and
-    they double as the default RoPE positions for packed rows, so a document
-    that begins mid-chunk gets the same block-diagonal pattern and rotary
-    phases it would have running alone.
-
-    :param jax.Array segment_ids: Raw per-token segment ids of shape (batch, seq).
-    :return tuple: (run indices starting at 1, position offset within the run).
-    """
-    boundaries = jnp.concatenate(
-        [
-            jnp.ones_like(segment_ids[:, :1], dtype=jnp.bool_),
-            segment_ids[:, 1:] != segment_ids[:, :-1],
-        ],
-        axis=1,
-    )
-    run_ids = jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
-    positions = jnp.arange(segment_ids.shape[1], dtype=segment_ids.dtype)[None, :]
-    run_starts = jax.lax.cummax(jnp.where(boundaries, positions, 0), axis=1)
-    return run_ids, positions - run_starts
-
-
 def attention_multi_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch seq heads head_dim"],
@@ -227,7 +195,7 @@ def attention_multi_chunk(
         # RoPE must restart at each packed document: without explicit
         # position_ids a packed row would silently keep continuous global
         # phases across boundaries while the mask still isolates attention.
-        _, position_ids = _segment_runs_and_local_positions(segment_ids)
+        _, position_ids = segment_runs_and_local_positions(segment_ids)
 
     if L <= chunk_size:
         # Single chunk: apply RoPE and attention directly.
@@ -237,7 +205,7 @@ def attention_multi_chunk(
             # Compare contiguous runs (ids may repeat); validity from raw ids.
             # Local chunks are all 0 here (L <= chunk_size), so run equality
             # alone gives the full same-run, same-local-chunk condition.
-            seg_runs, _ = _segment_runs_and_local_positions(segment_ids)
+            seg_runs, _ = segment_runs_and_local_positions(segment_ids)
             qk_mask = (
                 (seg_runs[:, :, None] == seg_runs[:, None, :])
                 & (segment_ids[:, :, None] > 0)
@@ -291,7 +259,7 @@ def attention_multi_chunk(
         # at most chunk_size consecutive positions, so keys/values from the
         # current + previous global chunk cover every allowed edge; the mask
         # keeps only same-run, same-local-chunk, valid pairs.
-        run_ids, local_positions = _segment_runs_and_local_positions(segment_ids)
+        run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
         local_chunks = local_positions // chunk_size
 
         def window_keys(z: jnp.ndarray, fill_value) -> jnp.ndarray:
