@@ -474,6 +474,7 @@ class ChunkedAttention(eqx.Module):
         :param jax.Array | None mask: Optional mask where True marks valid positions.
         :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
         :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
+            When omitted with segment_ids given, document-local positions are derived.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
@@ -1294,6 +1295,7 @@ class MegalodonAttention(eqx.Module):
         :param jax.Array | None mask: Optional mask where True marks valid positions.
         :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
         :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
+            When omitted with segment_ids given, document-local positions are derived.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.

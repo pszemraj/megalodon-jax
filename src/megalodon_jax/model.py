@@ -51,7 +51,9 @@ def _checkpointed_layer(
     :param Float[Array, "batch seq dim"] x: Input activations.
     :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
     :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
-    :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
+    :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+        When omitted with segment_ids given, document-local positions
+        (restarting at each segment start) are derived automatically.
     :param PRNGKeyArray | None key: Optional dropout key.
     :return Float[Array, "batch seq dim"]: Output activations.
     """
@@ -176,7 +178,9 @@ class MegalodonBlock(eqx.Module):
         :param LayerCache | None cache: Optional layer cache.
         :param Bool[Array, "batch seq"] | None mask: Optional attention mask.
         :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
-        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
@@ -319,7 +323,9 @@ class MegalodonModel(eqx.Module):
         :param Int[Array, "batch seq"] input_ids: Token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
         :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
-        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param ModelCache | None cache: Optional model cache.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
@@ -561,7 +567,9 @@ class MegalodonForCausalLM(eqx.Module):
         :param Int[Array, "batch seq"] input_ids: Token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
         :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
-        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param ModelCache | None cache: Optional model cache.
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
@@ -642,7 +650,9 @@ class MegalodonForCausalLM(eqx.Module):
         :param Int[Array, "batch seq"] labels: Target token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
         :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
-        :param Int[Array, "batch seq"] | None position_ids: Optional position IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+            When omitted with segment_ids given, document-local positions
+            (restarting at each segment start) are derived automatically.
         :param int ignore_index: Label value to ignore in loss computation.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
