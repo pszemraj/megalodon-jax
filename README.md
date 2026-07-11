@@ -1,6 +1,6 @@
 # megalodon-jax
 
-A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801), ported from [megalodon-hf](https://github.com/pszemraj/megalodon-hf).
+A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801), aligned with the original released PyTorch/CUDA implementation.
 
 ## Features
 
@@ -8,8 +8,8 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
 - Packed-sequence training with full document isolation: `segment_ids` masks attention, resets EMA/norm state at boundaries, and excludes cross-document label pairs from the loss
 - JAX pytree caches for JIT-compatible streaming inference
-- Weight conversion utilities for PyTorch ↔ JAX interop
-- 150+ tests (200+ cases via parametrization) covering parity with the PyTorch reference
+- Strict native SafeTensors checkpoints plus exact original-upstream PyTorch checkpoint conversion
+- Independent source-derived PyTorch/JAX forward, all-parameter gradient, and optimizer parity gates without building the fused CUDA extension
 
 ## Installation
 
@@ -29,7 +29,7 @@ cd megalodon-jax
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+. PyTorch is optional; install `.[convert]` for conversion utilities and `.[dev]` for conversion plus parity tests and dev tooling.
+Requires Python 3.11+ with JAX 0.7.0+ and Equinox 0.12.0+. PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
 
 ## Quick Start
 
@@ -54,6 +54,21 @@ input_ids = jax.random.randint(key, (1, 128), 0, cfg.vocab_size)
 logits, cache = model(input_ids, return_cache=True)
 print(logits.shape)  # (1, 128, 32000)
 ```
+
+### Exact named presets
+
+Preset names are explicit because the paper 7B configuration and the two released 7B configurations are not interchangeable. With `vocab_size=32_000`, the exact trainable counts are:
+
+| Factory | SwiGLU | Chunk | RoPE base | Tied | Parameters |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `from_upstream_mega200m` | no | 2,048 | 10,000 | no | 220,627,968 |
+| `from_upstream_mega1_3b` | no | 2,048 | 10,000 | no | 1,342,832,640 |
+| `from_upstream_mega1_3b_pg19` | yes | 2,048 | 10,000 | yes | 1,327,628,288 |
+| `from_upstream_mega7_1b` | no | 2,048 | 10,000 | no | 7,117,381,632 |
+| `from_upstream_mega7_3b` | yes | 2,048 | 10,000 | no | 7,385,817,088 |
+| `from_paper_7b` | yes | 4,096 | 100,000 | no | 7,385,817,088 |
+
+`from_7b()` intentionally raises because its historical definition mixed incompatible upstream presets. Use `config.parameter_count_breakdown()` for exact counts at another vocabulary size or output width. Output tying is controlled only by the explicit `share_emb` field; it is never inferred from matching shapes.
 
 ### Streaming Inference
 
@@ -134,7 +149,7 @@ Each packed document produces the same outputs (and gradients) as running it alo
 
 4. **Two-Hop Residual**: FFN adds residual from block input, not post-attention activations.
 
-5. **Mask-Aware Loss**: Padding tokens are excluded from loss computation (matches PyTorch/HF).
+5. **Mask-Aware Loss**: Attention masks, ignored labels, padding segments, and cross-document shifted pairs are excluded explicitly.
 
 ### Source Layout
 
@@ -143,8 +158,9 @@ src/megalodon_jax/
 ├── config.py          # MegalodonConfig (frozen dataclass)
 ├── types.py           # Cache/state pytrees
 ├── utils.py           # Weight initialization
+├── checkpoint.py      # Strict native model/cache persistence
 ├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM
-├── convert.py         # Weight conversion (PyTorch ↔ JAX)
+├── convert.py         # Exact original-upstream checkpoint conversion
 └── layers/
     ├── norms.py       # RMSNorm
     ├── rotary.py      # RotaryEmbedding
@@ -155,13 +171,13 @@ src/megalodon_jax/
 
 ## Precision
 
-- Parameters use `param_dtype` (default float32); compute uses `compute_dtype` (default float32).
-- Set `compute_dtype=jnp.bfloat16` for AMP-style bf16 compute while keeping sensitive params in fp32.
-- Use `accum_dtype` and `softmax_dtype` to keep GEMM accumulation and loss math in fp32.
+- Parameter storage and accumulation are float32; compute is float32 by default.
+- Set `compute_dtype=jnp.bfloat16` for BF16 compute while retaining FP32 parameters and accumulation.
+- `attention_softmax_dtype` and `loss_softmax_dtype` control attention and language-model loss math independently; FP32 is recommended for both.
 - Use `megalodon_jax.precision.audit_sensitive_param_dtypes` to verify fp32-sensitive params.
 - Avoid blanket `jax.tree.map` casts to bf16; use the config dtypes or `ensure_sensitive_param_dtype`.
 - See `docs/dtypes-and-stability.md` for downstream training guidance.
-- **Never use float16** (EMA/FFT overflow)
+- Float16 is deliberately unsupported. Use FP32, or BF16 on hardware with native BF16 support; older GPUs without native BF16 must use FP32.
 
 ## Performance
 
@@ -171,29 +187,29 @@ src/megalodon_jax/
 
 - Core components + streaming cache utilities
 - Sampling + `generate()` loop for text generation
-- PyTorch ↔ JAX conversion (SafeTensors via PyTorch state dicts)
+- Versioned native SafeTensors persistence and exact original-upstream `.pth` conversion
 
 ## Limitations
 
 - Pure JAX implementation (no fused CUDA kernels)
-- Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
+- Sequential CEMA is slower than FFT; training uses FFT automatically when no state or segment reset is required
 - No 4D chunk parallelism (out of scope for single-device)
 - Cached decoding does not support padded batches
 - Packed-sequence metadata (`segment_ids`/`position_ids`) is training-only; rejected on cached/streaming calls
-- CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
+- Token IDs are never treated as padding implicitly; callers must provide attention/loss masks and keep unknown-token semantics separate from padding metadata
 
 ## Testing
 
 ```bash
 pytest                          # All CPU tests
 pytest -m "not torch_ref"       # JAX-only tests
-pytest -m torch_ref             # PyTorch reference parity tests (requires torch + megalodon-hf)
+pytest -m torch_ref             # Independent source-derived Torch parity tests
 pytest tests/test_model.py -v   # Single file
+python tools/verify_modeling_correctness.py --jax-repo . --backend cpu --include-slow
 ```
 
 ## Related
 
-- [megalodon-hf](https://github.com/pszemraj/megalodon-hf) - PyTorch/Transformers implementation
 - [Original Megalodon](https://github.com/XuezheMax/megalodon) - Reference CUDA implementation
 
 ## Citation

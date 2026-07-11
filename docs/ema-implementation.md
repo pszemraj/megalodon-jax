@@ -5,7 +5,7 @@ This note describes the JAX ComplexEMA implementation in this repo (`src/megalod
 ## Reference Context
 
 - The original CUDA reference uses FFT-based convolution when no streaming state is required.
-- The original CUDA reference uses a fused kernel to emit the final streaming state; `megalodon-hf` uses a sequential PyTorch path instead.
+- The original CUDA reference uses fused FFT/state kernels. This repository validates those kernels at source level and uses a source-derived differentiable Torch recurrence for numerical parity without building the extension.
 
 ## JAX Implementation
 
@@ -25,7 +25,7 @@ The JAX version provides three numerically equivalent paths:
 
 ### Mask Handling
 
-If a boolean `mask` is provided, masked positions are zeroed before the recurrence. This prevents padded tokens from contaminating the EMA state and matches the `megalodon-hf` reference behavior. With `segment_ids`, positions in segment 0 (padding) are additionally treated as invalid, composing with `mask`.
+If a boolean `mask` is provided, masked positions are zeroed before the recurrence so they cannot contaminate EMA state. With `segment_ids`, positions in segment 0 are additionally invalid, composing with `mask`. Token IDs alone never imply padding.
 
 ## Stability Notes
 

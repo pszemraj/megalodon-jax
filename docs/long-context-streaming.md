@@ -57,7 +57,7 @@ sequenceDiagram
     participant Cache as KV Cache (window)
     participant State as EMA + TN state
     participant Block as Attn Block
-    Note over Cache: default max_cache_len = chunk_size (chunk-local)<br/>max_cache_len = W => keep last W<br/>cache_unbounded = True => no boundary reset (still bounded)
+    Note over Cache: attention_window=None => released chunk-local mode<br/>attention_window=W => fixed W-token sliding window
 
     Loop for each chunk
         Block->>State: TimestepNorm (update running mean/var)
@@ -71,9 +71,9 @@ sequenceDiagram
     end
 ```
 
-- Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`); chunk-local streaming calls can span boundaries and are processed chunk-by-chunk with cache reset at each boundary.
-- A finite `max_cache_len` above the chunk size enables a sliding window.
-- Setting `cache_unbounded=True` disables boundary resets but still uses a fixed `max_cache_len` for JIT compatibility.
+- `attention_window=None` is the released chunk-local behavior. The fixed ring capacity is `chunk_size`, and attention/RoPE restart at each source chunk boundary.
+- `attention_window=W` enables the intentional fixed-width sliding-window extension with ring capacity `W` and a per-query age mask.
+- Both modes are invariant to call partitioning: full calls, arbitrary chunks, token-by-token calls, and save/reload continuation produce the same outputs for identical semantics.
 
 ## 3) RoPE Offsets
 
@@ -86,12 +86,12 @@ flowchart TD
     end
 ```
 
-- We track absolute positions so rotary phases remain continuous across chunks, even when KV is trimmed.
+- The cache tracks absolute token count. Released chunk-local mode derives RoPE position as `absolute_position % chunk_size`, matching the source's per-chunk coordinate restart. Sliding-window mode uses absolute positions so retained keys and new queries remain in one coordinate system.
 
 ## 4) Training vs. Inference
 
-- **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache). Packed rows may pass `segment_ids`/`position_ids` for full per-document isolation (attention masking + EMA/norm state resets); see [dev.md](dev.md#packed-sequence-state-isolation).
-- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV; RoPE offset advances with absolute position. Packed metadata is rejected on any cached/streaming call - the model raises before compute.
+- **Training:** `attention_window=None` gives released block-diagonal attention per chunk; setting `attention_window` opts into sliding attention. EMA uses FFT when no state/reset is required. Packed rows may pass `segment_ids`/`position_ids` for full per-document isolation; see [dev.md](dev.md#packed-sequence-state-isolation).
+- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV. RoPE restarts per source chunk in faithful mode and remains absolute in sliding mode. Packed metadata is rejected on any cached/streaming call before compute.
 
 ## 5) Padding and Generation
 
@@ -101,6 +101,6 @@ flowchart TD
 
 ## Defaults and Options
 
-- **PyTorch reference (megalodon-hf):** default `max_cache_len = chunk_size` (chunk-local); set `max_cache_len` above `chunk_size` for a sliding window; validates `max_cache_len >= chunk_size`.
-- **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable chunk resets (still fixed-size).
+- **Original release:** chunk-local attention with per-chunk RoPE coordinates; long-range information flows through CEMA and stateful normalization.
+- **Paper theory:** "unlimited" context is carried by recurrent state rather than an unbounded global KV cache.
+- **This repo:** `attention_window=None` preserves released behavior. A positive `attention_window` explicitly opts into the partition-invariant sliding extension.

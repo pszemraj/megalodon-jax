@@ -1,24 +1,18 @@
 # Dtypes and Stability Guide
 
-This guide explains how to use Megalodon JAX safely in downstream training
-loops with fp32 or bf16 compute. The core rule is: keep sensitive parameters in
-fp32 while allowing compute to run in bf16 via the config.
+Megalodon JAX supports two numerical modes: FP32 and BF16 compute with FP32 storage/accumulation. Float16 is intentionally unsupported because the EMA, FFT, normalization, and long-context state paths are not reliable in that range.
 
-## Recommended dtype policy
+## Supported policies
 
-MegalodonConfig separates:
+`MegalodonConfig` separates the numerical roles explicitly:
 
-- `param_dtype`: parameter storage dtype (default fp32).
-- `compute_dtype`: matmul/activation dtype (default fp32).
-- `accum_dtype`: accumulation dtype for GEMM and reductions (default fp32).
-- `softmax_dtype`: softmax/log-softmax dtype (default fp32).
-- `gemm_backend`: `"default"` (reserved for future FP8 backends).
+- `param_dtype` is parameter storage and must be `jnp.float32`.
+- `compute_dtype` controls projections and activations and may be `jnp.float32` or `jnp.bfloat16`.
+- `accum_dtype` controls GEMM/reduction accumulation and must be `jnp.float32`.
+- `attention_softmax_dtype` controls attention softmax and may be FP32 or BF16.
+- `loss_softmax_dtype` controls language-model log-softmax and may be FP32 or BF16.
 
-Use one of the following:
-
-Attention matmuls honor `accum_dtype` for accumulation (default fp32).
-
-### 1) Full fp32 (most stable)
+Full FP32 is the reference policy:
 
 ```python
 config = MegalodonConfig(
@@ -26,11 +20,12 @@ config = MegalodonConfig(
     param_dtype=jnp.float32,
     compute_dtype=jnp.float32,
     accum_dtype=jnp.float32,
-    softmax_dtype=jnp.float32,
+    attention_softmax_dtype=jnp.float32,
+    loss_softmax_dtype=jnp.float32,
 )
 ```
 
-### 2) AMP-style bf16 compute (recommended for speed)
+BF16 compute is the accelerator policy:
 
 ```python
 config = MegalodonConfig(
@@ -38,63 +33,44 @@ config = MegalodonConfig(
     param_dtype=jnp.float32,
     compute_dtype=jnp.bfloat16,
     accum_dtype=jnp.float32,
-    softmax_dtype=jnp.float32,
+    attention_softmax_dtype=jnp.float32,
+    loss_softmax_dtype=jnp.float32,
 )
 ```
 
-This keeps master weights in fp32 while running most compute in bf16 with
-fp32 accumulation where needed.
+Use BF16 only on accelerators with native BF16 support. There is no FP16 fallback for older GPUs; use FP32 instead.
 
-## What not to do
+## Fixed precision behavior
 
-Do not blanket-cast the entire model to bf16, for example:
+- TimestepNorm state, running moments, RMSNorm statistics, and LayerNorm statistics are FP32.
+- CEMA coefficients and state are FP32/complex64.
+- RoPE angles are generated in FP32 and are derived data, not trainable leaves.
+- KV cache tensors follow `compute_dtype`; norm state remains FP32 and EMA state remains complex64.
+- Returned logits are always FP32, matching the original released model.
+- Parameter gradients have the FP32 storage dtype even under BF16 compute.
+
+The two softmax fields are deliberately independent. Changing `attention_softmax_dtype` does not alter loss math, and changing `loss_softmax_dtype` does not alter attention. FP32 is recommended for both.
+
+## Do not cast the model tree
+
+Do not blanket-cast the model to BF16:
 
 ```python
-# Avoid this: it quantizes sensitive params.
+# Unsupported: this quantizes persistent parameters and sensitive dynamics.
 model = jax.tree.map(lambda x: x.astype(jnp.bfloat16), model)
 ```
 
-This will quantize EMA parameters, normalization weights, and per-head Q/K
-affines, which can destabilize training.
-
-If you must cast a model, call the precision helpers afterward:
-
-```python
-from megalodon_jax.precision import ensure_sensitive_param_dtype
-
-model = jax.tree.map(...)
-model = ensure_sensitive_param_dtype(model)
-```
-
-## Precision-sensitive parameters
-
-The following are always expected to stay fp32:
-
-- ComplexEMA parameters: `alpha`, `delta`, `theta`, `gamma_real`, `gamma_imag`, `omega`
-- Norm parameters: RMSNorm, LayerNorm, and TimestepNorm weights/biases
-- Per-head Q/K affine parameters: `gamma`, `beta`
-
-You can audit these at runtime:
+Select BF16 through `MegalodonConfig(compute_dtype=jnp.bfloat16)`. The model casts compute operands while retaining FP32 master parameters. `audit_sensitive_param_dtypes` is available as a defensive check:
 
 ```python
 from megalodon_jax.precision import audit_sensitive_param_dtypes
 
-mismatches = audit_sensitive_param_dtypes(model)
-assert not mismatches, mismatches
+assert not audit_sensitive_param_dtypes(model)
 ```
 
-## Internal precision choices (not configurable)
+## Training loop
 
-The following operations use fixed higher precision for stability:
-
-- **Normalization layers**: RMSNorm, LayerNorm, and TimestepNorm compute stats in fp32.
-- **ComplexEMA coefficients**: computed in float32/complex64 regardless of parameter dtype.
-- **RoPE**: angles computed in fp32, outputs cast to input dtype.
-
-## Training loop guidance (fp32 or bf16 compute)
-
-The model already casts activations to `compute_dtype`. Use config-driven
-precision rather than manual casting in your loop.
+The model owns compute casting; token IDs remain `int32`, and optimizer state should be initialized from the FP32 parameter tree.
 
 ```python
 import equinox as eqx
@@ -104,53 +80,37 @@ import optax
 
 config = MegalodonConfig(
     ...,
-    param_dtype=jnp.float32,
     compute_dtype=jnp.bfloat16,
-    accum_dtype=jnp.float32,
-    softmax_dtype=jnp.float32,
+    attention_softmax_dtype=jnp.float32,
+    loss_softmax_dtype=jnp.float32,
 )
 model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
 optimizer = optax.adamw(learning_rate=1e-4)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
 @eqx.filter_value_and_grad
-def loss_fn(m, input_ids, labels, key):
-    return m.compute_loss(input_ids, labels, deterministic=False, key=key)
+def loss_fn(candidate, input_ids, labels, key):
+    return candidate.compute_loss(input_ids, labels, deterministic=False, key=key)
 
-def train_step(m, opt_state, input_ids, labels, key):
-    loss, grads = loss_fn(m, input_ids, labels, key)
-    updates, opt_state = optimizer.update(grads, opt_state, m)
-    m = eqx.apply_updates(m, updates)
-    return m, opt_state, loss
+def train_step(candidate, state, input_ids, labels, key):
+    loss, grads = loss_fn(candidate, input_ids, labels, key)
+    updates, state = optimizer.update(grads, state, candidate)
+    return eqx.apply_updates(candidate, updates), state, loss
 ```
 
-Notes:
-- Keep `param_dtype` as fp32 to maintain master weights.
-- Let the model handle compute casting; avoid manual `astype` on the model.
-- Input token ids should remain int32.
-- Loss is computed in `softmax_dtype` (default fp32) for stability.
-- GEMM wrappers cast weights each forward pass; this is correct but adds overhead.
+## Checkpoints and conversion
 
-## Inference and cache dtype
+Native v2 checkpoints preserve the exact FP32 parameter contract and store the dtype policy in serialized configuration metadata. `load_checkpoint` refuses metadata-free and incompatible files rather than guessing their semantics. Partial restore requires an explicit parameter-name allowlist and reports every initialized leaf.
 
-Use `init_cache(config, ...)` without a dtype override so cache dtypes match
-`config.compute_dtype`. This avoids unexpected dtype promotion inside attention.
+Original-upstream conversion uses FP32 by default. `export_upstream_state_dict(model, dtype=torch.bfloat16)` may be used for a BF16 transport copy, while source-sensitive normalization/CEMA tensors remain explicitly represented according to the original schema. Loading converts floating tensors to the model's FP32 storage contract.
 
-## Loading and conversion
+## Troubleshooting
 
-- `load_from_pretrained(..., dtype=jnp.bfloat16)` will cast non-sensitive
-  parameters to bf16 while keeping sensitive params in fp32.
-- `load_weights_from_torch` now enforces fp32 for sensitive params after load.
-- `convert_jax_to_torch(..., dtype=torch.bfloat16)` exports sensitive params in
-  fp32 even when the rest is bf16.
+If BF16 training diverges:
 
-## Troubleshooting checklist
-
-If bf16 training looks unstable:
-
-1. Verify config uses `param_dtype=jnp.float32`, `compute_dtype=jnp.bfloat16`,
-   and `softmax_dtype=jnp.float32`.
-2. Run `audit_sensitive_param_dtypes(model)` and ensure no mismatches.
-3. Remove any `jax.tree.map` casts applied in downstream code.
-4. Confirm you are not using float16 (unsupported).
+1. Confirm `param_dtype` and `accum_dtype` are FP32.
+2. Restore FP32 attention and loss softmax.
+3. Run `audit_sensitive_param_dtypes(model)`.
+4. Remove downstream tree-wide casts.
+5. Confirm the accelerator has native BF16 support.
+6. Reproduce the issue in full FP32 before changing model mathematics.

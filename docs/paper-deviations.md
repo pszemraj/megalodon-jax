@@ -1,29 +1,27 @@
-# Paper Deviations and Rationale
+# Paper, Released Source, and Intentional JAX Differences
 
-This doc tracks the **intentional** or **pragmatic** deviations in the JAX implementation relative to the Megalodon paper and upstream reference.
+This document separates mathematical architecture, original released checkpoint compatibility, and intentional JAX extensions. A paper/source disagreement is not silently resolved in favor of either one.
 
-## Architectural Deviations
+## Released-source compatibility choices
 
-- **No fused kernels.** The upstream reference relies on custom CUDA/Triton kernels for sequential CEMA, TimestepNorm, fused attention, and DropKey. This repo uses pure JAX/XLA (FFT EMA for training, sequential EMA for streaming; manual chunked attention). Expect lower throughput and slightly different numerics on very long sequences.
+- **CEMA coefficient placement.** Paper equation (2) can be read as applying phase to both input and recurrence terms. The released implementation uses real `p = sigmoid(alpha)` and places phase in complex `q = polar(1 - alpha * delta, theta)`. JAX follows the released behavior so original checkpoints retain their meaning.
+- **CEMA omega residual.** The `omega`-weighted skip is not explicit in the abbreviated paper equation but is a released trainable parameter and is preserved.
+- **Normalized Q/K.** The paper's L2 normalization is implemented as per-head RMS normalization followed by the released `1/sqrt(d_head)` affine factor. Attention scores do not receive an additional Transformer `1/sqrt(d_head)` scale.
+- **Normalization storage.** TimestepNorm, LayerNorm, and RMSNorm store zero-initialized scale offsets and apply `stored + 1`. This is forward-equivalent to direct unit scale at initialization but materially different for serialization and weight decay, so the released storage convention is preserved.
+- **TimestepNorm moments.** Each valid token contributes a block containing every scalar in a group. Population variance includes within-token feature variance, and continuation uses block-Welford merging. Masked positions do not update state and emit exact zeros. No variance floor is added beyond configured `norm_eps`.
+- **RoPE coordinates.** Adjacent coordinate pairs are interpreted as complex values, matching the released `view_as_complex(...reshape(..., -1, 2))` convention. Frequencies are derived, non-trainable data.
 
-- **No DropKey masking.** Attention dropout is standard post-softmax dropout. DropKey (pre-softmax masking) is not implemented without a fused kernel.
+## Intentional JAX extensions
 
-- **No 4D chunk-parallel axis.** The paper's time-parallel "chunk parallelism" is not implemented. Training is intended for a single device; multi-device scaling would require cross-rank exchange of EMA/Norm state and sharded KV.
+- **Pure JAX/XLA execution.** The original uses custom CUDA kernels. JAX provides FFT, scan, and manual attention implementations. The fused extension is authoritative source evidence but is not a build or runtime prerequisite.
+- **Packed training isolation.** `segment_ids` and optional `position_ids` isolate contiguous documents across attention, CEMA, TimestepNorm, RoPE, gradients, and shifted loss pairs. This is training-only and is rejected on cached calls.
+- **Sliding attention.** `attention_window=None` is faithful released chunk-local behavior. A positive `attention_window` opts into a fixed-capacity sliding window with an exact per-query age mask. Both modes are call-partition invariant.
+- **Dropout mode selection.** `attention_dropout_mode="post_softmax"` provides released unfused behavior; `"dropkey"` provides the pre-softmax compatibility option. Both require explicit PRNG keys in non-deterministic execution.
+- **Versioned native persistence.** Native model and cache SafeTensors formats include version/config/manifest metadata and fail closed. The original release did not define a JAX checkpoint format.
+- **No 4D chunk-parallel implementation.** Model-parallel checkpoint shards can be consolidated during conversion, but distributed chunk-parallel execution is outside this single-device implementation.
 
-- **Fixed-size KV cache.** Streaming attention uses a ring buffer for KV. `cache_unbounded=True` disables chunk-boundary resets but still uses a fixed `max_cache_len` for JIT compatibility; it does not grow without bound.
+## Deliberately unsupported
 
-- **Optional sliding KV window (opt-in).** Training attention remains block-diagonal per chunk. Streaming inference is chunk-local by default (`max_cache_len = chunk_size`). Set `max_cache_len` above `chunk_size` to enable a sliding KV window; long-range context is still primarily carried by EMA + TimestepNorm state.
-
-- **Packed-sequence resets are training-only.** The paper does not discuss packed (multi-document) training. This implementation adds `segment_ids`/`position_ids` that reset attention, CEMA state, and TimestepNorm statistics at document boundaries, but only on the non-cached training path - strict metadata is rejected whenever a cache is involved, mirroring the streaming/chunk-parallel split above.
-
-## Parameterization / Stability Tweaks
-
-- **TimestepNorm variance floor.** A small variance floor is enforced in TimestepNorm (`VARIANCE_FLOOR=1e-6`) to prevent division instability in early training steps.
-
-- **Omega residual in CEMA.** The EMA block includes an `omega`-weighted skip connection from MEGA. This is not explicitly shown in Eq. 2 of the paper but is present in the upstream lineage and helps optimization.
-
-- **CEMA input phase (paper vs upstream).** The paper's Eq. (2) applies the complex phase `(cos θ + i sin θ)` to both the input and recurrence terms. Upstream uses a real input coefficient `p = alpha` and encodes phase only in `q`; this implementation follows upstream for reproducibility.
-
-- **RMS vs L2 normalization for Z.** The paper specifies L2 normalization of the shared `Z`. We use per-head RMS normalization followed by a `1/sqrt(d_head)` factor in the affine scale. This is mathematically equivalent to L2 normalization while matching the reference kernel.
-
-If you spot any additional divergence, please open an issue or PR with the corresponding paper equation and code pointer.
+- Float16 compute or storage. Supported modes are FP32 and BF16 compute with FP32 parameters/accumulation.
+- Silent loading of pre-v2 JAX, Hugging Face-shaped, raw FSDP, or otherwise ambiguous checkpoints.
+- Cached decoding with padding masks or packed-sequence metadata because the KV cache does not store per-position validity/segment metadata.
