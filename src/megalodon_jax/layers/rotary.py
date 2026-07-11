@@ -24,18 +24,16 @@ class RotaryEmbedding(eqx.Module):
     Applies position-dependent rotations to query and key vectors.
     Computes cos/sin on the fly rather than caching a large table.
 
-    The rotation treats consecutive dimension pairs as complex numbers:
-    dimensions [0:half] are real parts, [half:dim] are imaginary parts.
+    The rotation treats adjacent dimension pairs as complex numbers, matching
+    the released implementation's reshape(..., -1, 2) convention.
 
     Attributes:
         dim: Per-head dimensionality (must be even).
         base: Exponential base controlling angular step size.
-        inv_freq: Precomputed inverse frequencies.
     """
 
     dim: int = eqx.field(static=True)
     base: float = eqx.field(static=True)
-    inv_freq: Float[Array, "half_dim"]
 
     def __init__(self, dim: int, base: float = 10000.0, *, key: PRNGKeyArray | None = None):
         """Initialize RotaryEmbedding.
@@ -51,12 +49,12 @@ class RotaryEmbedding(eqx.Module):
             raise ValueError(f"RotaryEmbedding expects even head dimension, got {dim}")
         self.dim = dim
         self.base = base
-        half = dim // 2
-        # inv_freq = 1 / (base^(i / half)) for i in [0, half)
-        # Equivalent: exp(-i * log(base) / half)
-        # Note: JAX's exp() may differ slightly from PyTorch's at float32 precision.
-        # This is acceptable as long as the difference is within float32 epsilon bounds.
-        self.inv_freq = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-jnp.log(base) / half))
+
+    def _inverse_frequencies(self) -> Float[Array, "half_dim"]:
+        """Derive fixed frequencies without adding an array leaf to the module."""
+        half = self.dim // 2
+        exponent = jnp.arange(half, dtype=jnp.float32) / half
+        return jnp.power(jnp.asarray(self.base, dtype=jnp.float32), -exponent)
 
     def __call__(
         self,
@@ -75,30 +73,40 @@ class RotaryEmbedding(eqx.Module):
         """
         batch_size = q.shape[0]
         seq_len = q.shape[1]
+        if q.shape != k.shape:
+            raise ValueError(f"RoPE query/key shapes must match, got {q.shape} and {k.shape}")
+        if q.shape[-1] != self.dim:
+            raise ValueError(f"RoPE expected final dimension {self.dim}, got {q.shape[-1]}")
+        inv_freq = self._inverse_frequencies()
 
         if position_ids is None:
             # Compute positions: [start_index, start_index+1, ..., start_index+seq_len-1]
             positions = jnp.arange(seq_len, dtype=jnp.float32) + start_index.astype(jnp.float32)
-            angles = positions[:, None] * self.inv_freq[None, :]  # (seq, half_dim)
+            angles = positions[:, None] * inv_freq[None, :]  # (seq, half_dim)
             cos = jnp.cos(angles)[None, :, None, :]  # (1, seq, 1, half_dim)
             sin = jnp.sin(angles)[None, :, None, :]  # (1, seq, 1, half_dim)
         else:
             positions = position_ids.astype(jnp.float32)
-            angles = positions[:, :, None] * self.inv_freq[None, None, :]  # (B, seq, half_dim)
+            if position_ids.shape != (batch_size, seq_len):
+                raise ValueError(
+                    f"position_ids must have shape {(batch_size, seq_len)}, "
+                    f"got {position_ids.shape}"
+                )
+            angles = positions[:, :, None] * inv_freq[None, None, :]  # (B, seq, half_dim)
             cos = jnp.cos(angles)[:, :, None, :]  # (B, seq, 1, half_dim)
             sin = jnp.sin(angles)[:, :, None, :]  # (B, seq, 1, half_dim)
             cos = jnp.broadcast_to(cos, (batch_size, seq_len, 1, self.dim // 2))
             sin = jnp.broadcast_to(sin, (batch_size, seq_len, 1, self.dim // 2))
 
-        # Split into real/imag pairs (first half, second half)
+        # Match torch.view_as_complex(x.float().reshape(..., -1, 2)).
         half = self.dim // 2
-        q1 = q[..., :half].astype(jnp.float32)
-        q2 = q[..., half:].astype(jnp.float32)
-        k1 = k[..., :half].astype(jnp.float32)
-        k2 = k[..., half:].astype(jnp.float32)
+        q_pairs = q.astype(jnp.float32).reshape(*q.shape[:-1], half, 2)
+        k_pairs = k.astype(jnp.float32).reshape(*k.shape[:-1], half, 2)
+        q1, q2 = q_pairs[..., 0], q_pairs[..., 1]
+        k1, k2 = k_pairs[..., 0], k_pairs[..., 1]
 
         # Apply rotation: (a + ib)(cos + i*sin) = (a*cos - b*sin) + i(b*cos + a*sin)
-        q_rot = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
-        k_rot = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+        q_rot = jnp.stack([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
+        k_rot = jnp.stack([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
 
-        return q_rot.astype(q.dtype), k_rot.astype(k.dtype)
+        return q_rot.reshape(q.shape).astype(q.dtype), k_rot.reshape(k.shape).astype(k.dtype)

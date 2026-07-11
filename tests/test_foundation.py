@@ -225,6 +225,47 @@ class TestRMSNormParity:
 class TestRotaryEmbeddingParity:
     """Parity tests for RotaryEmbedding against PyTorch reference."""
 
+    def test_adjacent_pair_oracle(self) -> None:
+        """RoPE rotates adjacent coordinates as released upstream does."""
+        rope = RotaryEmbedding(8, base=10_000.0)
+        q = jnp.arange(1, 9, dtype=jnp.float32).reshape(1, 1, 1, 8)
+        k = q + 10.0
+        q_actual, k_actual = rope(q, k, jnp.asarray(7, dtype=jnp.int32))
+
+        pairs = np.asarray(q).reshape(1, 1, 1, 4, 2)
+        inv = np.power(10_000.0, -np.arange(4, dtype=np.float32) / 4)
+        angles = 7.0 * inv
+        expected_pairs = np.stack(
+            [
+                pairs[..., 0] * np.cos(angles) - pairs[..., 1] * np.sin(angles),
+                pairs[..., 1] * np.cos(angles) + pairs[..., 0] * np.sin(angles),
+            ],
+            axis=-1,
+        )
+        np.testing.assert_allclose(np.asarray(q_actual), expected_pairs.reshape(q.shape), atol=2e-6)
+        assert k_actual.shape == k.shape
+
+    def test_frequencies_are_derived_not_array_leaves(self) -> None:
+        """Fixed rotary data must not enter generic Equinox optimizers."""
+        rope = RotaryEmbedding(8, base=10_000.0)
+        assert jax.tree_util.tree_leaves(rope) == []
+
+    def test_explicit_positions_match_start_offset(self) -> None:
+        """Explicit positions and a scalar cache offset use the same phases."""
+        rope = RotaryEmbedding(8)
+        q = jnp.arange(48, dtype=jnp.float32).reshape(2, 3, 1, 8)
+        k = q + 1.0
+        offset_q, offset_k = rope(q, k, jnp.asarray(5, dtype=jnp.int32))
+        positions = jnp.broadcast_to(jnp.arange(5, 8, dtype=jnp.int32), (2, 3))
+        explicit_q, explicit_k = rope(
+            q,
+            k,
+            jnp.asarray(0, dtype=jnp.int32),
+            position_ids=positions,
+        )
+        np.testing.assert_array_equal(np.asarray(offset_q), np.asarray(explicit_q))
+        np.testing.assert_array_equal(np.asarray(offset_k), np.asarray(explicit_k))
+
     @pytest.mark.torch_ref
     def test_forward_parity(self, random_seed: int) -> None:
         """Test RotaryEmbedding forward pass matches PyTorch.
