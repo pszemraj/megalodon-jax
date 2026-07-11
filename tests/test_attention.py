@@ -1324,7 +1324,7 @@ class TestStreamingEquivalence:
 
             _, cache, position = attn(q, k, v, cache=cache, return_cache=True)
 
-            # Fixed-size buffer: shape is always max_cache_len
+            # Fixed-size buffer: shape is always the configured cache capacity.
             assert cache.k.shape[1] == chunk_size, (
                 f"Cache buffer should be fixed size {chunk_size}, got {cache.k.shape[1]}"
             )
