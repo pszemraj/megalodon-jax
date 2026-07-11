@@ -124,6 +124,47 @@ class TestAttentionPrimitives:
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
 
+    def test_post_softmax_and_dropkey_semantics(self) -> None:
+        """The two released attention-dropout placements remain explicit."""
+        q = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
+        k = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
+        v = jnp.arange(1, 5, dtype=jnp.float32).reshape(1, 4, 1, 1)
+        key = jax.random.PRNGKey(7)
+        keep = np.asarray(jax.random.bernoulli(key, 0.5, (1, 1, 1, 4)))[0, 0, 0]
+
+        post = attention_single_chunk(
+            q,
+            k,
+            v,
+            causal=False,
+            dropout_rate=0.5,
+            dropout_mode="post_softmax",
+            deterministic=False,
+            key=key,
+        )
+        dropkey = attention_single_chunk(
+            q,
+            k,
+            v,
+            causal=False,
+            dropout_rate=0.5,
+            dropout_mode="dropkey",
+            deterministic=False,
+            key=key,
+        )
+
+        values = np.arange(1, 5, dtype=np.float32)
+        expected_post = np.sum(values * keep * 0.5)
+        expected_dropkey = np.mean(values[keep]) if np.any(keep) else 0.0
+        np.testing.assert_allclose(np.asarray(post).item(), expected_post, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(dropkey).item(), expected_dropkey, atol=1e-6)
+
+    def test_attention_dropout_rejects_one(self) -> None:
+        """Degenerate p=1 cannot reach either softmax path."""
+        q = jnp.ones((1, 1, 1, 2), dtype=jnp.float32)
+        with pytest.raises(ValueError, match=r"\[0, 1\)"):
+            attention_single_chunk(q, q, q, dropout_rate=1.0)
+
     def test_single_chunk_query_key_mask_blocks_cross_segment(self) -> None:
         """qk_mask should block cross-segment attention links."""
         q = jnp.ones((1, 4, 1, 2), dtype=jnp.float32)

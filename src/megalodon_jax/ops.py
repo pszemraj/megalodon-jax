@@ -20,24 +20,11 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float
 
 
-def _assert_gemm_backend(gemm_backend: str) -> None:
-    """Ensure the GEMM backend is supported.
-
-    :param str gemm_backend: GEMM backend selector.
-    :return None: None.
-    """
-    if gemm_backend != "default":
-        raise NotImplementedError(
-            f"gemm_backend='{gemm_backend}' not implemented; only 'default' is supported."
-        )
-
-
 def linear_3d(
     linear: eqx.nn.Linear,
     x: Float[Array, "batch seq in_dim"],
     compute_dtype: jnp.dtype,
     accum_dtype: jnp.dtype,
-    gemm_backend: str,
 ) -> Float[Array, "batch seq out_dim"]:
     """Apply an Equinox Linear over a (batch, seq, dim) tensor.
 
@@ -45,10 +32,8 @@ def linear_3d(
     :param jax.Array x: Input tensor of shape (batch, seq, in_dim).
     :param jnp.dtype compute_dtype: Compute dtype for matmul and output.
     :param jnp.dtype accum_dtype: Accumulation dtype for GEMM.
-    :param str gemm_backend: GEMM backend selector.
     :return jax.Array: Output tensor of shape (batch, seq, out_dim).
     """
-    _assert_gemm_backend(gemm_backend)
     x_c = x.astype(compute_dtype)
     w_c = linear.weight.astype(compute_dtype)
     y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
@@ -63,7 +48,7 @@ def matmul_3d_weight(
     weight: Float[Array, "out_dim in_dim"],
     compute_dtype: jnp.dtype,
     accum_dtype: jnp.dtype,
-    gemm_backend: str,
+    output_dtype: jnp.dtype | None = None,
 ) -> Float[Array, "batch seq out_dim"]:
     """Apply a weight matrix to a (batch, seq, dim) tensor with compute policy.
 
@@ -71,12 +56,10 @@ def matmul_3d_weight(
     :param Float[Array, "out_dim in_dim"] weight: Weight matrix (out_dim, in_dim).
     :param jnp.dtype compute_dtype: Compute dtype for matmul and output.
     :param jnp.dtype accum_dtype: Accumulation dtype for GEMM.
-    :param str gemm_backend: GEMM backend selector.
+    :param jnp.dtype | None output_dtype: Output dtype; defaults to compute_dtype.
     :return Float[Array, "batch seq out_dim"]: Output tensor.
     """
-    _assert_gemm_backend(gemm_backend)
     x_c = x.astype(compute_dtype)
     w_c = weight.astype(compute_dtype)
     y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
-    # Downcast from accum_dtype (e.g., fp32) to compute_dtype (e.g., bf16).
-    return y.astype(compute_dtype)
+    return y.astype(compute_dtype if output_dtype is None else output_dtype)

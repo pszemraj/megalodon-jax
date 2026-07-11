@@ -36,8 +36,8 @@ class TestMegalodonConfig:
         assert cfg.param_dtype == jnp.float32
         assert cfg.compute_dtype == jnp.float32
         assert cfg.accum_dtype == jnp.float32
-        assert cfg.softmax_dtype == jnp.float32
-        assert cfg.gemm_backend == "default"
+        assert cfg.attention_softmax_dtype == jnp.float32
+        assert cfg.loss_softmax_dtype == jnp.float32
         assert cfg.init_mode == "he"
         assert cfg.share_emb is False
 
@@ -146,23 +146,27 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match="float16"):
             MegalodonConfig(accum_dtype=jnp.float16)
         with pytest.raises(ValueError, match="float16"):
-            MegalodonConfig(softmax_dtype=jnp.float16)
-
-    def test_gemm_backend_validation(self) -> None:
-        """Test gemm_backend validation.
-
-        :return None: None.
-        """
-        with pytest.raises(ValueError, match="gemm_backend"):
-            MegalodonConfig(gemm_backend="unsupported")  # type: ignore[arg-type]
+            MegalodonConfig(attention_softmax_dtype=jnp.float16)
+        with pytest.raises(ValueError, match="float16"):
+            MegalodonConfig(loss_softmax_dtype=jnp.float16)
+        with pytest.raises(ValueError, match="param_dtype must be float32"):
+            MegalodonConfig(param_dtype=jnp.bfloat16)
 
     def test_accum_dtype_precision_validation(self) -> None:
         """Test accum_dtype must be at least as wide as compute_dtype.
 
         :return None: None.
         """
-        with pytest.raises(ValueError, match="accum_dtype should be >= compute_dtype"):
+        with pytest.raises(ValueError, match="accum_dtype must be float32"):
             MegalodonConfig(compute_dtype=jnp.float32, accum_dtype=jnp.bfloat16)
+
+    def test_dropout_and_fresh_init_validation(self) -> None:
+        """Degenerate dropout and loader-only initialization are rejected."""
+        for field in ("dropout", "attention_dropout", "hidden_dropout"):
+            with pytest.raises(ValueError, match=r"\[0, 1\)"):
+                MegalodonConfig(**{field: 1.0})
+        with pytest.raises(ValueError, match="fresh-model init_mode"):
+            MegalodonConfig(init_mode="none")  # type: ignore[arg-type]
 
     def test_config_is_frozen(self) -> None:
         """Test that config is immutable.

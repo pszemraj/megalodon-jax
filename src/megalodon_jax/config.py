@@ -18,8 +18,8 @@ from typing import Literal
 
 import jax.numpy as jnp
 
-InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
-GemmBackend = Literal["default"]
+InitMode = Literal["gaussian", "xavier", "he", "bert"]
+AttentionDropoutMode = Literal["post_softmax", "dropkey"]
 
 
 @dataclass(frozen=True)
@@ -54,11 +54,11 @@ class MegalodonConfig:
     norm_affine: bool = True
     dropout: float = 0.0
     attention_dropout: float = 0.0
+    attention_dropout_mode: AttentionDropoutMode = "post_softmax"
     hidden_dropout: float = 0.0
-    pad_token_id: int = 0
+    pad_token_id: int | None = None
     bos_token_id: int = 1
     eos_token_id: int = 2
-    max_positions: int = 1_000_000
     init_mode: InitMode = "he"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
     # Segmented CEMA path for packed sequences: parallel associative scan
@@ -69,8 +69,8 @@ class MegalodonConfig:
     param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
     compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations
     accum_dtype: jnp.dtype = jnp.float32  # Accumulation dtype for GEMM/reductions
-    softmax_dtype: jnp.dtype = jnp.float32  # Softmax/log-softmax dtype
-    gemm_backend: GemmBackend = "default"
+    attention_softmax_dtype: jnp.dtype = jnp.float32
+    loss_softmax_dtype: jnp.dtype = jnp.float32
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
@@ -95,12 +95,23 @@ class MegalodonConfig:
             )
         if self.norm_eps <= 0:
             raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
-        if not 0.0 <= self.dropout <= 1.0:
-            raise ValueError(f"dropout must be in [0, 1], got {self.dropout}")
-        if not 0.0 <= self.attention_dropout <= 1.0:
-            raise ValueError(f"attention_dropout must be in [0, 1], got {self.attention_dropout}")
-        if not 0.0 <= self.hidden_dropout <= 1.0:
-            raise ValueError(f"hidden_dropout must be in [0, 1], got {self.hidden_dropout}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if not 0.0 <= self.attention_dropout < 1.0:
+            raise ValueError(f"attention_dropout must be in [0, 1), got {self.attention_dropout}")
+        if not 0.0 <= self.hidden_dropout < 1.0:
+            raise ValueError(f"hidden_dropout must be in [0, 1), got {self.hidden_dropout}")
+        if self.attention_dropout_mode not in ("post_softmax", "dropkey"):
+            raise ValueError(
+                "attention_dropout_mode must be 'post_softmax' or 'dropkey', got "
+                f"{self.attention_dropout_mode!r}"
+            )
+        if self.init_mode not in ("gaussian", "xavier", "he", "bert"):
+            raise ValueError(f"unsupported fresh-model init_mode: {self.init_mode!r}")
+        if self.pad_token_id is not None and not 0 <= self.pad_token_id < self.vocab_size:
+            raise ValueError(
+                f"pad_token_id must be in [0, {self.vocab_size}) or None, got {self.pad_token_id}"
+            )
         if self.max_cache_len is not None and self.max_cache_len <= 0:
             raise ValueError("max_cache_len must be positive when provided.")
         if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
@@ -109,19 +120,25 @@ class MegalodonConfig:
             ("param_dtype", self.param_dtype),
             ("compute_dtype", self.compute_dtype),
             ("accum_dtype", self.accum_dtype),
-            ("softmax_dtype", self.softmax_dtype),
+            ("attention_softmax_dtype", self.attention_softmax_dtype),
+            ("loss_softmax_dtype", self.loss_softmax_dtype),
         ):
             if not jnp.issubdtype(dtype, jnp.floating):
                 raise ValueError(f"{name} must be a floating dtype, got {dtype}")
             if dtype == jnp.float16:
                 raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
-        if self.gemm_backend != "default":
-            raise ValueError(
-                f"gemm_backend must be 'default' until other backends are implemented, got "
-                f"{self.gemm_backend}"
-            )
-        if jnp.finfo(self.accum_dtype).bits < jnp.finfo(self.compute_dtype).bits:
-            raise ValueError("accum_dtype should be >= compute_dtype for stable accumulation.")
+        if self.param_dtype != jnp.float32:
+            raise ValueError("param_dtype must be float32")
+        if self.compute_dtype not in (jnp.float32, jnp.bfloat16):
+            raise ValueError("compute_dtype must be float32 or bfloat16")
+        if self.accum_dtype != jnp.float32:
+            raise ValueError("accum_dtype must be float32")
+        for name, dtype in (
+            ("attention_softmax_dtype", self.attention_softmax_dtype),
+            ("loss_softmax_dtype", self.loss_softmax_dtype),
+        ):
+            if dtype not in (jnp.float32, jnp.bfloat16):
+                raise ValueError(f"{name} must be float32 or bfloat16")
 
     @property
     def head_dim(self) -> int:

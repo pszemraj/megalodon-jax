@@ -1015,12 +1015,41 @@ class TestFixDropoutKeyGuard:
         with pytest.raises(ValueError, match="PRNG key required"):
             model(input_ids, deterministic=False, key=None)
 
+    def test_embedding_dropout_uses_independent_deterministic_key(self, random_seed: int) -> None:
+        """Embedding dropout is active before a zero-layer model's final norm."""
+        config = MegalodonConfig(
+            vocab_size=128,
+            model_dim=64,
+            num_layers=0,
+            num_heads=2,
+            z_dim=32,
+            value_dim=64,
+            ffn_hidden_dim=128,
+            cema_ndim=4,
+            chunk_size=16,
+            norm_num_groups=8,
+            dropout=0.5,
+        )
+        model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
+        key_a = jax.random.PRNGKey(100)
+        key_b = jax.random.PRNGKey(101)
 
-class TestFix2PadTokenMasking:
-    """Tests for pad token masking (Fix 2)."""
+        train_a, _ = model(input_ids, deterministic=False, key=key_a)
+        train_a_repeat, _ = model(input_ids, deterministic=False, key=key_a)
+        train_b, _ = model(input_ids, deterministic=False, key=key_b)
+        inference, _ = model(input_ids, deterministic=True)
 
-    def test_pad_token_embeddings_are_zeroed(self, random_seed: int) -> None:
-        """Test that pad tokens produce zero embeddings.
+        np.testing.assert_array_equal(np.asarray(train_a), np.asarray(train_a_repeat))
+        assert not np.array_equal(np.asarray(train_a), np.asarray(train_b))
+        assert not np.array_equal(np.asarray(train_a), np.asarray(inference))
+
+
+class TestPaddingContract:
+    """Tests for explicit mask-driven padding semantics."""
+
+    def test_pad_id_is_metadata_not_an_embedding_rule(self, random_seed: int) -> None:
+        """A token id remains learnable and valid unless an explicit mask excludes it.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1042,31 +1071,20 @@ class TestFix2PadTokenMasking:
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
 
-        # Create input with pad tokens at positions 1, 3
-        input_ids = jnp.array([[5, 0, 10, 0, 15]])  # 0 is pad token
+        input_ids = jnp.array([[0, 5]], dtype=jnp.int32)
+        valid_output, _ = model(input_ids, attention_mask=jnp.array([[True, True]]))
+        masked_output, _ = model(input_ids, attention_mask=jnp.array([[False, True]]))
 
-        # Get embeddings after scaling but before layers process them
-        # We check embedding lookup directly
-        embed = jax.vmap(jax.vmap(model.embed))(input_ids) * model.scale
+        assert np.any(np.asarray(valid_output[0, 0]) != 0.0)
+        np.testing.assert_array_equal(np.asarray(masked_output[0, 0]), np.zeros(64))
 
-        # Mask pad tokens the same way as in the model (dtype-matched zero)
-        pad_mask = input_ids == config.pad_token_id
-        masked_embed = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=embed.dtype), embed)
+        replacement = model.embed.weight.at[0].add(jnp.linspace(-1.0, 1.0, 64))
+        modified = eqx.tree_at(lambda current: current.embed.weight, model, replacement)
+        modified_output, _ = modified(input_ids, attention_mask=jnp.array([[True, True]]))
+        assert not np.allclose(np.asarray(valid_output), np.asarray(modified_output))
 
-        # Positions 1 and 3 (pad tokens) should have all-zero embeddings
-        np.testing.assert_array_equal(
-            np.array(masked_embed[0, 1]),
-            np.zeros(config.model_dim),
-            err_msg="Pad token at position 1 should have zero embedding",
-        )
-        np.testing.assert_array_equal(
-            np.array(masked_embed[0, 3]),
-            np.zeros(config.model_dim),
-            err_msg="Pad token at position 3 should have zero embedding",
-        )
-
-    def test_pad_masking_preserves_bf16_dtype(self, random_seed: int) -> None:
-        """Test that pad token masking preserves bf16 dtype (no upcast to float32).
+    def test_explicit_masking_preserves_bf16_dtype(self, random_seed: int) -> None:
+        """Explicit masking does not upcast bf16 activations.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1093,11 +1111,13 @@ class TestFix2PadTokenMasking:
         input_ids = jnp.array([[5, 0, 10, 0, 15]])
 
         # Forward pass should preserve bf16 dtype
-        hidden, _ = model(input_ids, return_cache=False)
-
-        assert hidden.dtype == jnp.bfloat16, (
-            f"Expected bf16 output, got {hidden.dtype}. Pad masking may be upcasting to float32."
+        hidden, _ = model(
+            input_ids,
+            attention_mask=jnp.array([[True, False, True, False, True]]),
+            return_cache=False,
         )
+
+        assert hidden.dtype == jnp.bfloat16, f"Expected bf16 output, got {hidden.dtype}."
 
 
 class TestFix3UntiedLMHead:
@@ -1296,31 +1316,15 @@ class TestFix6InitMode:
         expected_std = 1.0 / np.sqrt(3.0 * weight.shape[-1])
         np.testing.assert_allclose(weight.std(), expected_std, rtol=0.12)
 
-    def test_none_init_keeps_defaults(self, random_seed: int) -> None:
-        """Test that init_mode='none' doesn't reinitialize weights.
+    def test_none_init_is_loader_only(self, random_seed: int) -> None:
+        """Fresh construction cannot expose an uninitialized mode.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            init_mode="none",
-        )
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        # Weights should exist
-        assert model.model.embed.weight is not None
+        del random_seed
+        with pytest.raises(ValueError, match="fresh-model init_mode"):
+            replace(small_config(), init_mode="none")  # type: ignore[arg-type]
 
     def test_internal_modes_do_not_change_embedding_policy(self, random_seed: int) -> None:
         """Internal modes change projections but never boundary tensors.
@@ -1858,12 +1862,15 @@ class TestEdgeCases:
         # Empty batch (B=0)
         empty_batch = jnp.zeros((0, 16), dtype=jnp.int32)
         logits_b0, _ = model(empty_batch, return_cache=False)
-        assert logits_b0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_b0.dtype}"
+        assert logits_b0.dtype == jnp.float32, f"Expected float32, got {logits_b0.dtype}"
 
         # Empty sequence (L=0)
         empty_seq = jnp.zeros((2, 0), dtype=jnp.int32)
         logits_l0, _ = model(empty_seq, return_cache=False)
-        assert logits_l0.dtype == jnp.bfloat16, f"Expected bfloat16, got {logits_l0.dtype}"
+        assert logits_l0.dtype == jnp.float32, f"Expected float32, got {logits_l0.dtype}"
+
+        logits, _ = model(jnp.asarray([[1, 2]], dtype=jnp.int32))
+        assert logits.dtype == jnp.float32
 
     def test_vocab_bounds_input_ids_raises(self, random_seed: int) -> None:
         """Test that out-of-bounds input_ids raises an error.
@@ -1951,8 +1958,8 @@ class TestEdgeCases:
         loss = model.compute_loss(input_ids, labels)
 
         # Loss should stay fp32 for numerical stability
-        assert loss.dtype == config.softmax_dtype, (
-            f"Expected {config.softmax_dtype}, got {loss.dtype}"
+        assert loss.dtype == config.loss_softmax_dtype, (
+            f"Expected {config.loss_softmax_dtype}, got {loss.dtype}"
         )
         assert loss == 0.0
 
@@ -2033,7 +2040,7 @@ class TestEdgeCases:
             chunk_size=16,
             norm_num_groups=8,
             compute_dtype=jnp.bfloat16,
-            softmax_dtype=jnp.bfloat16,
+            loss_softmax_dtype=jnp.bfloat16,
         )
 
         key = jax.random.PRNGKey(random_seed)

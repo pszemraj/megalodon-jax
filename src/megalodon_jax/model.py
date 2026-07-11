@@ -136,11 +136,12 @@ class MegalodonBlock(eqx.Module):
             cache_unbounded=config.cache_unbounded,
             dropout=config.dropout,
             attention_dropout=config.attention_dropout,
+            attention_dropout_mode=config.attention_dropout_mode,
             hidden_dropout=config.hidden_dropout,
             param_dtype=config.param_dtype,
             compute_dtype=config.compute_dtype,
             accum_dtype=config.accum_dtype,
-            gemm_backend=config.gemm_backend,
+            attention_softmax_dtype=config.attention_softmax_dtype,
             use_associative_segment_scan=config.use_associative_segment_scan,
             key=k1,
         )
@@ -158,7 +159,6 @@ class MegalodonBlock(eqx.Module):
             param_dtype=config.param_dtype,
             compute_dtype=config.compute_dtype,
             accum_dtype=config.accum_dtype,
-            gemm_backend=config.gemm_backend,
             key=k2,
         )
 
@@ -348,6 +348,10 @@ class MegalodonModel(eqx.Module):
                     "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
                 )
         B, L = input_ids.shape
+        if key is not None:
+            embedding_key, layers_key = jax.random.split(key)
+        else:
+            embedding_key = layers_key = None
 
         # Handle empty inputs gracefully (B=0 or L=0)
         # Use compute dtype to match model's output dtype.
@@ -383,14 +387,17 @@ class MegalodonModel(eqx.Module):
         if self.scale != 1.0:
             x = x * jnp.asarray(self.scale, dtype=x.dtype)
 
-        # Zero-mask pad tokens (matches PyTorch padding_idx behavior)
-        # This ensures pad tokens have zero embeddings and receive no gradient updates
-        # Use dtype-matched zero to avoid upcasting bf16 to float32
-        pad_mask = input_ids == self.config.pad_token_id
-        x = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=x.dtype), x)
-
         if x.dtype != self.config.compute_dtype:
             x = x.astype(self.config.compute_dtype)
+        if not deterministic and self.config.dropout > 0.0:
+            assert embedding_key is not None
+            keep = jax.random.bernoulli(
+                embedding_key,
+                1.0 - self.config.dropout,
+                x.shape,
+            )
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.config.dropout), dtype=x.dtype)
+            x = jnp.where(keep, x * inv_keep, jnp.zeros((), dtype=x.dtype))
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
@@ -436,8 +443,8 @@ class MegalodonModel(eqx.Module):
             final_norm_state = None
 
         # Split keys for layers
-        if key is not None:
-            keys = list(jax.random.split(key, len(self.layers)))
+        if layers_key is not None:
+            keys = list(jax.random.split(layers_key, len(self.layers)))
         else:
             keys = [None] * len(self.layers)
 
@@ -600,7 +607,6 @@ class MegalodonForCausalLM(eqx.Module):
 
         compute_dtype = self.config.compute_dtype
         accum_dtype = self.config.accum_dtype
-        gemm_backend = self.config.gemm_backend
         if self.tied:
             # Weight-tied projection
             logits = matmul_3d_weight(
@@ -608,7 +614,7 @@ class MegalodonForCausalLM(eqx.Module):
                 self.model.embed.weight,
                 compute_dtype,
                 accum_dtype,
-                gemm_backend,
+                output_dtype=jnp.float32,
             )
         else:
             # Separate LM head
@@ -617,7 +623,7 @@ class MegalodonForCausalLM(eqx.Module):
                 self.lm_head.weight,
                 compute_dtype,
                 accum_dtype,
-                gemm_backend,
+                output_dtype=jnp.float32,
             )
 
         return logits, cache
@@ -688,7 +694,7 @@ class MegalodonForCausalLM(eqx.Module):
 
         # Guard against empty sequences (seq=0 or seq=1 after shift)
         # jnp.mean() on empty array returns NaN, which would poison training
-        softmax_dtype = self.config.softmax_dtype
+        softmax_dtype = self.config.loss_softmax_dtype
         if shift_labels.shape[1] == 0:
             return jnp.zeros((), dtype=softmax_dtype)
 
