@@ -329,7 +329,12 @@ class TestMegalodonForCausalLM:
         hidden, _ = model.model(input_ids, return_cache=False)
 
         # Compute logits manually using weight tying
-        manual_logits = hidden @ model.model.embed.weight.T
+        manual_logits = jnp.matmul(
+            hidden,
+            model.model.embed.weight.T,
+            precision=jax.lax.Precision.HIGHEST,
+            preferred_element_type=jnp.float32,
+        )
 
         np.testing.assert_allclose(
             np.array(logits),
