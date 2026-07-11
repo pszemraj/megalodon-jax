@@ -1244,13 +1244,10 @@ class TestJITCompilation:
 class TestStreamingEquivalence:
     """Tests for streaming (token-by-token) equivalence with batch processing."""
 
-    def test_chunked_attention_streaming_equivalence(
-        self, random_seed: int, force_fp32_matmul: None
-    ) -> None:
+    def test_chunked_attention_streaming_equivalence(self, random_seed: int) -> None:
         """Verify streaming with cache matches batch processing within a chunk.
 
         :param int random_seed: Random seed fixture.
-        :param None force_fp32_matmul: Fixture enabling fp32 matmul precision.
         :return None: None.
         """
         batch, heads, head_dim, value_dim = 1, 2, 16, 16

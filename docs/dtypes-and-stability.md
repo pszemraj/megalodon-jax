@@ -45,6 +45,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 - TimestepNorm state, running moments, RMSNorm statistics, and LayerNorm statistics are FP32.
 - CEMA coefficients and state are FP32/complex64.
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
+- FP32 matrix contractions request JAX's per-operation `HIGHEST` precision, so NVIDIA GPUs do not silently substitute TensorFloat-32 products. BF16 contractions retain BF16 inputs with FP32 accumulation.
 - KV cache tensors follow `compute_dtype`; norm state remains FP32 and EMA state remains complex64.
 - Returned logits are always FP32, matching the original released model.
 - Parameter gradients have the FP32 storage dtype even under BF16 compute.

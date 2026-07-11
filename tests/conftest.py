@@ -86,28 +86,8 @@ def clear_gpu_caches() -> Iterator[None]:
 
 
 @pytest.fixture
-def force_fp32_matmul() -> Iterator[None]:
-    """Force float32 matmuls for precision-sensitive parity tests.
-
-    GPU matmuls use TensorFloat-32 by default on Ampere+ GPUs, which truncates
-    mantissa from 23 to 10 bits. This causes ~1e-3 differences vs fp32.
-    Use this fixture when exact parity with PyTorch CPU is required.
-
-    :return Iterator[None]: Context that forces float32 matmul precision.
-    """
-    import jax
-
-    original = jax.config.jax_default_matmul_precision
-    jax.config.update("jax_default_matmul_precision", "float32")
-    yield
-    jax.config.update("jax_default_matmul_precision", original)
-
-
-@pytest.fixture
 def torch_device() -> torch.device:
-    """Get the appropriate torch device and ensure TF32 settings match JAX.
-
-    Both PyTorch and JAX should use the same precision mode (TF32 on GPU).
+    """Get the appropriate torch device and require full FP32 matmuls.
 
     :return torch.device: Selected torch device for the session.
     """
@@ -115,9 +95,8 @@ def torch_device() -> torch.device:
         pytest.skip("torch is not installed")
     if _TORCH_CUDA_AVAILABLE:
         device = torch.device("cuda")
-        # Enable TF32 to match JAX's default behavior
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     else:
         device = torch.device("cpu")
     return device

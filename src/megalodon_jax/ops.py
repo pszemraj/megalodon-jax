@@ -16,8 +16,13 @@
 from __future__ import annotations
 
 import equinox as eqx
+import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
+
+# FP32 means full IEEE-style float32 products in this project, not TensorFloat-32.
+# Passing this per operation avoids mutating JAX's process-global precision config.
+DOT_PRECISION = jax.lax.Precision.HIGHEST
 
 
 def linear_3d(
@@ -36,7 +41,12 @@ def linear_3d(
     """
     x_c = x.astype(compute_dtype)
     w_c = linear.weight.astype(compute_dtype)
-    y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
+    y = jnp.matmul(
+        x_c,
+        w_c.T,
+        precision=DOT_PRECISION,
+        preferred_element_type=accum_dtype,
+    )
     if linear.bias is not None:
         y = y + linear.bias.astype(compute_dtype)
     # Downcast from accum_dtype (e.g., fp32) to compute_dtype (e.g., bf16).
@@ -61,5 +71,10 @@ def matmul_3d_weight(
     """
     x_c = x.astype(compute_dtype)
     w_c = weight.astype(compute_dtype)
-    y = jnp.matmul(x_c, w_c.T, preferred_element_type=accum_dtype)
+    y = jnp.matmul(
+        x_c,
+        w_c.T,
+        precision=DOT_PRECISION,
+        preferred_element_type=accum_dtype,
+    )
     return y.astype(compute_dtype if output_dtype is None else output_dtype)
