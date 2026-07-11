@@ -49,7 +49,6 @@ convert = [
 ]
 dev = [
   "pytest>=7.0",
-  "megalodon-hf @ git+https://github.com/pszemraj/megalodon-hf.git@f85a47849d07d52982a2e6e4cf0297c2621e9916",
   "torch>=2.6",
   "ruff>=0.5",
 ]
@@ -70,7 +69,7 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "cuda: tests that require a CUDA-capable device",
-  "torch_ref: PyTorch reference tests (not run by default)",
+  "torch_ref: independent PyTorch checks derived from the exact local released source",
 ]
 
 [tool.ruff]

@@ -29,7 +29,7 @@ import platform
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -260,6 +260,240 @@ def adjacent_pair_rope(x: np.ndarray, positions: np.ndarray, base: float) -> np.
     imag = pairs[..., 1]
     out = np.stack([real * cos - imag * sin, imag * cos + real * sin], axis=-1)
     return out.reshape(x.shape).astype(x.dtype)
+
+
+TorchStateDict = Mapping[str, Any]
+
+
+def trainable_upstream_keys(state: TorchStateDict) -> tuple[str, ...]:
+    """Return released-source parameters, excluding zero-prior and RoPE buffers."""
+    buffers = (".prior_count", ".prior_mean", ".prior_logv")
+    return tuple(
+        name
+        for name, value in state.items()
+        if value.is_floating_point() and name != "rope.freqs" and not name.endswith(buffers)
+    )
+
+
+def differentiable_state(state: TorchStateDict) -> dict[str, Any]:
+    """Clone a Torch checkpoint state with autograd enabled only for source parameters."""
+    trainable = set(trainable_upstream_keys(state))
+    return {
+        name: value.detach().clone().requires_grad_(name in trainable)
+        for name, value in state.items()
+    }
+
+
+def _torch_linear(x: Any, state: TorchStateDict, prefix: str) -> Any:
+    """Apply a released ``(out_features, in_features)`` projection."""
+    import torch.nn.functional as functional
+
+    return functional.linear(x, state[f"{prefix}.weight"], state.get(f"{prefix}.bias"))
+
+
+def _torch_timestep_norm(
+    x: Any,
+    state: TorchStateDict,
+    prefix: str,
+    groups: int,
+    eps: float,
+) -> Any:
+    """Evaluate group TimestepNorm with population block-Welford updates."""
+    import torch
+
+    batch, length, dim = x.shape
+    group_size = dim // groups
+    grouped = x.float().reshape(batch, length, groups, group_size)
+    mean = torch.zeros((batch, groups), dtype=torch.float32, device=x.device)
+    variance = torch.ones_like(mean)
+    outputs = []
+
+    for index in range(length):
+        block = grouped[:, index]
+        block_mean = block.mean(dim=-1)
+        block_var = torch.square(block - block_mean.unsqueeze(-1)).mean(dim=-1)
+        count = float(index)
+        next_count = count + 1.0
+        delta = block_mean - mean
+        mean = mean + delta / next_count
+        variance = (
+            count * variance + block_var + torch.square(delta) * count / next_count
+        ) / next_count
+        normalized = (block - mean.unsqueeze(-1)) * torch.rsqrt(variance.unsqueeze(-1) + eps)
+        outputs.append(normalized.reshape(batch, dim))
+
+    y = torch.stack(outputs, dim=1).to(x.dtype)
+    scale = (state[f"{prefix}.weight"] + 1.0).to(y.dtype)
+    bias = state[f"{prefix}.bias"].to(y.dtype)
+    return y * scale + bias
+
+
+def _torch_rms_norm(x: Any, weight: Any | None, eps: float) -> Any:
+    """Evaluate the released RMSNorm fallback in fp32."""
+    import torch
+
+    normalized = x.float() * torch.rsqrt(torch.square(x.float()).mean(dim=-1, keepdim=True) + eps)
+    normalized = normalized.to(x.dtype)
+    return normalized if weight is None else normalized * (weight + 1.0).to(x.dtype)
+
+
+def _torch_layer_norm(x: Any, weight: Any | None, bias: Any | None, eps: float) -> Any:
+    """Evaluate released plus-one LayerNorm storage semantics."""
+    import torch.nn.functional as functional
+
+    effective_weight = None if weight is None else weight + 1.0
+    return functional.layer_norm(x, (x.shape[-1],), effective_weight, bias, eps)
+
+
+def _torch_cema(x: Any, state: TorchStateDict, prefix: str, ndim: int) -> Any:
+    """Evaluate the exact source-compatible CEMA recurrence and residual."""
+    import torch
+
+    alpha = torch.sigmoid(state[f"{prefix}.alpha"].float()).squeeze(-1)
+    delta = torch.sigmoid(state[f"{prefix}.delta"].float()).squeeze(-1)
+    theta = torch.sigmoid(state[f"{prefix}.theta"].float()) * (2.0 * math.pi / ndim)
+    wavelets = torch.arange(1, ndim + 1, dtype=torch.float32, device=x.device).reshape(1, ndim)
+    phase = theta.squeeze(-1) * wavelets
+    q = torch.polar(1.0 - alpha * delta, phase)
+    gamma_parts = state[f"{prefix}.gamma"].float()
+    gamma = torch.view_as_complex(gamma_parts.contiguous()) / math.sqrt(ndim)
+
+    batch, dim, length = x.shape
+    hidden = torch.zeros((batch, dim, ndim), dtype=torch.complex64, device=x.device)
+    outputs = []
+    for index in range(length):
+        hidden = q.unsqueeze(0) * hidden + alpha.unsqueeze(0) * x[:, :, index, None].float()
+        outputs.append((hidden * gamma.unsqueeze(0)).real.sum(dim=-1))
+    recurrent = torch.stack(outputs, dim=-1)
+    omega = state[f"{prefix}.omega"].float().squeeze(-1)
+    return (recurrent + x.float() * omega[None, :, None]).to(x.dtype)
+
+
+def _torch_rope(q: Any, k: Any, frequencies: Any) -> tuple[Any, Any]:
+    """Apply the released adjacent-pair ``view_as_complex`` RoPE convention."""
+    import torch
+
+    length = q.shape[1]
+    positions = torch.arange(length, dtype=torch.float32, device=q.device)
+    angles = torch.outer(positions, frequencies.float())
+    rotation = torch.polar(torch.ones_like(angles), angles).unsqueeze(1)
+
+    def rotate(x: Any) -> Any:
+        complex_x = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
+        return torch.view_as_real(complex_x * rotation).flatten(-2).to(x.dtype)
+
+    return rotate(q), rotate(k)
+
+
+def _torch_attention(
+    q: Any,
+    k: Any,
+    v: Any,
+    frequencies: Any,
+    num_heads: int,
+) -> Any:
+    """Evaluate source attention with no Transformer ``1/sqrt(d)`` scale."""
+    import torch
+
+    batch, length, z_dim = q.shape
+    value_dim = v.shape[-1]
+    q = q.reshape(batch, length, num_heads, z_dim // num_heads)
+    k = k.reshape_as(q)
+    v = v.reshape(batch, length, num_heads, value_dim // num_heads)
+    q, k = _torch_rope(q, k, frequencies)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    scores = torch.matmul(q, k.transpose(-2, -1))
+    causal = torch.triu(
+        torch.full((length, length), float("-inf"), dtype=scores.dtype, device=scores.device),
+        diagonal=1,
+    )
+    probabilities = torch.softmax(scores + causal, dim=-1, dtype=torch.float32).to(q.dtype)
+    return torch.matmul(probabilities, v).transpose(1, 2).reshape(batch, length, value_dim)
+
+
+def source_forward(tokens: Any, state: TorchStateDict, config: Any) -> Any:
+    """Run a tiny differentiable forward pass from the exact released equations.
+
+    Dropout must be disabled and the sequence must fit within one attention chunk.
+    These constraints avoid fused kernels while retaining every modeling equation
+    and trainable tensor used by the released architecture.
+    """
+    import torch.nn.functional as functional
+
+    if tokens.ndim != 2:
+        raise ValueError(f"tokens must have shape (batch, length), got {tuple(tokens.shape)}")
+    if tokens.shape[1] > config.chunk_size:
+        raise ValueError("source oracle supports at most one attention chunk")
+    if any((config.dropout, config.attention_dropout, config.hidden_dropout)):
+        raise ValueError("source oracle requires dropout probabilities to be zero")
+    if config.attention_window is not None:
+        raise ValueError("source oracle covers released chunk-local attention only")
+
+    x = functional.embedding(tokens, state["embed.weight"])
+    if config.scale_emb:
+        x = x * math.sqrt(config.model_dim)
+
+    for layer_index in range(config.num_layers):
+        residual_base = x
+        attention_prefix = f"layers.{layer_index}.mega"
+        normalized = _torch_timestep_norm(
+            x,
+            state,
+            f"{attention_prefix}.timenorm",
+            config.norm_num_groups,
+            config.norm_eps,
+        )
+        cema = _torch_cema(
+            normalized.transpose(1, 2),
+            state,
+            f"{attention_prefix}.cema",
+            config.cema_ndim,
+        ).transpose(1, 2)
+        rms_weight = state.get(f"{attention_prefix}.rmsnorm.weight")
+        memory = _torch_rms_norm(cema, rms_weight, config.norm_eps)
+
+        z = _torch_linear(memory, state, f"{attention_prefix}.wz")
+        z = z.reshape(*z.shape[:-1], config.num_heads, config.head_dim)
+        z = _torch_rms_norm(z, None, config.norm_eps).reshape(*z.shape[:-2], config.z_dim)
+        scale = (state[f"{attention_prefix}.gamma"] + 1.0) / math.sqrt(config.head_dim)
+        z = z.unsqueeze(2) * scale + state[f"{attention_prefix}.beta"]
+        q, k = z.unbind(dim=2)
+
+        v = functional.silu(_torch_linear(normalized, state, f"{attention_prefix}.wv"))
+        reset = functional.silu(_torch_linear(memory, state, f"{attention_prefix}.wr"))
+        attended = _torch_attention(q, k, v, state["rope.freqs"], config.num_heads)
+        attention_output = _torch_linear(memory, state, f"{attention_prefix}.wh1") + _torch_linear(
+            attended * reset, state, f"{attention_prefix}.wh2"
+        )
+        after_attention = residual_base + attention_output
+
+        ffn_prefix = f"layers.{layer_index}.nffn"
+        ffn_input = _torch_layer_norm(
+            after_attention,
+            state.get(f"{ffn_prefix}.norm.weight"),
+            state.get(f"{ffn_prefix}.norm.bias"),
+            config.norm_eps,
+        )
+        hidden = functional.silu(_torch_linear(ffn_input, state, f"{ffn_prefix}.fc1"))
+        if config.swiglu:
+            hidden = hidden * _torch_linear(ffn_input, state, f"{ffn_prefix}.fc3")
+        ffn_output = _torch_linear(hidden, state, f"{ffn_prefix}.fc2")
+        alpha = state.get(f"{ffn_prefix}.alpha")
+        if alpha is not None:
+            ffn_output = ffn_output * alpha
+        x = residual_base + ffn_output
+
+    x = _torch_timestep_norm(
+        x,
+        state,
+        "output.final_norm",
+        config.norm_num_groups,
+        config.norm_eps,
+    )
+    output_weight = state["embed.weight"] if config.share_emb else state["output.output.weight"]
+    return functional.linear(x, output_weight).float()
 
 
 def source_parameter_count(
@@ -874,6 +1108,44 @@ def main() -> int:
 
     audit.run("upstream_initialization_contract", "INFO", check_upstream_init_contract)
 
+    def check_torch_oracle_source_contract() -> tuple[bool, str, dict[str, Any]]:
+        attention_path = upstream / "megalodon" / "modules" / "moving_average_gated_attention.py"
+        cema_path = upstream / "megalodon" / "modules" / "complex_exponential_moving_average.py"
+        ffn_path = upstream / "megalodon" / "modules" / "normalized_feedforward_network.py"
+        rope_path = upstream / "megalodon" / "modules" / "rotary_positional_embedding.py"
+        attention = _read_required(attention_path)
+        cema = _read_required(cema_path)
+        ffn = _read_required(ffn_path)
+        rope = _read_required(rope_path)
+        facts = {
+            "unscaled_attention_scores": "scores = torch.matmul(xq, xk.transpose(2, 3))"
+            in attention,
+            "fp32_attention_softmax": "F.softmax(scores, dim=-1, dtype=torch.float32)" in attention,
+            "attention_two_projection_sum": "self.wh1(mx) + self.wh2(attn)" in attention,
+            "attention_residual": "out = h + residual" in attention,
+            "cema_complex_polar": "q = torch.polar(1.0 - alpha * delta, theta)" in cema,
+            "swiglu_order": "F.silu(self.fc1(x)) * self.fc3(x)" in ffn,
+            "two_hop_ffn_residual": "self.rescale(x) + residual" in ffn,
+            "adjacent_pair_rope": "torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))"
+            in rope,
+        }
+        passed = all(facts.values())
+        return (
+            passed,
+            "Pure-Torch oracle is anchored to the exact released source equations",
+            {
+                **facts,
+                "source_sha256": {
+                    "attention": _sha256(attention_path),
+                    "cema": _sha256(cema_path),
+                    "ffn": _sha256(ffn_path),
+                    "rope": _sha256(rope_path),
+                },
+            },
+        )
+
+    audit.run("torch_oracle_source_contract", "INFO", check_torch_oracle_source_contract)
+
     def check_cuda_source_mask_contract() -> tuple[bool, str, dict[str, Any]]:
         source_path = upstream / "megalodon" / "csrc" / "ops" / "timestep_norm_kernel.cu"
         source = _read_required(source_path)
@@ -947,6 +1219,38 @@ def main() -> int:
 
     audit.run("dropout_upper_bound", "P1", check_dropout_bounds)
 
+    def check_fp16_rejection() -> tuple[bool, str, dict[str, Any]]:
+        rejected: dict[str, bool] = {}
+        for field in (
+            "param_dtype",
+            "compute_dtype",
+            "accum_dtype",
+            "attention_softmax_dtype",
+            "loss_softmax_dtype",
+        ):
+            try:
+                MegalodonConfig(**{field: jnp.float16})
+            except ValueError:
+                rejected[field] = True
+            else:
+                rejected[field] = False
+        try:
+            TimestepNorm(4, 2)(jnp.ones((1, 1, 4), dtype=jnp.float16))
+        except TypeError:
+            rejected["timestep_norm_input"] = True
+        else:
+            rejected["timestep_norm_input"] = False
+        passed = all(rejected.values())
+        return (
+            passed,
+            "FP16 is rejected; the supported numerical surface is FP32/BF16 only"
+            if passed
+            else "An FP16 configuration or state path remains reachable",
+            {"rejected": rejected, "supported": ["float32", "bfloat16"]},
+        )
+
+    audit.run("fp16_is_out_of_scope", "P1", check_fp16_rejection)
+
     def check_pad_embedding() -> tuple[bool, str, dict[str, Any]]:
         import inspect
 
@@ -977,6 +1281,41 @@ def main() -> int:
 
     if args.include_slow:
 
+        def tiny_reference_fixture() -> tuple[Any, Any, Any, np.ndarray]:
+            config = MegalodonConfig(
+                vocab_size=32,
+                model_dim=8,
+                num_layers=1,
+                num_heads=2,
+                z_dim=8,
+                value_dim=8,
+                ffn_hidden_dim=16,
+                cema_ndim=2,
+                chunk_size=4,
+                norm_num_groups=2,
+                swiglu=True,
+                rescale_nffn=True,
+                scale_emb=True,
+                share_emb=False,
+            )
+            model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(8675309))
+            token_values = np.asarray([[1, 7, 3, 11], [5, 2, 13, 17]], dtype=np.int32)
+            loss_weights = np.linspace(
+                -0.75,
+                0.9,
+                token_values.shape[0] * token_values.shape[1] * config.effective_output_size,
+                dtype=np.float32,
+            ).reshape(token_values.shape[0], token_values.shape[1], config.effective_output_size)
+            return config, model, token_values, loss_weights
+
+        def make_torch_reference_state(model: Any) -> tuple[dict[str, Any], list[str]]:
+            from megalodon_jax.convert import export_upstream_state_dict
+
+            source_state = export_upstream_state_dict(model)
+            trainable = list(trainable_upstream_keys(source_state))
+            state = differentiable_state(source_state)
+            return state, trainable
+
         def check_logits_dtype() -> tuple[bool, str, dict[str, Any]]:
             cfg = MegalodonConfig(
                 vocab_size=32,
@@ -1005,6 +1344,223 @@ def main() -> int:
             )
 
         audit.run("fp32_output_logits", "P1", check_logits_dtype)
+
+        def check_torch_forward_and_gradients() -> tuple[bool, str, dict[str, Any]]:
+            import torch
+
+            from megalodon_jax.convert import export_upstream_state_dict
+
+            config, model, token_values, loss_weights = tiny_reference_fixture()
+            jax_tokens = jnp.asarray(token_values)
+            jax_weights = jnp.asarray(loss_weights)
+
+            def jax_objective(candidate: Any) -> tuple[Any, Any]:
+                logits, _ = candidate(jax_tokens)
+                return jnp.sum(logits * jax_weights), logits
+
+            (jax_loss, jax_logits), jax_grads = eqx.filter_value_and_grad(
+                jax_objective,
+                has_aux=True,
+            )(model)
+
+            torch_state, trainable = make_torch_reference_state(model)
+            torch_tokens = torch.from_numpy(token_values)
+            torch_weights = torch.from_numpy(loss_weights)
+            torch_logits = source_forward(torch_tokens, torch_state, config)
+            torch_loss = torch.sum(torch_logits * torch_weights)
+            torch_loss.backward()
+
+            gradient_state = export_upstream_state_dict(jax_grads)
+            gradient_errors: dict[str, Any] = {}
+            gradients_pass = True
+            for name in trainable:
+                reference_gradient = torch_state[name].grad
+                if reference_gradient is None:
+                    gradient_errors[name] = {"missing_torch_gradient": True}
+                    gradients_pass = False
+                    continue
+                actual = gradient_state[name].detach().cpu().numpy()
+                expected = reference_gradient.detach().cpu().numpy()
+                absolute = np.abs(actual - expected)
+                max_abs = float(absolute.max(initial=0.0))
+                scale = np.maximum(np.maximum(np.abs(actual), np.abs(expected)), 1e-6)
+                max_rel = float((absolute / scale).max(initial=0.0))
+                close = bool(np.allclose(actual, expected, rtol=5e-3, atol=2e-4))
+                gradient_errors[name] = {
+                    "max_abs_error": max_abs,
+                    "max_relative_error": max_rel,
+                    "passed": close,
+                }
+                gradients_pass = gradients_pass and close
+
+            jax_logits_np = np.asarray(jax_logits)
+            torch_logits_np = torch_logits.detach().cpu().numpy()
+            output_error = float(np.max(np.abs(jax_logits_np - torch_logits_np)))
+            loss_error = abs(float(jax_loss) - float(torch_loss.detach()))
+            forward_pass = bool(np.allclose(jax_logits_np, torch_logits_np, rtol=5e-4, atol=5e-5))
+            passed = forward_pass and gradients_pass
+            return (
+                passed,
+                "Tiny JAX logits and every trainable gradient match the source-derived Torch oracle"
+                if passed
+                else "Tiny source-derived Torch/JAX forward or gradient parity failed",
+                {
+                    "max_abs_logits_error": output_error,
+                    "absolute_loss_error": loss_error,
+                    "gradient_tolerances": {"rtol": 5e-3, "atol": 2e-4},
+                    "logit_tolerances": {"rtol": 5e-4, "atol": 5e-5},
+                    "gradient_errors": gradient_errors,
+                },
+            )
+
+        audit.run(
+            "source_torch_jax_forward_gradient_parity",
+            "P0",
+            check_torch_forward_and_gradients,
+        )
+
+        def check_short_adamw_parity() -> tuple[bool, str, dict[str, Any]]:
+            import torch
+
+            from megalodon_jax.convert import (
+                export_upstream_state_dict,
+                load_upstream_state_dict,
+            )
+
+            config, jax_model, base_tokens, loss_weights = tiny_reference_fixture()
+            torch_state, trainable = make_torch_reference_state(jax_model)
+            optimizer = torch.optim.AdamW(
+                [torch_state[name] for name in trainable],
+                lr=3e-4,
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=0.01,
+                foreach=False,
+                fused=False,
+            )
+            jax_state = export_upstream_state_dict(jax_model)
+            first_moment = {name: torch.zeros_like(jax_state[name]) for name in trainable}
+            second_moment = {name: torch.zeros_like(jax_state[name]) for name in trainable}
+            step_results: list[dict[str, Any]] = []
+            passed = True
+
+            for step in range(1, 4):
+                token_values = (base_tokens + step - 1) % config.vocab_size
+                jax_tokens = jnp.asarray(token_values)
+                jax_weights = jnp.asarray(loss_weights)
+
+                def objective(candidate: Any) -> Any:
+                    logits, _ = candidate(jax_tokens)
+                    return jnp.sum(logits * jax_weights)
+
+                jax_loss, jax_grads = eqx.filter_value_and_grad(objective)(jax_model)
+                gradient_state = export_upstream_state_dict(jax_grads)
+
+                optimizer.zero_grad(set_to_none=True)
+                torch_logits = source_forward(
+                    torch.from_numpy(token_values),
+                    torch_state,
+                    config,
+                )
+                torch_loss = torch.sum(torch_logits * torch.from_numpy(loss_weights))
+                torch_loss.backward()
+                optimizer.step()
+
+                correction1 = 1.0 - 0.9**step
+                correction2 = 1.0 - 0.999**step
+                with torch.no_grad():
+                    for name in trainable:
+                        gradient = gradient_state[name]
+                        first_moment[name].mul_(0.9).add_(gradient, alpha=0.1)
+                        second_moment[name].mul_(0.999).addcmul_(
+                            gradient,
+                            gradient,
+                            value=0.001,
+                        )
+                        denominator = second_moment[name].sqrt().div_(math.sqrt(correction2))
+                        denominator.add_(1e-8)
+                        jax_state[name].mul_(1.0 - 3e-4 * 0.01)
+                        jax_state[name].addcdiv_(
+                            first_moment[name],
+                            denominator,
+                            value=-3e-4 / correction1,
+                        )
+
+                jax_model = load_upstream_state_dict(jax_model, jax_state)
+                parameter_errors = {
+                    name: float(
+                        torch.max(torch.abs(jax_state[name] - torch_state[name].detach())).item()
+                    )
+                    for name in trainable
+                }
+                max_parameter_error = max(parameter_errors.values(), default=0.0)
+                loss_error = abs(float(jax_loss) - float(torch_loss.detach()))
+                step_pass = max_parameter_error <= 3e-6 and loss_error <= 2e-3
+                passed = passed and step_pass
+                step_results.append(
+                    {
+                        "step": step,
+                        "jax_loss": float(jax_loss),
+                        "torch_loss": float(torch_loss.detach()),
+                        "absolute_loss_error": loss_error,
+                        "max_abs_parameter_error": max_parameter_error,
+                        "worst_parameter": max(parameter_errors, key=parameter_errors.get),
+                        "passed": step_pass,
+                    }
+                )
+
+            return (
+                passed,
+                "Three AdamW steps preserve source-derived Torch/JAX optimizer parity"
+                if passed
+                else "Short AdamW parity diverged",
+                {
+                    "steps": step_results,
+                    "parameter_atol": 3e-6,
+                    "loss_atol": 2e-3,
+                },
+            )
+
+        audit.run("source_torch_jax_three_step_adamw", "P0", check_short_adamw_parity)
+
+        def check_tiny_overfit() -> tuple[bool, str, dict[str, Any]]:
+            config = MegalodonConfig(
+                vocab_size=8,
+                model_dim=8,
+                num_layers=1,
+                num_heads=1,
+                z_dim=4,
+                value_dim=8,
+                ffn_hidden_dim=12,
+                cema_ndim=2,
+                chunk_size=8,
+                norm_num_groups=2,
+            )
+            model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(405))
+            tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
+            learning_rate = 2e-2
+
+            @eqx.filter_jit
+            def step(candidate: MegalodonForCausalLM) -> tuple[MegalodonForCausalLM, Any]:
+                def loss_fn(current: MegalodonForCausalLM) -> Any:
+                    return current.compute_loss(tokens, tokens)
+
+                loss, grads = eqx.filter_value_and_grad(loss_fn)(candidate)
+                updates = jax.tree.map(lambda gradient: -learning_rate * gradient, grads)
+                return eqx.apply_updates(candidate, updates), loss
+
+            initial = float(model.compute_loss(tokens, tokens))
+            for _ in range(80):
+                model, _ = step(model)
+            final = float(model.compute_loss(tokens, tokens))
+            passed = math.isfinite(final) and final < 0.35 * initial
+            return (
+                passed,
+                "Deterministic FP32 tiny-batch overfit gate succeeds",
+                {"initial_loss": initial, "final_loss": final, "ratio": final / initial},
+            )
+
+        audit.run("deterministic_tiny_batch_overfit", "P0", check_tiny_overfit)
 
         def cache_partition_error(attention_window: int | None) -> float:
             key = jax.random.PRNGKey(17)

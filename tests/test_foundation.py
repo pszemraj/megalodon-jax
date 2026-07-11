@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -12,7 +11,6 @@ from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.layers.norms import BatchedLayerNorm
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
-from tests.utils import require_torch_modeling, to_jax
 
 
 class TestMegalodonConfig:
@@ -187,39 +185,8 @@ class TestMegalodonConfig:
         assert d[cfg] == "test"
 
 
-class TestRMSNormParity:
-    """Parity tests for RMSNorm against PyTorch reference."""
-
-    @pytest.mark.torch_ref
-    def test_forward_parity(self, random_seed: int) -> None:
-        """Test RMSNorm forward pass matches PyTorch.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        torch = pytest.importorskip("torch")
-        torch_norm_cls = require_torch_modeling().RMSNorm
-
-        dim = 64
-        eps = 1e-6
-
-        # Create both modules
-        torch_norm = torch_norm_cls(dim, eps=eps)
-        jax_norm = RMSNorm(dim, eps=eps)
-
-        # Copy weights from PyTorch to JAX
-        jax_norm = eqx.tree_at(lambda m: m.gamma, jax_norm, to_jax(torch_norm.gamma))
-
-        # Generate test input
-        x_torch = torch.randn(2, 16, dim)
-        x_jax = to_jax(x_torch)
-
-        # Forward pass
-        y_torch = torch_norm(x_torch)
-        y_jax = jax_norm(x_jax)
-
-        # Compare
-        np.testing.assert_allclose(np.array(y_jax), y_torch.detach().numpy(), rtol=1e-5, atol=1e-5)
+class TestRMSNorm:
+    """Mathematical and parameterization tests for RMSNorm."""
 
     def test_gamma_initialization(self) -> None:
         """Test that gamma is initialized to zeros.
@@ -314,100 +281,6 @@ class TestRotaryEmbeddingParity:
         np.testing.assert_array_equal(np.asarray(offset_q), np.asarray(explicit_q))
         np.testing.assert_array_equal(np.asarray(offset_k), np.asarray(explicit_k))
 
-    @pytest.mark.torch_ref
-    def test_forward_parity(self, random_seed: int) -> None:
-        """Test RotaryEmbedding forward pass matches PyTorch.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        torch = pytest.importorskip("torch")
-        torch_rope_cls = require_torch_modeling().RotaryEmbedding
-
-        dim = 64
-        base = 10000.0
-
-        # Create both modules
-        torch_rope = torch_rope_cls(dim, base=base)
-        jax_rope = RotaryEmbedding(dim, base=base)
-
-        # Verify inv_freq matches
-        np.testing.assert_allclose(
-            np.array(jax_rope.inv_freq),
-            torch_rope.inv_freq.numpy(),
-            rtol=1e-6,
-            atol=1e-6,
-        )
-
-        # Generate test input
-        batch, seq, heads = 2, 16, 4
-        q_torch = torch.randn(batch, seq, heads, dim)
-        k_torch = torch.randn(batch, seq, heads, dim)
-        q_jax = to_jax(q_torch)
-        k_jax = to_jax(k_torch)
-
-        # Forward pass at position 0
-        start_index = 0
-        q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=start_index)
-        q_rot_jax, k_rot_jax = jax_rope(q_jax, k_jax, jnp.array(start_index, dtype=jnp.int32))
-
-        # Compare
-        np.testing.assert_allclose(
-            np.array(q_rot_jax), q_rot_torch.detach().numpy(), rtol=1e-5, atol=1e-5
-        )
-        np.testing.assert_allclose(
-            np.array(k_rot_jax), k_rot_torch.detach().numpy(), rtol=1e-5, atol=1e-5
-        )
-
-    @pytest.mark.torch_ref
-    def test_different_start_positions(self, random_seed: int) -> None:
-        """Test RotaryEmbedding at various start positions.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        torch = pytest.importorskip("torch")
-        torch_rope_cls = require_torch_modeling().RotaryEmbedding
-
-        dim = 64
-        torch_rope = torch_rope_cls(dim)
-        jax_rope = RotaryEmbedding(dim)
-
-        batch, seq, heads = 2, 8, 4
-        q_torch = torch.randn(batch, seq, heads, dim)
-        k_torch = torch.randn(batch, seq, heads, dim)
-        q_jax = to_jax(q_torch)
-        k_jax = to_jax(k_torch)
-
-        for start_index in [0, 10, 100, 1000]:
-            q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=start_index)
-            q_rot_jax, k_rot_jax = jax_rope(q_jax, k_jax, jnp.array(start_index, dtype=jnp.int32))
-
-            # Tolerance scales with position due to exp() implementation differences
-            # between JAX (XLA) and PyTorch. These are within float32 precision bounds.
-            # Error analysis shows: pos 0-10: ~1e-6, pos 100: ~1e-5, pos 1000: ~1e-4
-            if start_index >= 1000:
-                rtol, atol = 1e-4, 1e-4
-            elif start_index >= 100:
-                rtol, atol = 5e-5, 5e-5
-            else:
-                rtol, atol = 1e-5, 1e-5
-
-            np.testing.assert_allclose(
-                np.array(q_rot_jax),
-                q_rot_torch.detach().numpy(),
-                rtol=rtol,
-                atol=atol,
-                err_msg=f"Q mismatch at start_index={start_index}",
-            )
-            np.testing.assert_allclose(
-                np.array(k_rot_jax),
-                k_rot_torch.detach().numpy(),
-                rtol=rtol,
-                atol=atol,
-                err_msg=f"K mismatch at start_index={start_index}",
-            )
-
     def test_even_dim_required(self) -> None:
         """Test that odd dimension raises ValueError.
 
@@ -415,38 +288,6 @@ class TestRotaryEmbeddingParity:
         """
         with pytest.raises(ValueError, match="even head dimension"):
             RotaryEmbedding(63)
-
-    @pytest.mark.torch_ref
-    def test_different_base_values(self, random_seed: int) -> None:
-        """Test RotaryEmbedding with different base values.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        torch = pytest.importorskip("torch")
-        torch_rope_cls = require_torch_modeling().RotaryEmbedding
-
-        dim = 64
-        batch, seq, heads = 2, 8, 4
-        q_torch = torch.randn(batch, seq, heads, dim)
-        k_torch = torch.randn(batch, seq, heads, dim)
-        q_jax = to_jax(q_torch)
-        k_jax = to_jax(k_torch)
-
-        for base in [10000.0, 100000.0]:
-            torch_rope = torch_rope_cls(dim, base=base)
-            jax_rope = RotaryEmbedding(dim, base=base)
-
-            q_rot_torch, k_rot_torch = torch_rope(q_torch, k_torch, start_index=0)
-            q_rot_jax, k_rot_jax = jax_rope(q_jax, k_jax, jnp.array(0, dtype=jnp.int32))
-
-            np.testing.assert_allclose(
-                np.array(q_rot_jax),
-                q_rot_torch.detach().numpy(),
-                rtol=1e-5,
-                atol=1e-5,
-                err_msg=f"Mismatch at base={base}",
-            )
 
 
 class TestCacheTypes:
