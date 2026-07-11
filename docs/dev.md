@@ -9,6 +9,7 @@
 - Unreleased: native model/cache format v2 fails closed; original-upstream conversion targets only the exact released schema.
 - Unreleased: FP32 and BF16 are the complete supported numerical surface. Float16 is rejected.
 - Unreleased: downstream Megalodon packages were removed from development and tests. Parity uses the exact local source plus an independent differentiable Torch oracle.
+- Unreleased: the verified dependency window is JAX 0.8.2 through 0.10.x with Equinox 0.13.x; the baseline and latest endpoint pairs pass the complete verifier.
 
 ## Architecture Overview
 

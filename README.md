@@ -29,7 +29,7 @@ cd megalodon-jax
 pip install -e ".[dev]"
 ```
 
-Requires Python 3.11+ with JAX 0.7.0+ and Equinox 0.12.0+. PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
+Requires Python 3.11+, JAX 0.8.2 through 0.10.x, and Equinox 0.13.x. The correctness gate passes at both the installed baseline (JAX 0.8.2 / Equinox 0.13.2) and the current releases (JAX 0.10.2 / Equinox 0.13.8). PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
 
 ## Quick Start
 
