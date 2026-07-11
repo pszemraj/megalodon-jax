@@ -148,7 +148,9 @@ class TestMegalodonBlock:
         # Different layer IDs should have different alpha values
         assert block0.ffn.alpha is not None
         assert block3.ffn.alpha is not None
-        assert block0.ffn.alpha != block3.ffn.alpha
+        np.testing.assert_allclose(np.asarray(block0.ffn.alpha), 0.1)
+        np.testing.assert_allclose(np.asarray(block3.ffn.alpha), 0.1 * (0.5**3))
+        assert not np.array_equal(np.asarray(block0.ffn.alpha), np.asarray(block3.ffn.alpha))
         # alpha = 0.1 * (0.5 ** layer_id)
         np.testing.assert_allclose(block0.ffn.alpha, 0.1 * (0.5**0), rtol=1e-6)
         np.testing.assert_allclose(block3.ffn.alpha, 0.1 * (0.5**3), rtol=1e-6)
@@ -1450,8 +1452,8 @@ class TestEdgeCases:
         with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
             model(input_ids, attention_mask=attention_mask, return_cache=True)
 
-    def test_cache_without_padding_succeeds(self, random_seed: int) -> None:
-        """Test that building cache without padding works correctly.
+    def test_cache_rejects_attention_mask_metadata(self, random_seed: int) -> None:
+        """Cached calls require an unmasked generation batch.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1474,12 +1476,14 @@ class TestEdgeCases:
 
         batch, seq = 2, 16
         input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
-        # All-True mask (no padding) should work
+        # Even an all-True mask is rejected so the cached API never silently
+        # discards validity metadata that cannot be represented in the cache.
         attention_mask = jnp.ones((batch, seq), dtype=bool)
 
-        # Should succeed with all-True mask
-        logits, cache = model(input_ids, attention_mask=attention_mask, return_cache=True)
+        with pytest.raises(ValueError, match="attention_mask is unsupported with cached calls"):
+            model(input_ids, attention_mask=attention_mask, return_cache=True)
 
+        logits, cache = model(input_ids, return_cache=True)
         assert logits.shape == (batch, seq, config.vocab_size)
         assert cache is not None
 
