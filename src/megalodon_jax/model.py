@@ -494,9 +494,8 @@ class MegalodonModel(eqx.Module):
 class MegalodonForCausalLM(eqx.Module):
     """Megalodon decoder with LM head for causal language modeling.
 
-    Supports both tied and untied LM heads:
-    - When output_size == vocab_size or output_size == -1: weights are tied
-    - When output_size != vocab_size: separate lm_head is created
+    Supports explicitly tied and untied LM heads. Output width and sharing are
+    independent configuration decisions.
 
     For tied weights, logits are computed as: hidden @ embed.weight.T
     For untied weights, logits are computed via the lm_head Linear layer.
@@ -526,18 +525,14 @@ class MegalodonForCausalLM(eqx.Module):
         """
         self.config = config
 
-        # Determine output size and whether to tie weights
-        # output_size=-1 means "use vocab_size" (tied weights)
-        lm_out = config.vocab_size if config.output_size == -1 else config.output_size
-        self.tied = lm_out == config.vocab_size
+        lm_out = config.effective_output_size
+        self.tied = config.share_emb
+        k_model, k_head, k_head_reinit = jax.random.split(key, 3)
 
         if self.tied:
-            # Tied weights: only need key for model
-            self.model = MegalodonModel(config, key=key)
+            self.model = MegalodonModel(config, key=k_model)
             self.lm_head = None
         else:
-            # Untied weights: split keys for model, lm_head, and reinit
-            k_model, k_head, k_head_reinit = jax.random.split(key, 3)
             self.model = MegalodonModel(config, key=k_model)
 
             lm_head = eqx.nn.Linear(

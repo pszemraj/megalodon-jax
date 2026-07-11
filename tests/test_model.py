@@ -287,7 +287,7 @@ class TestMegalodonModel:
 
 
 class TestMegalodonForCausalLM:
-    """Tests for MegalodonForCausalLM with tied LM head."""
+    """Tests for MegalodonForCausalLM."""
 
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test that MegalodonForCausalLM produces correct logit shapes.
@@ -313,7 +313,7 @@ class TestMegalodonForCausalLM:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = small_config()
+        config = replace(small_config(), share_emb=True)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1103,8 +1103,8 @@ class TestFix2PadTokenMasking:
 class TestFix3UntiedLMHead:
     """Tests for untied LM head support (Fix 3)."""
 
-    def test_tied_head_when_output_size_matches_vocab(self, random_seed: int) -> None:
-        """Test that LM head is tied when output_size equals vocab_size.
+    def test_tied_head_requires_explicit_flag(self, random_seed: int) -> None:
+        """Vocabulary width and weight sharing are independent settings.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1120,7 +1120,8 @@ class TestFix3UntiedLMHead:
             cema_ndim=4,
             chunk_size=16,
             norm_num_groups=8,
-            output_size=-1,  # Tied
+            output_size=-1,
+            share_emb=True,
         )
 
         key = jax.random.PRNGKey(random_seed)
@@ -1128,6 +1129,19 @@ class TestFix3UntiedLMHead:
 
         assert model.tied is True
         assert model.lm_head is None
+
+    def test_vocab_sized_head_is_untied_by_default(self, random_seed: int) -> None:
+        """Source default keeps a separate vocabulary-sized output matrix."""
+        config = replace(small_config(), output_size=-1, share_emb=False)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        assert model.tied is False
+        assert model.lm_head is not None
+        assert model.lm_head.weight.shape == (config.vocab_size, config.model_dim)
+
+    def test_invalid_share_width_is_rejected(self) -> None:
+        """Tied output cannot use a non-vocabulary width."""
+        with pytest.raises(ValueError, match="share_emb"):
+            replace(small_config(), output_size=128, share_emb=True)
 
     def test_untied_head_when_output_size_differs(self, random_seed: int) -> None:
         """Test that separate LM head is created when output_size != vocab_size.

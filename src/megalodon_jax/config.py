@@ -50,6 +50,7 @@ class MegalodonConfig:
     swiglu: bool = False
     rescale_nffn: bool = False
     scale_emb: bool = False
+    share_emb: bool = False
     norm_affine: bool = True
     dropout: float = 0.0
     attention_dropout: float = 0.0
@@ -64,7 +65,7 @@ class MegalodonConfig:
     # (fast, materializes (L, B, D, N) complex64 tensors) vs sequential scan
     # (10-60x slower on GPU, O(1) extra memory). Only affects segment_ids runs.
     use_associative_segment_scan: bool = True
-    output_size: int = -1  # LM head size; -1 ties to vocab_size
+    output_size: int = -1  # LM head width; -1 resolves to vocab_size
     param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
     compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations
     accum_dtype: jnp.dtype = jnp.float32  # Accumulation dtype for GEMM/reductions
@@ -73,6 +74,12 @@ class MegalodonConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
+        if self.vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
+        if self.output_size < -1 or self.output_size == 0:
+            raise ValueError(f"output_size must be -1 or positive, got {self.output_size}")
+        if self.share_emb and self.effective_output_size != self.vocab_size:
+            raise ValueError("share_emb requires output_size to resolve to vocab_size")
         if self.z_dim % self.num_heads != 0:
             raise ValueError(
                 f"z_dim ({self.z_dim}) must be divisible by num_heads ({self.num_heads})"
@@ -148,21 +155,169 @@ class MegalodonConfig:
         """
         return self.max_cache_len if self.max_cache_len is not None else self.chunk_size
 
-    @classmethod
-    def from_7b(cls) -> "MegalodonConfig":
-        """Create configuration for 7B parameter model.
+    @property
+    def effective_output_size(self) -> int:
+        """Resolve the language-model output width.
 
-        :return MegalodonConfig: Config with 7B-scale hyperparameters.
+        :return int: Vocabulary size when output_size is -1, otherwise output_size.
         """
+        return self.vocab_size if self.output_size == -1 else self.output_size
+
+    def parameter_count_breakdown(self) -> dict[str, int]:
+        """Return the exact trainable parameter count for this configuration."""
+        d = self.model_dim
+        z = self.z_dim
+        v = self.value_dim
+        f = self.ffn_hidden_dim
+        n = self.cema_ndim
+
+        timestep_norm = 2 * d
+        cema = 4 * d * n + 2 * d
+        rmsnorm = d if self.norm_affine else 0
+        attention_projections = (d * z + z) + (d * v + v) + (d * v + v) + (d * d + d) + (v * d)
+        qk_affine = 4 * z
+        ffn_norm = 2 * d if self.norm_affine else 0
+        ffn = 2 * d * f + (d * f if self.swiglu else 0)
+        ffn_rescale = d if self.rescale_nffn else 0
+        per_layer = (
+            timestep_norm
+            + cema
+            + rmsnorm
+            + attention_projections
+            + qk_affine
+            + ffn_norm
+            + ffn
+            + ffn_rescale
+        )
+        embedding = self.vocab_size * d
+        output_head = 0 if self.share_emb else self.effective_output_size * d
+        layers = self.num_layers * per_layer
+        final_norm = 2 * d
+        return {
+            "embedding": embedding,
+            "timestep_norm_per_layer": timestep_norm,
+            "cema_per_layer": cema,
+            "rmsnorm_per_layer": rmsnorm,
+            "attention_projections_per_layer": attention_projections,
+            "qk_affine_per_layer": qk_affine,
+            "ffn_norm_per_layer": ffn_norm,
+            "ffn_per_layer": ffn,
+            "ffn_rescale_per_layer": ffn_rescale,
+            "per_layer": per_layer,
+            "layers": layers,
+            "final_norm": final_norm,
+            "output_head": output_head,
+            "total": embedding + layers + final_norm + output_head,
+        }
+
+    @classmethod
+    def from_upstream_mega200m(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released mega200M configuration."""
         return cls(
-            model_dim=4096,
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=12,
+            model_dim=1024,
+            num_heads=1,
+            z_dim=256,
+            value_dim=2048,
+            ffn_hidden_dim=2560,
+            chunk_size=2048,
+            norm_num_groups=32,
+        )
+
+    @classmethod
+    def from_upstream_mega1_3b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released mega1.3B configuration."""
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=24,
+            model_dim=2048,
+            num_heads=2,
+            z_dim=512,
+            value_dim=4096,
+            ffn_hidden_dim=4864,
+            chunk_size=2048,
+            norm_num_groups=64,
+        )
+
+    @classmethod
+    def from_upstream_mega1_3b_pg19(
+        cls, *, vocab_size: int, output_size: int = -1
+    ) -> "MegalodonConfig":
+        """Create the released tied PG-19 mega1.3B configuration."""
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=24,
+            model_dim=2048,
+            num_heads=2,
+            z_dim=512,
+            value_dim=4096,
+            ffn_hidden_dim=3584,
+            chunk_size=2048,
+            norm_num_groups=64,
+            swiglu=True,
+            scale_emb=True,
+            share_emb=True,
+        )
+
+    @classmethod
+    def from_upstream_mega7_1b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released non-SwiGLU mega7.1B configuration."""
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
             num_layers=32,
+            model_dim=4096,
             num_heads=4,
             z_dim=1024,
             value_dim=8192,
             ffn_hidden_dim=11264,
+            chunk_size=2048,
+            norm_num_groups=64,
+        )
+
+    @classmethod
+    def from_upstream_mega7_3b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released SwiGLU mega7.3B configuration."""
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=32,
+            model_dim=4096,
+            num_heads=4,
+            z_dim=1024,
+            value_dim=8192,
+            ffn_hidden_dim=8192,
+            chunk_size=2048,
+            norm_num_groups=64,
+            swiglu=True,
+        )
+
+    @classmethod
+    def from_paper_7b(cls, *, vocab_size: int = 32_000, output_size: int = -1) -> "MegalodonConfig":
+        """Create the distinct 7B training configuration reported in the paper."""
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=32,
+            model_dim=4096,
+            num_heads=4,
+            z_dim=1024,
+            value_dim=8192,
+            ffn_hidden_dim=8192,
             chunk_size=4096,
             norm_num_groups=64,
             rope_base=100_000.0,
             swiglu=True,
+        )
+
+    @classmethod
+    def from_7b(cls) -> "MegalodonConfig":
+        """Reject the historically ambiguous and incorrect 7B factory."""
+        raise ValueError(
+            "from_7b() was an invalid hybrid preset; choose from_paper_7b(), "
+            "from_upstream_mega7_1b(), or from_upstream_mega7_3b() explicitly"
         )

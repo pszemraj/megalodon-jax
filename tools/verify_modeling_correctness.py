@@ -612,47 +612,48 @@ def main() -> int:
     audit.run("explicit_output_weight_tying", "P0", check_explicit_tying)
 
     def check_7b_preset() -> tuple[bool, str, dict[str, Any]]:
-        cfg = MegalodonConfig.from_7b()
-        matches_71 = cfg.ffn_hidden_dim == 11264 and not cfg.swiglu
-        matches_73 = cfg.ffn_hidden_dim == 8192 and cfg.swiglu
-        source_71 = source_parameter_count(
-            model_dim=4096,
-            num_layers=32,
-            num_heads=4,
-            z_dim=1024,
-            value_dim=8192,
-            ffn_hidden_dim=11264,
-            cema_ndim=16,
-            vocab_size=32000,
-            swiglu=False,
-            share_emb=False,
-        )
-        source_73 = source_parameter_count(
-            model_dim=4096,
-            num_layers=32,
-            num_heads=4,
-            z_dim=1024,
-            value_dim=8192,
-            ffn_hidden_dim=8192,
-            cema_ndim=16,
-            vocab_size=32000,
-            swiglu=True,
-            share_emb=False,
-        )
-        current_tied = current_jax_formula_count(cfg, assume_tied=True)
-        passed = matches_71 or matches_73
+        configs = {
+            "mega200M": MegalodonConfig.from_upstream_mega200m(vocab_size=32_000),
+            "mega1.3B": MegalodonConfig.from_upstream_mega1_3b(vocab_size=32_000),
+            "mega1.3B_pg19": MegalodonConfig.from_upstream_mega1_3b_pg19(vocab_size=32_000),
+            "mega7.1B": MegalodonConfig.from_upstream_mega7_1b(vocab_size=32_000),
+            "mega7.3B": MegalodonConfig.from_upstream_mega7_3b(vocab_size=32_000),
+            "paper7B": MegalodonConfig.from_paper_7b(),
+        }
+        expected_counts = {
+            "mega200M": 220_627_968,
+            "mega1.3B": 1_342_832_640,
+            "mega1.3B_pg19": 1_327_628_288,
+            "mega7.1B": 7_117_381_632,
+            "mega7.3B": 7_385_817_088,
+            "paper7B": 7_385_817_088,
+        }
+        counts = {
+            name: config.parameter_count_breakdown()["total"] for name, config in configs.items()
+        }
+        try:
+            MegalodonConfig.from_7b()
+        except ValueError:
+            ambiguous_rejected = True
+        else:
+            ambiguous_rejected = False
+        identities = {
+            "mega7.1B_non_swiglu_11264": not configs["mega7.1B"].swiglu
+            and configs["mega7.1B"].ffn_hidden_dim == 11_264,
+            "mega7.3B_swiglu_8192": configs["mega7.3B"].swiglu
+            and configs["mega7.3B"].ffn_hidden_dim == 8_192,
+            "paper_chunk_and_base": configs["paper7B"].chunk_size == 4_096
+            and configs["paper7B"].effective_rope_base == 100_000.0,
+        }
+        passed = counts == expected_counts and ambiguous_rejected and all(identities.values())
         return (
             passed,
-            "7B factory matches a named upstream preset"
-            if passed
-            else "from_7b combines F=11264 with SwiGLU and is an ~8.46B hybrid",
+            "Named source/paper presets and exact parameter counts are unambiguous",
             {
-                "factory_ffn_hidden_dim": cfg.ffn_hidden_dim,
-                "factory_swiglu": cfg.swiglu,
-                "factory_init_mode": cfg.init_mode,
-                "current_formula_tied_count": current_tied,
-                "upstream_mega7_1b_count": source_71,
-                "upstream_mega7_3b_count": source_73,
+                "actual_counts": counts,
+                "expected_counts": expected_counts,
+                "ambiguous_from_7b_rejected": ambiguous_rejected,
+                "identities": identities,
             },
         )
 

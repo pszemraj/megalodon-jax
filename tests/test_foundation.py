@@ -38,6 +38,8 @@ class TestMegalodonConfig:
         assert cfg.accum_dtype == jnp.float32
         assert cfg.softmax_dtype == jnp.float32
         assert cfg.gemm_backend == "default"
+        assert cfg.init_mode == "he"
+        assert cfg.share_emb is False
 
     def test_head_dim_property(self) -> None:
         """Test head_dim computed property.
@@ -55,22 +57,46 @@ class TestMegalodonConfig:
         cfg = MegalodonConfig()
         assert cfg.value_head_dim == 2048  # value_dim / num_heads
 
-    def test_7b_preset(self) -> None:
-        """Test 7B configuration preset.
+    def test_exact_named_presets_and_counts(self) -> None:
+        """Released and paper presets retain distinct identities and exact counts."""
+        presets = {
+            "mega200m": (
+                MegalodonConfig.from_upstream_mega200m(vocab_size=32_000),
+                220_627_968,
+            ),
+            "mega1_3b": (
+                MegalodonConfig.from_upstream_mega1_3b(vocab_size=32_000),
+                1_342_832_640,
+            ),
+            "mega1_3b_pg19": (
+                MegalodonConfig.from_upstream_mega1_3b_pg19(vocab_size=32_000),
+                1_327_628_288,
+            ),
+            "mega7_1b": (
+                MegalodonConfig.from_upstream_mega7_1b(vocab_size=32_000),
+                7_117_381_632,
+            ),
+            "mega7_3b": (
+                MegalodonConfig.from_upstream_mega7_3b(vocab_size=32_000),
+                7_385_817_088,
+            ),
+            "paper_7b": (MegalodonConfig.from_paper_7b(), 7_385_817_088),
+        }
+        for name, (config, expected) in presets.items():
+            assert config.parameter_count_breakdown()["total"] == expected, name
 
-        :return None: None.
-        """
-        cfg = MegalodonConfig.from_7b()
-        assert cfg.model_dim == 4096
-        assert cfg.num_layers == 32
-        assert cfg.num_heads == 4
-        assert cfg.z_dim == 1024
-        assert cfg.value_dim == 8192
-        assert cfg.ffn_hidden_dim == 11264
-        assert cfg.chunk_size == 4096
-        assert cfg.norm_num_groups == 64
-        assert cfg.rope_base == 100_000.0
-        assert cfg.swiglu is True
+        assert presets["mega7_1b"][0].swiglu is False
+        assert presets["mega7_1b"][0].ffn_hidden_dim == 11_264
+        assert presets["mega7_3b"][0].swiglu is True
+        assert presets["mega7_3b"][0].ffn_hidden_dim == 8_192
+        assert presets["paper_7b"][0].chunk_size == 4_096
+        assert presets["paper_7b"][0].effective_rope_base == 100_000.0
+        assert presets["mega1_3b_pg19"][0].share_emb is True
+
+    def test_ambiguous_7b_factory_is_rejected(self) -> None:
+        """The historical hybrid factory must never select semantics silently."""
+        with pytest.raises(ValueError, match="invalid hybrid"):
+            MegalodonConfig.from_7b()
 
     def test_z_dim_divisibility_validation(self) -> None:
         """Test z_dim must be divisible by num_heads.
