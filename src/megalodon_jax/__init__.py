@@ -1,5 +1,12 @@
 """Megalodon JAX - JAX/Equinox implementation of Megalodon for efficient long-context LLM."""
 
+from megalodon_jax.checkpoint import (
+    load_checkpoint,
+    load_inference_cache,
+    load_partial_checkpoint,
+    save_checkpoint,
+    save_inference_cache,
+)
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.inference import (
     generate,
@@ -26,6 +33,12 @@ __all__ = [
     "EMAState",
     "LayerCache",
     "NormState",
+    # Native persistence
+    "save_checkpoint",
+    "load_checkpoint",
+    "load_partial_checkpoint",
+    "save_inference_cache",
+    "load_inference_cache",
     # Inference utilities
     "init_cache",
     "trim_cache",
@@ -36,5 +49,5 @@ __all__ = [
     "generate_jit",
 ]
 
-# Weight conversion utilities require torch.
-# Import explicitly: from megalodon_jax.convert import load_from_pretrained, save_safetensors
+# Original-upstream conversion requires torch and is imported explicitly from
+# megalodon_jax.convert.

@@ -11,578 +11,408 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Weight conversion utilities for PyTorch ↔ JAX.
+"""Strict conversion for the exact released PyTorch Megalodon keyspace."""
 
-This module requires torch. Install with:
-    pip install megalodon-jax[convert]
+from __future__ import annotations
 
-Usage:
-    from megalodon_jax.convert import load_from_pretrained, save_safetensors
-"""
-
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
-import equinox as eqx
-import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
 from jaxtyping import Array
 
+from megalodon_jax.checkpoint import _apply_parameters
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
-from megalodon_jax.precision import ensure_sensitive_param_dtype
 
-StateDict = dict[str, Any]
-
-
-def _to_jax(tensor: Any) -> Array:
-    """Convert a PyTorch tensor to a JAX array.
-
-    :param Any tensor: Torch tensor or array-like input.
-    :return Array: JAX array on the default device.
-    """
-    if isinstance(tensor, torch.Tensor):
-        return jnp.array(tensor.detach().cpu().numpy())
-    return jnp.array(tensor)
+StateDict = dict[str, torch.Tensor]
 
 
-def _validate_shape(
-    loaded: Array,
-    expected: tuple[int, ...],
-    name: str,
-) -> None:
-    """Validate loaded weight shape matches expected shape.
-
-    :param Array loaded: Array loaded from checkpoint.
-    :param tuple[int, ...] expected: Expected shape based on config.
-    :param str name: Parameter name for error reporting.
-    :raises ValueError: If shapes don't match.
-    :return None: None.
-    """
-    if loaded.shape != expected:
-        raise ValueError(
-            f"Shape mismatch for '{name}':\n"
-            f"  Checkpoint: {loaded.shape}\n"
-            f"  Expected:   {expected}\n"
-            "Check that config matches the checkpoint."
-        )
+def _torch_tensor(
+    value: Any,
+    *,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    array = np.asarray(value)
+    if np.issubdtype(array.dtype, np.floating):
+        array = array.astype(np.float32, copy=False)
+    if not array.flags.writeable:
+        array = array.copy()
+    tensor = torch.from_numpy(array)
+    return tensor if dtype is None else tensor.to(dtype)
 
 
-def _to_torch_tensor(x: Any, *, dtype: torch.dtype | None = None) -> torch.Tensor:
-    """Convert an array-like object into a torch tensor.
-
-    :param Any x: JAX/NumPy array-like input.
-    :param torch.dtype | None dtype: Optional target dtype for the tensor.
-    :return torch.Tensor: Torch tensor on CPU.
-    """
-    arr = np.asarray(x)
-    if np.issubdtype(arr.dtype, np.floating):
-        arr = arr.astype(np.float32, copy=False)
-    if not arr.flags.writeable:
-        arr = arr.copy()
-    tensor = torch.from_numpy(arr)
-    if dtype is not None:
-        tensor = tensor.to(dtype)
-    return tensor
+def _jax_float(value: torch.Tensor, name: str) -> Array:
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"upstream value {name!r} is not a torch.Tensor")
+    return jnp.asarray(value.detach().float().cpu().numpy(), dtype=jnp.float32)
 
 
-def convert_jax_to_torch(
+def _rope_frequencies(config: MegalodonConfig) -> np.ndarray:
+    half = config.head_dim // 2
+    exponent = np.arange(half, dtype=np.float32) / half
+    return np.power(np.float32(config.effective_rope_base), -exponent).astype(np.float32)
+
+
+def export_upstream_state_dict(
     model: MegalodonForCausalLM,
     *,
     dtype: torch.dtype | None = None,
-    include_rope_inv_freq: bool = False,
 ) -> StateDict:
-    """Convert a JAX Megalodon model to a PyTorch-style state dict.
+    """Export an exact world-size-one released-source state dictionary."""
+    config = model.config
 
-    Precision-sensitive parameters (CEMA params, norms, per-head Q/K affine) are
-    exported in fp32 regardless of the requested dtype.
+    def ordinary(value: Any) -> torch.Tensor:
+        return _torch_tensor(value, dtype=dtype)
 
-    :param MegalodonForCausalLM model: JAX MegalodonForCausalLM to export.
-    :param torch.dtype | None dtype: Optional dtype for floating tensors.
-    :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
-    :return StateDict: PyTorch-style state dict for export.
-    """
+    def fp32(value: Any) -> torch.Tensor:
+        return _torch_tensor(value, dtype=torch.float32)
 
-    def convert(arr: Any, *, dtype_override: torch.dtype | None = None) -> torch.Tensor:
-        """Convert a leaf array with optional dtype override.
+    state: StateDict = {
+        "embed.weight": ordinary(model.model.embed.weight),
+        "rope.freqs": torch.from_numpy(_rope_frequencies(config)),
+    }
+    for index, layer in enumerate(model.model.layers):
+        attn = layer.attn
+        ap = f"layers.{index}.mega"
+        state[f"{ap}.timenorm.prior_count"] = torch.tensor(
+            attn.timenorm.prior_count,
+            dtype=torch.int64,
+        )
+        prior_mean = (
+            jnp.zeros(attn.timenorm.num_groups, dtype=jnp.float32)
+            if attn.timenorm.prior_mean is None
+            else attn.timenorm.prior_mean
+        )
+        prior_logv = (
+            jnp.zeros(attn.timenorm.num_groups, dtype=jnp.float32)
+            if attn.timenorm.prior_logv is None
+            else attn.timenorm.prior_logv
+        )
+        state[f"{ap}.timenorm.prior_mean"] = fp32(prior_mean)
+        state[f"{ap}.timenorm.prior_logv"] = fp32(prior_logv)
+        state[f"{ap}.timenorm.weight"] = fp32(attn.timenorm.weight)
+        state[f"{ap}.timenorm.bias"] = fp32(attn.timenorm.bias)
 
-        :param Any arr: JAX array or scalar to convert.
-        :param torch.dtype | None dtype_override: Override dtype for this tensor.
-        :return torch.Tensor: Converted PyTorch tensor.
-        """
-        use_dtype = dtype_override if dtype_override is not None else dtype
-        return _to_torch_tensor(arr, dtype=use_dtype)
+        cema = attn.cema
+        state[f"{ap}.cema.alpha"] = fp32(cema.alpha)
+        state[f"{ap}.cema.delta"] = fp32(cema.delta)
+        state[f"{ap}.cema.theta"] = fp32(cema.theta)
+        state[f"{ap}.cema.gamma"] = fp32(jnp.stack([cema.gamma_real, cema.gamma_imag], axis=-1))
+        state[f"{ap}.cema.omega"] = fp32(cema.omega[:, None])
 
-    state_dict: StateDict = {}
+        if attn.rmsnorm.gamma is not None:
+            state[f"{ap}.rmsnorm.weight"] = fp32(attn.rmsnorm.gamma)
+        for name in ("wz", "wv", "wr", "wh1", "wh2"):
+            projection = getattr(attn, name)
+            state[f"{ap}.{name}.weight"] = ordinary(projection.weight)
+            if projection.bias is not None:
+                state[f"{ap}.{name}.bias"] = ordinary(projection.bias)
+        state[f"{ap}.gamma"] = fp32(attn.gamma)
+        state[f"{ap}.beta"] = fp32(attn.beta)
 
-    state_dict["model.embed.weight"] = convert(model.model.embed.weight)
+        ffn = layer.ffn
+        fp = f"layers.{index}.nffn"
+        if ffn.norm.weight is not None:
+            state[f"{fp}.norm.weight"] = fp32(ffn.norm.weight)
+            assert ffn.norm.bias is not None
+            state[f"{fp}.norm.bias"] = fp32(ffn.norm.bias)
+        state[f"{fp}.fc1.weight"] = ordinary(ffn.fc1.weight)
+        state[f"{fp}.fc2.weight"] = ordinary(ffn.fc2.weight)
+        if ffn.fc3 is not None:
+            state[f"{fp}.fc3.weight"] = ordinary(ffn.fc3.weight)
+        if ffn.alpha is not None:
+            state[f"{fp}.alpha"] = fp32(ffn.alpha)
 
-    for i, layer in enumerate(model.model.layers):
-        attn_prefix = f"model.layers.{i}.attn"
-        ffn_prefix = f"model.layers.{i}.ffn"
+    final_norm = model.model.norm
+    state["output.final_norm.prior_count"] = torch.tensor(
+        final_norm.prior_count,
+        dtype=torch.int64,
+    )
+    final_prior_mean = (
+        jnp.zeros(final_norm.num_groups, dtype=jnp.float32)
+        if final_norm.prior_mean is None
+        else final_norm.prior_mean
+    )
+    final_prior_logv = (
+        jnp.zeros(final_norm.num_groups, dtype=jnp.float32)
+        if final_norm.prior_logv is None
+        else final_norm.prior_logv
+    )
+    state["output.final_norm.prior_mean"] = fp32(final_prior_mean)
+    state["output.final_norm.prior_logv"] = fp32(final_prior_logv)
+    state["output.final_norm.weight"] = fp32(final_norm.weight)
+    state["output.final_norm.bias"] = fp32(final_norm.bias)
+    output_weight = model.model.embed.weight if model.tied else model.lm_head.weight
+    state["output.output.weight"] = ordinary(output_weight).clone()
+    return state
 
-        # TimestepNorm
-        if layer.attn.timenorm.weight is not None:
-            state_dict[f"{attn_prefix}.timenorm.weight"] = convert(
-                layer.attn.timenorm.weight,
-                dtype_override=torch.float32,
+
+def _validate_prior(
+    state: StateDict,
+    prefix: str,
+    expected_groups: int,
+) -> None:
+    count = state[f"{prefix}.prior_count"]
+    if count.numel() != 1 or int(count.item()) != 0:
+        raise ValueError(
+            f"{prefix} uses learned prior_count; top-level released presets require zero"
+        )
+    for name in ("prior_mean", "prior_logv"):
+        tensor = state[f"{prefix}.{name}"]
+        if tuple(tensor.shape) != (expected_groups,):
+            raise ValueError(
+                f"{prefix}.{name} has shape {tuple(tensor.shape)}, expected {(expected_groups,)}"
             )
-        if layer.attn.timenorm.bias is not None:
-            state_dict[f"{attn_prefix}.timenorm.bias"] = convert(
-                layer.attn.timenorm.bias,
-                dtype_override=torch.float32,
-            )
-
-        # CEMA
-        state_dict[f"{attn_prefix}.cema.alpha"] = convert(
-            layer.attn.cema.alpha,
-            dtype_override=torch.float32,
-        )
-        state_dict[f"{attn_prefix}.cema.delta"] = convert(
-            layer.attn.cema.delta,
-            dtype_override=torch.float32,
-        )
-        state_dict[f"{attn_prefix}.cema.theta"] = convert(
-            layer.attn.cema.theta,
-            dtype_override=torch.float32,
-        )
-        state_dict[f"{attn_prefix}.cema.gamma_real"] = convert(
-            layer.attn.cema.gamma_real,
-            dtype_override=torch.float32,
-        )
-        state_dict[f"{attn_prefix}.cema.gamma_imag"] = convert(
-            layer.attn.cema.gamma_imag,
-            dtype_override=torch.float32,
-        )
-        state_dict[f"{attn_prefix}.cema.omega"] = convert(
-            layer.attn.cema.omega,
-            dtype_override=torch.float32,
-        )
-
-        # RMSNorm
-        if layer.attn.rmsnorm.gamma is not None:
-            state_dict[f"{attn_prefix}.rmsnorm.gamma"] = convert(
-                layer.attn.rmsnorm.gamma,
-                dtype_override=torch.float32,
-            )
-
-        # Linear projections
-        for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
-            proj = getattr(layer.attn, proj_name)
-            state_dict[f"{attn_prefix}.{proj_name}.weight"] = convert(proj.weight)
-            if proj.bias is not None:
-                state_dict[f"{attn_prefix}.{proj_name}.bias"] = convert(proj.bias)
-
-        state_dict[f"{attn_prefix}.gamma"] = convert(
-            layer.attn.gamma,
-            dtype_override=torch.float32,
-        )
-        state_dict[f"{attn_prefix}.beta"] = convert(
-            layer.attn.beta,
-            dtype_override=torch.float32,
-        )
-
-        # Rotary embedding (inv_freq is not a persistent buffer in PyTorch)
-        if include_rope_inv_freq:
-            state_dict[f"{attn_prefix}.inner.rope.inv_freq"] = convert(
-                layer.attn.inner.rotary.inv_freq
-            )
-
-        # FFN norms
-        if layer.ffn.norm.weight is not None:
-            state_dict[f"{ffn_prefix}.norm.weight"] = convert(
-                layer.ffn.norm.weight,
-                dtype_override=torch.float32,
-            )
-        if layer.ffn.norm.bias is not None:
-            state_dict[f"{ffn_prefix}.norm.bias"] = convert(
-                layer.ffn.norm.bias,
-                dtype_override=torch.float32,
-            )
-
-        # FFN linear layers
-        for fc_name in ["fc1", "fc2", "fc3"]:
-            fc = getattr(layer.ffn, fc_name, None)
-            if fc is None:
-                continue
-            state_dict[f"{ffn_prefix}.{fc_name}.weight"] = convert(fc.weight)
-            if fc.bias is not None:
-                state_dict[f"{ffn_prefix}.{fc_name}.bias"] = convert(fc.bias)
-
-    # Final norm
-    if model.model.norm.weight is not None:
-        state_dict["model.norm.weight"] = convert(
-            model.model.norm.weight,
-            dtype_override=torch.float32,
-        )
-    if model.model.norm.bias is not None:
-        state_dict["model.norm.bias"] = convert(
-            model.model.norm.bias,
-            dtype_override=torch.float32,
-        )
-
-    # LM head - always emit for PyTorch strict loading compatibility
-    if not model.tied and model.lm_head is not None:
-        state_dict["lm_head.weight"] = convert(model.lm_head.weight)
-    elif model.tied:
-        # Clone to avoid SafeTensors shared memory error
-        state_dict["lm_head.weight"] = convert(model.model.embed.weight).clone()
-
-    return state_dict
+        if torch.count_nonzero(tensor).item() != 0:
+            raise ValueError(f"{prefix}.{name} must be zero when prior_count is zero")
 
 
-def load_weights_from_torch(
+def load_upstream_state_dict(
     model: MegalodonForCausalLM,
     state_dict: StateDict,
 ) -> MegalodonForCausalLM:
-    """Load PyTorch weights into a JAX MegalodonForCausalLM model.
+    """Load an exact released world-size-one state dictionary, strictly."""
+    expected = set(export_upstream_state_dict(model))
+    actual = set(state_dict)
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise ValueError(
+            f"strict original-upstream key mismatch: missing={missing}, unexpected={unexpected}"
+        )
 
-    The function maps PyTorch state dict keys to JAX model paths and uses
-    eqx.tree_at to update the model with loaded weights.
+    config = model.config
+    native: dict[str, Array] = {
+        "model.embed.weight": _jax_float(state_dict["embed.weight"], "embed.weight"),
+    }
+    expected_freqs = _rope_frequencies(config)
+    actual_freqs = state_dict["rope.freqs"].detach().float().cpu().numpy()
+    if actual_freqs.shape != expected_freqs.shape or not np.allclose(
+        actual_freqs,
+        expected_freqs,
+        atol=2e-6,
+        rtol=2e-6,
+    ):
+        raise ValueError("upstream rope.freqs is incompatible with config RoPE coordinates")
 
-    Weight mapping:
-        - model.embed.weight → model.model.embed.weight
-        - model.layers.{i}.attn.* → model.model.layers[i].attn.*
-        - model.layers.{i}.ffn.* → model.model.layers[i].ffn.*
-        - model.norm.* → model.model.norm.*
-        - lm_head.weight → (skipped, tied to embed)
+    for index, layer in enumerate(model.model.layers):
+        ap = f"layers.{index}.mega"
+        jp = f"model.layers.{index}.attn"
+        _validate_prior(state_dict, f"{ap}.timenorm", layer.attn.timenorm.num_groups)
+        native[f"{jp}.timenorm.weight"] = _jax_float(
+            state_dict[f"{ap}.timenorm.weight"],
+            f"{ap}.timenorm.weight",
+        )
+        native[f"{jp}.timenorm.bias"] = _jax_float(
+            state_dict[f"{ap}.timenorm.bias"],
+            f"{ap}.timenorm.bias",
+        )
+        for name in ("alpha", "delta", "theta"):
+            native[f"{jp}.cema.{name}"] = _jax_float(
+                state_dict[f"{ap}.cema.{name}"],
+                f"{ap}.cema.{name}",
+            )
+        gamma = _jax_float(state_dict[f"{ap}.cema.gamma"], f"{ap}.cema.gamma")
+        expected_gamma = (config.model_dim, config.cema_ndim, 2)
+        if gamma.shape != expected_gamma:
+            raise ValueError(f"{ap}.cema.gamma has shape {gamma.shape}, expected {expected_gamma}")
+        native[f"{jp}.cema.gamma_real"] = gamma[..., 0]
+        native[f"{jp}.cema.gamma_imag"] = gamma[..., 1]
+        omega = _jax_float(state_dict[f"{ap}.cema.omega"], f"{ap}.cema.omega")
+        if omega.shape != (config.model_dim, 1):
+            raise ValueError(f"{ap}.cema.omega must have shape {(config.model_dim, 1)}")
+        native[f"{jp}.cema.omega"] = omega[:, 0]
 
-    Note: PyTorch nn.Linear stores weight as (out_features, in_features),
-    which matches Equinox convention. No transpose is needed.
+        if layer.attn.rmsnorm.gamma is not None:
+            native[f"{jp}.rmsnorm.gamma"] = _jax_float(
+                state_dict[f"{ap}.rmsnorm.weight"],
+                f"{ap}.rmsnorm.weight",
+            )
+        for name in ("wz", "wv", "wr", "wh1", "wh2"):
+            native[f"{jp}.{name}.weight"] = _jax_float(
+                state_dict[f"{ap}.{name}.weight"],
+                f"{ap}.{name}.weight",
+            )
+            if getattr(layer.attn, name).bias is not None:
+                native[f"{jp}.{name}.bias"] = _jax_float(
+                    state_dict[f"{ap}.{name}.bias"],
+                    f"{ap}.{name}.bias",
+                )
+        native[f"{jp}.gamma"] = _jax_float(state_dict[f"{ap}.gamma"], f"{ap}.gamma")
+        native[f"{jp}.beta"] = _jax_float(state_dict[f"{ap}.beta"], f"{ap}.beta")
 
-    :param MegalodonForCausalLM model: Initialized JAX model.
-    :param StateDict state_dict: PyTorch state dict.
-    :raises KeyError: If expected keys are missing.
-    :return MegalodonForCausalLM: Model with loaded weights.
-    """
+        fp = f"layers.{index}.nffn"
+        jfp = f"model.layers.{index}.ffn"
+        if layer.ffn.norm.weight is not None:
+            native[f"{jfp}.norm.weight"] = _jax_float(
+                state_dict[f"{fp}.norm.weight"],
+                f"{fp}.norm.weight",
+            )
+            native[f"{jfp}.norm.bias"] = _jax_float(
+                state_dict[f"{fp}.norm.bias"],
+                f"{fp}.norm.bias",
+            )
+        for name in ("fc1", "fc2", "fc3"):
+            projection = getattr(layer.ffn, name)
+            if projection is not None:
+                native[f"{jfp}.{name}.weight"] = _jax_float(
+                    state_dict[f"{fp}.{name}.weight"],
+                    f"{fp}.{name}.weight",
+                )
+        if layer.ffn.alpha is not None:
+            native[f"{jfp}.alpha"] = _jax_float(
+                state_dict[f"{fp}.alpha"],
+                f"{fp}.alpha",
+            )
 
-    def get_weight(key: str) -> Array:
-        """Retrieve a weight from the state dict or raise KeyError.
-
-        :param str key: State dict key to fetch.
-        :raises KeyError: If the key is missing.
-        :return Array: JAX array for the parameter.
-        """
-        if key not in state_dict:
-            raise KeyError(f"Missing key in state_dict: {key}")
-        return _to_jax(state_dict[key])
-
-    def has_key(key: str) -> bool:
-        """Check whether a key exists in the state dict.
-
-        :param str key: State dict key to query.
-        :return bool: True if the key exists.
-        """
-        return key in state_dict
-
-    cfg = model.config
-    norm_affine = cfg.norm_affine
-    swiglu = cfg.swiglu
-
-    # Embedding - validate shape before loading
-    embed_weight = get_weight("model.embed.weight")
-    expected_embed = (cfg.vocab_size, cfg.model_dim)
-    _validate_shape(embed_weight, expected_embed, "model.embed.weight")
-    model = eqx.tree_at(
-        lambda m: m.model.embed.weight,
-        model,
-        embed_weight,
+    _validate_prior(state_dict, "output.final_norm", model.model.norm.num_groups)
+    native["model.norm.weight"] = _jax_float(
+        state_dict["output.final_norm.weight"],
+        "output.final_norm.weight",
     )
+    native["model.norm.bias"] = _jax_float(
+        state_dict["output.final_norm.bias"],
+        "output.final_norm.bias",
+    )
+    output = _jax_float(state_dict["output.output.weight"], "output.output.weight")
+    if model.tied:
+        if not np.array_equal(np.asarray(output), np.asarray(native["model.embed.weight"])):
+            raise ValueError("tied upstream output weight does not equal embedding weight")
+    else:
+        native["lm_head.weight"] = output
 
-    # Validate layer count before loading layers
-    num_layers = len(model.model.layers)
-    ckpt_layers = sum(1 for k in state_dict if k.startswith("model.layers.") and ".cema.alpha" in k)
-    if ckpt_layers != num_layers:
+    loaded, _ = _apply_parameters(model, native)
+    return loaded
+
+
+def _replicated(shards: list[torch.Tensor], key: str) -> torch.Tensor:
+    first = shards[0]
+    if any(not torch.equal(first, shard) for shard in shards[1:]):
+        raise ValueError(f"replicated upstream shard key differs across ranks: {key}")
+    return first
+
+
+def _merge_axis(key: str) -> int | None:
+    if key == "embed.weight" or key == "output.output.weight":
+        return 1
+    if key == "rope.freqs" or key.endswith(".prior_count"):
+        return None
+    if ".rmsnorm.weight" in key or ".nffn.norm." in key:
+        return None
+    if ".cema." in key:
+        return 0
+    if key.endswith(".wh2.weight") or key.endswith(".fc2.weight"):
+        return 1
+    if key.endswith(".mega.gamma") or key.endswith(".mega.beta"):
+        return 1
+    concat_zero = (
+        ".timenorm." in key
+        or key.endswith(".wz.weight")
+        or key.endswith(".wz.bias")
+        or key.endswith(".wv.weight")
+        or key.endswith(".wv.bias")
+        or key.endswith(".wr.weight")
+        or key.endswith(".wr.bias")
+        or key.endswith(".wh1.weight")
+        or key.endswith(".wh1.bias")
+        or key.endswith(".fc1.weight")
+        or key.endswith(".fc3.weight")
+        or key.endswith(".nffn.alpha")
+        or key.startswith("output.final_norm.")
+    )
+    if concat_zero:
+        return 0
+    raise ValueError(f"unknown original-upstream model-parallel key: {key}")
+
+
+def _load_consolidated_directory(path: Path) -> StateDict:
+    config_path = path / "consolidate_config.json"
+    if not config_path.is_file():
         raise ValueError(
-            f"Layer count mismatch: checkpoint has {ckpt_layers} layers, "
-            f"config expects {num_layers} layers"
+            "raw FSDP checkpoints are unsupported; run the original upstream "
+            "consolidation script first"
         )
+    with config_path.open(encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    world_size = int(metadata["model_parallel_size"])
+    files = (
+        [path / "consolidated.pth"]
+        if world_size == 1
+        else [path / f"consolidated.{rank:02d}.pth" for rank in range(world_size)]
+    )
+    for file in files:
+        if not file.is_file():
+            raise FileNotFoundError(file)
+    shards = [torch.load(file, map_location="cpu", weights_only=True) for file in files]
+    if any(not isinstance(shard, dict) for shard in shards):
+        raise ValueError("consolidated checkpoint shard is not a state dictionary")
+    key_sets = [set(shard) for shard in shards]
+    if any(keys != key_sets[0] for keys in key_sets[1:]):
+        raise ValueError("consolidated checkpoint shards have different key sets")
 
-    for i in range(num_layers):
-        prefix = f"model.layers.{i}"
-
-        # ----- Attention Block -----
-        attn_prefix = f"{prefix}.attn"
-
-        # TimestepNorm
-        if norm_affine:
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].attn.timenorm.weight,
-                model,
-                get_weight(f"{attn_prefix}.timenorm.weight"),
-            )
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].attn.timenorm.bias,
-                model,
-                get_weight(f"{attn_prefix}.timenorm.bias"),
-            )
-        else:
-            if has_key(f"{attn_prefix}.timenorm.weight") or has_key(f"{attn_prefix}.timenorm.bias"):
-                raise ValueError(
-                    "Checkpoint provides TimestepNorm affine parameters but config.norm_affine=False."
-                )
-
-        # ComplexEMA - validate shapes on first layer
-        alpha_weight = get_weight(f"{attn_prefix}.cema.alpha")
-        if i == 0:
-            expected_alpha = (cfg.model_dim, cfg.cema_ndim, 1)
-            _validate_shape(alpha_weight, expected_alpha, f"{attn_prefix}.cema.alpha")
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.cema.alpha,
-            model,
-            alpha_weight,
-        )
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.cema.delta,
-            model,
-            get_weight(f"{attn_prefix}.cema.delta"),
-        )
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.cema.theta,
-            model,
-            get_weight(f"{attn_prefix}.cema.theta"),
-        )
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.cema.gamma_real,
-            model,
-            get_weight(f"{attn_prefix}.cema.gamma_real"),
-        )
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.cema.gamma_imag,
-            model,
-            get_weight(f"{attn_prefix}.cema.gamma_imag"),
-        )
-        omega_weight = get_weight(f"{attn_prefix}.cema.omega")
-        if i == 0:
-            _validate_shape(omega_weight, (cfg.model_dim,), f"{attn_prefix}.cema.omega")
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.cema.omega,
-            model,
-            omega_weight,
-        )
-
-        # RMSNorm
-        if norm_affine:
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].attn.rmsnorm.gamma,
-                model,
-                get_weight(f"{attn_prefix}.rmsnorm.gamma"),
-            )
-        elif has_key(f"{attn_prefix}.rmsnorm.gamma"):
-            raise ValueError(
-                "Checkpoint provides RMSNorm affine parameters but config.norm_affine=False."
-            )
-
-        # Linear projections - validate wz shape on first layer
-        for proj_name in ["wz", "wv", "wr", "wh1", "wh2"]:
-            proj_weight = get_weight(f"{attn_prefix}.{proj_name}.weight")
-            if i == 0 and proj_name == "wz":
-                expected_wz = (cfg.z_dim, cfg.model_dim)
-                _validate_shape(proj_weight, expected_wz, f"{attn_prefix}.wz.weight")
-            model = eqx.tree_at(
-                lambda m, idx=i, pn=proj_name: getattr(m.model.layers[idx].attn, pn).weight,
-                model,
-                proj_weight,
-            )
-            if has_key(f"{attn_prefix}.{proj_name}.bias"):
-                model = eqx.tree_at(
-                    lambda m, idx=i, pn=proj_name: getattr(m.model.layers[idx].attn, pn).bias,
-                    model,
-                    get_weight(f"{attn_prefix}.{proj_name}.bias"),
-                )
-
-        # Per-head affine (gamma, beta)
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.gamma,
-            model,
-            get_weight(f"{attn_prefix}.gamma"),
-        )
-        model = eqx.tree_at(
-            lambda m, idx=i: m.model.layers[idx].attn.beta,
-            model,
-            get_weight(f"{attn_prefix}.beta"),
-        )
-
-        # ChunkedAttention (inner) - rotary embedding
-        if has_key(f"{attn_prefix}.inner.rope.inv_freq"):
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].attn.inner.rotary.inv_freq,
-                model,
-                get_weight(f"{attn_prefix}.inner.rope.inv_freq"),
-            )
-
-        # ----- FFN Block -----
-        ffn_prefix = f"{prefix}.ffn"
-
-        # LayerNorm
-        if norm_affine:
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].ffn.norm.weight,
-                model,
-                get_weight(f"{ffn_prefix}.norm.weight"),
-            )
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].ffn.norm.bias,
-                model,
-                get_weight(f"{ffn_prefix}.norm.bias"),
-            )
-        else:
-            if has_key(f"{ffn_prefix}.norm.weight") or has_key(f"{ffn_prefix}.norm.bias"):
-                raise ValueError(
-                    "Checkpoint provides LayerNorm affine parameters but config.norm_affine=False."
-                )
-
-        # FC layers - validate fc1 shape on first layer
-        for fc_name in ["fc1", "fc2"]:
-            fc_weight = get_weight(f"{ffn_prefix}.{fc_name}.weight")
-            if i == 0 and fc_name == "fc1":
-                expected_fc1 = (cfg.ffn_hidden_dim, cfg.model_dim)
-                _validate_shape(fc_weight, expected_fc1, f"{ffn_prefix}.fc1.weight")
-            model = eqx.tree_at(
-                lambda m, idx=i, fn=fc_name: getattr(m.model.layers[idx].ffn, fn).weight,
-                model,
-                fc_weight,
-            )
-            if has_key(f"{ffn_prefix}.{fc_name}.bias"):
-                model = eqx.tree_at(
-                    lambda m, idx=i, fn=fc_name: getattr(m.model.layers[idx].ffn, fn).bias,
-                    model,
-                    get_weight(f"{ffn_prefix}.{fc_name}.bias"),
-                )
-
-        # fc3 for SwiGLU (optional)
-        if swiglu:
-            model = eqx.tree_at(
-                lambda m, idx=i: m.model.layers[idx].ffn.fc3.weight,
-                model,
-                get_weight(f"{ffn_prefix}.fc3.weight"),
-            )
-            if has_key(f"{ffn_prefix}.fc3.bias"):
-                model = eqx.tree_at(
-                    lambda m, idx=i: m.model.layers[idx].ffn.fc3.bias,
-                    model,
-                    get_weight(f"{ffn_prefix}.fc3.bias"),
-                )
-        elif has_key(f"{ffn_prefix}.fc3.weight") or has_key(f"{ffn_prefix}.fc3.bias"):
-            raise ValueError("Checkpoint includes SwiGLU weights but config.swiglu=False.")
-
-    # Final norm
-    if norm_affine:
-        model = eqx.tree_at(
-            lambda m: m.model.norm.weight,
-            model,
-            get_weight("model.norm.weight"),
-        )
-        model = eqx.tree_at(
-            lambda m: m.model.norm.bias,
-            model,
-            get_weight("model.norm.bias"),
-        )
-    elif has_key("model.norm.weight") or has_key("model.norm.bias"):
-        raise ValueError(
-            "Checkpoint provides final norm affine parameters but config.norm_affine=False."
-        )
-
-    # lm_head.weight - require for untied configs
-    if not model.tied and model.lm_head is not None:
-        if not has_key("lm_head.weight"):
-            raise KeyError("Missing key in state_dict: lm_head.weight")
-        lm_head_weight = get_weight("lm_head.weight")
-        lm_out = cfg.vocab_size if cfg.output_size == -1 else cfg.output_size
-        expected_lm_head = (lm_out, cfg.model_dim)
-        _validate_shape(lm_head_weight, expected_lm_head, "lm_head.weight")
-        model = eqx.tree_at(
-            lambda m: m.lm_head.weight,
-            model,
-            lm_head_weight,
-        )
-
-    return ensure_sensitive_param_dtype(model)
+    merged: StateDict = {}
+    for key in sorted(key_sets[0]):
+        values = [shard[key] for shard in shards]
+        if any(not isinstance(value, torch.Tensor) for value in values):
+            raise TypeError(f"consolidated value {key!r} is not a tensor")
+        axis = _merge_axis(key)
+        merged[key] = _replicated(values, key) if axis is None else torch.cat(values, dim=axis)
+    return merged
 
 
-def load_from_pretrained(
+def load_upstream_checkpoint(
     path: str | Path,
     config: MegalodonConfig,
-    dtype: jnp.dtype = jnp.float32,
     *,
     key: Array,
 ) -> MegalodonForCausalLM:
-    """Load a MegalodonForCausalLM from a checkpoint file.
-
-    Supports .safetensors, .pt, and .bin formats.
-
-    :param str | Path path: Path to checkpoint file.
-    :param MegalodonConfig config: Model configuration.
-    :param jnp.dtype dtype: Target dtype for parameters (sensitive params stay fp32).
-    :param Array key: PRNG key for model initialization.
-    :raises FileNotFoundError: If checkpoint file doesn't exist.
-    :return MegalodonForCausalLM: Model with loaded weights.
-    """
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"Checkpoint not found: {path}")
-
-    # Load state dict
-    if path.suffix == ".safetensors":
-        from safetensors.torch import load_file
-
-        state_dict = load_file(str(path), device="cpu")
+    """Load a strict original-upstream file or consolidated directory."""
+    source = Path(path)
+    if source.is_dir():
+        state = _load_consolidated_directory(source)
     else:
-        state_dict = torch.load(path, map_location="cpu", weights_only=True)
-
-    # Handle nested state dict (e.g., from checkpoint with optimizer state)
-    if "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-    if "model" in state_dict and isinstance(state_dict["model"], dict):
-        state_dict = state_dict["model"]
-
-    # Initialize JAX model
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        if source.suffix == ".safetensors":
+            raise ValueError(
+                "metadata-free or Hugging Face SafeTensors are not original-upstream checkpoints"
+            )
+        state = torch.load(source, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict) or any(not isinstance(name, str) for name in state):
+            raise ValueError("original-upstream checkpoint is not a flat string-keyed state dict")
     model = MegalodonForCausalLM(config, key=key)
-
-    # Load weights
-    model = load_weights_from_torch(model, state_dict)
-
-    # Apply dtype cast if requested
-    if dtype != jnp.float32:
-
-        def cast_arrays(x: Any) -> Any:
-            """Cast floating-point arrays to the target dtype.
-
-            :param Any x: Array leaf to cast when floating point.
-            :return Any: Casted array or original input.
-            """
-            if isinstance(x, jnp.ndarray) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(dtype)
-            return x
-
-        model = jax.tree.map(cast_arrays, model)
-        model = ensure_sensitive_param_dtype(model)
-
-    return ensure_sensitive_param_dtype(model)
+    return load_upstream_state_dict(model, state)
 
 
-def save_safetensors(
-    model: MegalodonForCausalLM,
-    path: str | Path,
-    *,
-    dtype: torch.dtype | None = None,
-    include_rope_inv_freq: bool = False,
-) -> None:
-    """Save a MegalodonForCausalLM to SafeTensors format.
-
-    :param MegalodonForCausalLM model: JAX model to export.
-    :param str | Path path: Output path for the .safetensors file.
-    :param torch.dtype | None dtype: Optional dtype for exported tensors.
-    :param bool include_rope_inv_freq: Whether to include RoPE inv_freq buffers.
-    :return None: None.
-    """
-    from safetensors.torch import save_file
-
-    state_dict = convert_jax_to_torch(
-        model,
-        dtype=dtype,
-        include_rope_inv_freq=include_rope_inv_freq,
+def _removed(name: str, replacement: str) -> NoReturn:
+    raise RuntimeError(
+        f"{name} was removed because it ambiguously targeted a different schema; use {replacement}"
     )
-    save_file(state_dict, str(path))
+
+
+def convert_jax_to_torch(*args: Any, **kwargs: Any) -> NoReturn:
+    """Reject the historical Hugging-Face-shaped exporter."""
+    del args, kwargs
+    _removed("convert_jax_to_torch", "export_upstream_state_dict")
+
+
+def load_weights_from_torch(*args: Any, **kwargs: Any) -> NoReturn:
+    """Reject the historical Hugging-Face-shaped loader."""
+    del args, kwargs
+    _removed("load_weights_from_torch", "load_upstream_state_dict")
+
+
+def load_from_pretrained(*args: Any, **kwargs: Any) -> NoReturn:
+    """Reject schema guessing between native and upstream checkpoints."""
+    del args, kwargs
+    _removed("load_from_pretrained", "load_checkpoint or load_upstream_checkpoint")
+
+
+def save_safetensors(*args: Any, **kwargs: Any) -> NoReturn:
+    """Reject the historical metadata-free SafeTensors writer."""
+    del args, kwargs
+    _removed("save_safetensors", "save_checkpoint")

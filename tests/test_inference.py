@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -11,10 +11,20 @@ import numpy as np
 import pytest
 
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
+from megalodon_jax.checkpoint import (
+    load_checkpoint,
+    load_inference_cache,
+    load_partial_checkpoint,
+    model_state_dict,
+    save_checkpoint,
+    save_inference_cache,
+)
 from megalodon_jax.convert import (
     convert_jax_to_torch,
+    export_upstream_state_dict,
     load_from_pretrained,
-    load_weights_from_torch,
+    load_upstream_checkpoint,
+    load_upstream_state_dict,
     save_safetensors,
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token, trim_cache
@@ -479,388 +489,185 @@ class TestSamplingAndGeneration:
 
 
 class TestConversion:
-    """Weight conversion + SafeTensors roundtrip."""
+    """Strict native and original-upstream checkpoint tests."""
 
-    @pytest.mark.torch_ref
-    def test_torch_roundtrip_matches_logits(self) -> None:
-        """Ensure JAX export/load roundtrip preserves logits.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
+    def test_native_v2_roundtrip_is_exact(self, tmp_path: Path) -> None:
+        """Native save/reload preserves every tensor and model output."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        state_dict = convert_jax_to_torch(model)
-
-        model_copy = MegalodonForCausalLM(config, key=jax.random.PRNGKey(1))
-        model_copy = load_weights_from_torch(model_copy, state_dict)
-
-        input_ids = jnp.array([[1, 2, 3, 4]], dtype=jnp.int32)
-        logits1, _ = model(input_ids, deterministic=True)
-        logits2, _ = model_copy(input_ids, deterministic=True)
-
-        np.testing.assert_allclose(np.array(logits1), np.array(logits2), rtol=1e-5, atol=1e-5)
-
-    def test_safetensors_roundtrip(self, tmp_path: Path) -> None:
-        """Ensure SafeTensors roundtrip preserves logits.
-
-        :param Path tmp_path: Temporary directory fixture.
-        :return None: None.
-        """
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
         path = tmp_path / "model.safetensors"
-        save_safetensors(model, path)
 
-        loaded = load_from_pretrained(
-            str(path),
-            config=config,
+        save_checkpoint(model, path)
+        loaded = load_checkpoint(path, key=jax.random.PRNGKey(1))
+
+        expected = model_state_dict(model)
+        actual = model_state_dict(loaded)
+        assert expected.keys() == actual.keys()
+        for name in expected:
+            np.testing.assert_array_equal(np.asarray(actual[name]), np.asarray(expected[name]))
+
+        tokens = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
+        expected_logits, _ = model(tokens)
+        actual_logits, _ = loaded(tokens)
+        np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
+
+    def test_metadata_free_and_legacy_files_are_rejected(self, tmp_path: Path) -> None:
+        """SafeTensors without explicit v2 semantics must never be guessed."""
+        from safetensors.flax import save_file
+
+        path = tmp_path / "legacy.safetensors"
+        save_file({"weight": jnp.ones((2, 2), dtype=jnp.float32)}, str(path))
+        with pytest.raises(ValueError, match="legacy JAX checkpoint"):
+            load_checkpoint(path, key=jax.random.PRNGKey(0))
+
+    def test_partial_restore_requires_explicit_names(self, tmp_path: Path) -> None:
+        """Partial restore reports restored and freshly initialized leaves."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        path = tmp_path / "partial.safetensors"
+        save_checkpoint(model, path)
+
+        loaded, report = load_partial_checkpoint(
+            path,
+            config,
+            include={"model.embed.weight"},
             key=jax.random.PRNGKey(1),
         )
-
-        input_ids = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
-        logits_orig, _ = model(input_ids, deterministic=True)
-        logits_loaded, _ = loaded(input_ids, deterministic=True)
-
-        np.testing.assert_allclose(
-            np.array(logits_orig),
-            np.array(logits_loaded),
-            rtol=1e-5,
-            atol=1e-5,
-        )
-
-    @pytest.mark.torch_ref
-    def test_export_loads_in_torch_strict(self, tmp_path: Path) -> None:
-        """Ensure JAX export loads strictly in the PyTorch reference.
-
-        :param Path tmp_path: Temporary directory fixture.
-        :return None: None.
-        """
-        torch = pytest.importorskip("torch")
-        megalodon = pytest.importorskip("megalodon")
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        path = tmp_path / "model.safetensors"
-        save_safetensors(model, path)
-
-        config_kwargs = asdict(config)
-        config_kwargs["gradient_checkpointing"] = config.use_checkpoint
-        config_kwargs.pop("use_checkpoint", None)
-        config_kwargs.pop("param_dtype", None)
-        config_kwargs.pop("compute_dtype", None)
-        config_kwargs.pop("accum_dtype", None)
-        config_kwargs.pop("softmax_dtype", None)
-        config_kwargs.pop("gemm_backend", None)
-        torch_config = megalodon.MegalodonConfig(**config_kwargs)
-        torch_model = megalodon.MegalodonForCausalLM(torch_config).eval()
-
-        from safetensors.torch import load_file
-
-        state_dict = load_file(str(path))
-        incompat = torch_model.load_state_dict(state_dict, strict=True)
-        assert not incompat.missing_keys
-        assert not incompat.unexpected_keys
-
-        input_ids = torch.randint(0, config.vocab_size, (2, 8))
-        with torch.no_grad():
-            out = torch_model(
-                input_ids=input_ids, attention_mask=None, use_cache=False, return_dict=True
-            )
-        assert not torch.isnan(out.logits).any()
-
-    @pytest.mark.torch_ref
-    def test_load_weights_requires_lm_head_for_untied(self) -> None:
-        """Require lm_head weight for untied head loading.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config = MegalodonConfig(
-            vocab_size=64,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=8,
-            norm_num_groups=8,
-            output_size=32,
-        )
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        state_dict = convert_jax_to_torch(model)
-        state_dict.pop("lm_head.weight")
-
-        with pytest.raises(KeyError, match="lm_head.weight"):
-            load_weights_from_torch(
-                MegalodonForCausalLM(config, key=jax.random.PRNGKey(1)),
-                state_dict,
-            )
-
-    @pytest.mark.torch_ref
-    def test_load_weights_rejects_swiglu_mismatch(self) -> None:
-        """Reject mismatched SwiGLU configs on load.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config_swiglu = MegalodonConfig(
-            vocab_size=64,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=8,
-            norm_num_groups=8,
-            swiglu=True,
-        )
-        model_swiglu = MegalodonForCausalLM(config_swiglu, key=jax.random.PRNGKey(0))
-        state_dict = convert_jax_to_torch(model_swiglu)
-
-        config_no_swiglu = MegalodonConfig(
-            vocab_size=64,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=8,
-            norm_num_groups=8,
-            swiglu=False,
-        )
-
-        with pytest.raises(ValueError, match="swiglu"):
-            load_weights_from_torch(
-                MegalodonForCausalLM(config_no_swiglu, key=jax.random.PRNGKey(1)),
-                state_dict,
-            )
-
-    @pytest.mark.torch_ref
-    def test_tied_model_export_has_lm_head(self) -> None:
-        """Ensure tied models export lm_head for strict loading.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config = small_config()  # default is tied (output_size=-1)
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        assert model.tied, "Default model should be tied"
-
-        state_dict = convert_jax_to_torch(model)
-
-        # Must have lm_head.weight for PyTorch strict loading compatibility
-        assert "lm_head.weight" in state_dict
-        assert "model.embed.weight" in state_dict
-
-        # For tied models, lm_head.weight should equal embed.weight
         np.testing.assert_array_equal(
-            state_dict["lm_head.weight"].numpy(),
-            state_dict["model.embed.weight"].numpy(),
+            np.asarray(loaded.model.embed.weight),
+            np.asarray(model.model.embed.weight),
         )
+        assert report["restored"] == ["model.embed.weight"]
+        assert report["initialized"]
+        with pytest.raises(ValueError, match="partial restore selection"):
+            load_partial_checkpoint(
+                path,
+                config,
+                include={"not.a.parameter"},
+                key=jax.random.PRNGKey(1),
+            )
 
     @pytest.mark.torch_ref
-    def test_export_skips_rope_inv_freq_by_default(self) -> None:
-        """Ensure default export omits RoPE inv_freq.
-
-        :return None: None.
-        """
+    def test_original_upstream_roundtrip_and_keyspace(self) -> None:
+        """Exact released keys round-trip without transposes or schema aliases."""
         pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state = export_upstream_state_dict(model)
 
-        state_dict = convert_jax_to_torch(model)
+        assert "embed.weight" in state
+        assert "rope.freqs" in state
+        assert "layers.0.mega.cema.gamma" in state
+        assert "layers.0.nffn.fc1.weight" in state
+        assert "output.final_norm.weight" in state
+        assert "output.output.weight" in state
+        assert "model.embed.weight" not in state
+        assert "layers.0.mega.wh2.bias" not in state
+        assert "layers.0.nffn.fc1.bias" not in state
 
-        assert not any(key.endswith("inner.rope.inv_freq") for key in state_dict)
+        loaded = load_upstream_state_dict(
+            MegalodonForCausalLM(config, key=jax.random.PRNGKey(1)),
+            state,
+        )
+        tokens = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
+        expected_logits, _ = model(tokens)
+        actual_logits, _ = loaded(tokens)
+        np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
 
     @pytest.mark.torch_ref
-    def test_export_includes_rope_inv_freq_when_requested(self) -> None:
-        """Ensure explicit export includes RoPE inv_freq.
-
-        :return None: None.
-        """
+    def test_original_upstream_strict_failure(self) -> None:
+        """Missing, unexpected, and Hugging-Face-shaped keys fail closed."""
         pytest.importorskip("torch")
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        state_dict = convert_jax_to_torch(model, include_rope_inv_freq=True)
-
-        assert "model.layers.0.attn.inner.rope.inv_freq" in state_dict
+        state = export_upstream_state_dict(model)
+        state.pop("layers.0.mega.wh2.weight")
+        state["model.embed.weight"] = state["embed.weight"]
+        with pytest.raises(ValueError, match="strict original-upstream key mismatch"):
+            load_upstream_state_dict(model, state)
 
     @pytest.mark.torch_ref
-    def test_export_dtype_casting_keeps_cema_gamma_fp32(self) -> None:
-        """Ensure dtype export keeps CEMA gamma in fp32.
+    def test_tied_output_contract(self) -> None:
+        """Tied upstream export emits an equal output tensor and validates it."""
+        pytest.importorskip("torch")
+        config = replace(small_config(), share_emb=True)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state = export_upstream_state_dict(model)
+        assert state["output.output.weight"].data_ptr() != state["embed.weight"].data_ptr()
+        assert state["output.output.weight"].equal(state["embed.weight"])
 
-        :return None: None.
-        """
+        state["output.output.weight"][0, 0] += 1.0
+        with pytest.raises(ValueError, match="does not equal embedding"):
+            load_upstream_state_dict(model, state)
+
+    @pytest.mark.torch_ref
+    def test_consolidated_model_parallel_shards(self, tmp_path: Path) -> None:
+        """Declared model-parallel axes merge back into a world-size-one model."""
         torch = pytest.importorskip("torch")
+        from megalodon_jax.convert import _merge_axis
+
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        state = export_upstream_state_dict(model)
+        shards: list[dict[str, torch.Tensor]] = [{}, {}]
+        for name, value in state.items():
+            axis = _merge_axis(name)
+            if axis is None:
+                shards[0][name] = value.clone()
+                shards[1][name] = value.clone()
+            else:
+                pieces = torch.chunk(value, 2, dim=axis)
+                assert len(pieces) == 2
+                shards[0][name] = pieces[0].clone()
+                shards[1][name] = pieces[1].clone()
 
-        state_dict = convert_jax_to_torch(model, dtype=torch.bfloat16)
-
-        assert state_dict["model.embed.weight"].dtype == torch.bfloat16
-        assert state_dict["model.layers.0.attn.cema.alpha"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.cema.delta"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.cema.theta"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.cema.gamma_real"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.cema.gamma_imag"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.cema.omega"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.gamma"].dtype == torch.float32
-        assert state_dict["model.layers.0.attn.beta"].dtype == torch.float32
-
-    @pytest.mark.torch_ref
-    def test_untied_model_export(self) -> None:
-        """Ensure untied models export separate lm_head weights.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config = MegalodonConfig(
-            vocab_size=64,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=8,
-            norm_num_groups=8,
-            output_size=32,  # Different from vocab_size -> untied
+        (tmp_path / "consolidate_config.json").write_text(
+            '{"model_parallel_size": 2, "dtype": "fp32"}',
+            encoding="utf-8",
         )
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        assert not model.tied, "Model should be untied with output_size != vocab_size"
-
-        state_dict = convert_jax_to_torch(model)
-
-        assert "lm_head.weight" in state_dict
-        assert "model.embed.weight" in state_dict
-
-        # For untied, shapes should differ
-        assert state_dict["lm_head.weight"].shape[0] == 32
-        assert state_dict["model.embed.weight"].shape[0] == 64
-
-    @pytest.mark.torch_ref
-    def test_shape_validation_error(self) -> None:
-        """Ensure shape mismatches raise a ValueError.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        state_dict = convert_jax_to_torch(model)
-
-        # Create model with different model_dim
-        config_wrong = MegalodonConfig(
-            vocab_size=64,
-            model_dim=128,  # Different from state_dict
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=8,
-            norm_num_groups=8,
-        )
-        model_wrong = MegalodonForCausalLM(config_wrong, key=jax.random.PRNGKey(1))
-
-        with pytest.raises(ValueError, match="Shape mismatch"):
-            load_weights_from_torch(model_wrong, state_dict)
-
-    @pytest.mark.torch_ref
-    def test_layer_count_mismatch_error(self) -> None:
-        """Ensure layer count mismatches raise a ValueError.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        state_dict = convert_jax_to_torch(model)
-
-        # Create model with different layer count
-        config_wrong = MegalodonConfig(
-            vocab_size=64,
-            model_dim=64,
-            num_layers=2,  # Different from state_dict (1 layer)
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=8,
-            norm_num_groups=8,
-        )
-        model_wrong = MegalodonForCausalLM(config_wrong, key=jax.random.PRNGKey(1))
-
-        with pytest.raises(ValueError, match="Layer count mismatch"):
-            load_weights_from_torch(model_wrong, state_dict)
-
-    @pytest.mark.torch_ref
-    def test_missing_key_error(self) -> None:
-        """Ensure missing keys raise a KeyError.
-
-        :return None: None.
-        """
-        pytest.importorskip("torch")
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        state_dict = convert_jax_to_torch(model)
-
-        # Remove a required key
-        del state_dict["model.embed.weight"]
-
-        model_copy = MegalodonForCausalLM(config, key=jax.random.PRNGKey(1))
-
-        with pytest.raises(KeyError, match="model.embed.weight"):
-            load_weights_from_torch(model_copy, state_dict)
-
-    def test_dtype_casting(self, tmp_path: Path) -> None:
-        """Ensure load_from_pretrained casts to requested dtype.
-
-        :param Path tmp_path: Temporary directory fixture.
-        :return None: None.
-        """
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        path = tmp_path / "model.safetensors"
-        save_safetensors(model, path)
-
-        loaded = load_from_pretrained(
-            str(path),
-            config=config,
-            dtype=jnp.bfloat16,
+        torch.save(shards[0], tmp_path / "consolidated.00.pth")
+        torch.save(shards[1], tmp_path / "consolidated.01.pth")
+        loaded = load_upstream_checkpoint(
+            tmp_path,
+            config,
             key=jax.random.PRNGKey(1),
         )
+        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        expected, _ = model(tokens)
+        actual, _ = loaded(tokens)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
-        # Check that floating point params are bf16
-        assert loaded.model.embed.weight.dtype == jnp.bfloat16
-        assert loaded.model.layers[0].attn.cema.alpha.dtype == jnp.float32
-        assert loaded.model.layers[0].attn.gamma.dtype == jnp.float32
-
-    def test_missing_file_error(self) -> None:
-        """Ensure load_from_pretrained raises for missing files.
-
-        :return None: None.
-        """
+    def test_cache_roundtrip_and_config_binding(self, tmp_path: Path) -> None:
+        """Serialized continuation state resumes exactly and rejects other configs."""
         config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
+        assert cache is not None
+        path = tmp_path / "cache.safetensors"
+        save_inference_cache(cache, path, config)
+        loaded = load_inference_cache(path, config)
 
-        with pytest.raises(FileNotFoundError, match="Checkpoint not found"):
-            load_from_pretrained(
-                "/nonexistent/path/model.safetensors",
-                config=config,
-                key=jax.random.PRNGKey(0),
-            )
+        for expected, actual in zip(
+            jax.tree_util.tree_leaves(cache),
+            jax.tree_util.tree_leaves(loaded),
+        ):
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+        continuation = jnp.asarray([[4, 5]], dtype=jnp.int32)
+        expected_logits, _ = model(continuation, cache=cache, return_cache=True)
+        actual_logits, _ = model(continuation, cache=loaded, return_cache=True)
+        np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
+
+        incompatible = replace(config, attention_window=4)
+        with pytest.raises(ValueError, match="fingerprint"):
+            load_inference_cache(path, incompatible)
+
+    def test_ambiguous_legacy_apis_refuse(self, tmp_path: Path) -> None:
+        """Historical schema-guessing entry points provide migration guidance."""
+        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
+        with pytest.raises(RuntimeError, match="export_upstream_state_dict"):
+            convert_jax_to_torch(model)
+        with pytest.raises(RuntimeError, match="save_checkpoint"):
+            save_safetensors(model, tmp_path / "model.safetensors")
+        with pytest.raises(RuntimeError, match="load_checkpoint"):
+            load_from_pretrained(tmp_path / "model.safetensors")
