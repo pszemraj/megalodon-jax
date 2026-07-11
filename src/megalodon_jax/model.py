@@ -305,7 +305,6 @@ class MegalodonModel(eqx.Module):
             num_features=config.model_dim,
             num_groups=config.norm_num_groups,
             eps=config.norm_eps,
-            affine=config.norm_affine,
         )
 
     def __call__(

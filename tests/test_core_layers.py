@@ -12,7 +12,6 @@ import pytest
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
 from megalodon_jax.layers.segments import segment_boundaries, segment_runs_and_local_positions
-from megalodon_jax.layers.timestep_norm import VARIANCE_FLOOR
 from tests.utils import require_torch_modeling, to_jax
 
 
@@ -155,6 +154,36 @@ class TestTimestepNormParity:
         # Output should be normalized (mean~0, var~1 per group, then scaled by 1.0)
         assert y.shape == x.shape
 
+    def test_exact_scalar_population_moments(self) -> None:
+        """Each valid token contributes all scalar features in its group."""
+        norm = TimestepNorm(4, 2, eps=0.0)
+        x = jnp.asarray([[[1.0, 3.0, 2.0, 6.0], [5.0, 7.0, 10.0, 14.0]]])
+
+        output, state = norm(x)
+
+        expected_output = np.asarray(
+            [[[-1.0, 1.0, -1.0, 1.0], [0.4472136, 1.3416408, 0.4472136, 1.3416408]]]
+        )
+        np.testing.assert_allclose(np.asarray(output), expected_output, atol=2e-6, rtol=2e-6)
+        np.testing.assert_array_equal(np.asarray(state.count), [2])
+        np.testing.assert_allclose(np.asarray(state.mean), [[4.0, 8.0]], atol=1e-6)
+        np.testing.assert_allclose(np.asarray(state.var), [[5.0, 20.0]], atol=1e-6)
+
+    def test_learned_prior_and_featurewise_contract(self) -> None:
+        """Released learned priors are trainable only when prior_count is positive."""
+        grouped = TimestepNorm(8, 2)
+        assert grouped.prior_mean is None
+        assert grouped.prior_logv is None
+
+        with pytest.raises(ValueError, match="prior_count > 1"):
+            TimestepNorm(8, 8)
+
+        featurewise = TimestepNorm(8, None, prior_count=2)
+        assert featurewise.prior_mean is not None
+        assert featurewise.prior_logv is not None
+        _, state = featurewise(jnp.ones((1, 1, 8), dtype=jnp.float32))
+        np.testing.assert_array_equal(np.asarray(state.count), [3])
+
     def test_mask_handling(self, random_seed: int) -> None:
         """Test that padding mask correctly excludes positions from statistics.
 
@@ -183,6 +212,7 @@ class TestTimestepNormParity:
 
         # Count should be 8 for all batch elements
         np.testing.assert_array_equal(np.array(state_masked.count), np.array([8, 8]))
+        np.testing.assert_array_equal(np.asarray(y_masked[:, 8:]), np.zeros((batch, 8, dim)))
 
     def test_state_dtype_fp32(self, random_seed: int) -> None:
         """Ensure running stats stay in float32 for bf16 inputs."""
@@ -219,22 +249,23 @@ class TestTimestepNormParity:
         x_np = np.array(x, dtype=np.float32)
         mask_np = np.array(mask)
         count = np.zeros((2,), dtype=np.int32)
-        mean = np.zeros((2, num_groups), dtype=np.float32)
-        m2 = np.ones((2, num_groups), dtype=np.float32)
+        values = [[[] for _ in range(num_groups)] for _ in range(2)]
 
         for t in range(x_np.shape[1]):
-            group_means = x_np[:, t].reshape(2, num_groups, group_size).mean(axis=-1)
             for b in range(2):
                 if not mask_np[b, t]:
                     continue
                 count[b] += 1
-                delta = group_means[b] - mean[b]
-                mean[b] += delta / count[b]
-                delta2 = group_means[b] - mean[b]
-                m2[b] += delta * delta2
+                grouped = x_np[b, t].reshape(num_groups, group_size)
+                for group in range(num_groups):
+                    values[b][group].extend(grouped[group].tolist())
 
-        var = np.where(count[:, None] > 0, m2 / count[:, None], 1.0)
-        var = np.maximum(var, VARIANCE_FLOOR)
+        mean = np.zeros((2, num_groups), dtype=np.float32)
+        var = np.ones((2, num_groups), dtype=np.float32)
+        for b in range(2):
+            for group in range(num_groups):
+                mean[b, group] = np.mean(values[b][group])
+                var[b, group] = np.var(values[b][group])
 
         np.testing.assert_array_equal(np.array(state.count), count)
         np.testing.assert_allclose(np.array(state.mean), mean, rtol=1e-5, atol=1e-5)
@@ -365,27 +396,26 @@ class TestTimestepNormSegmentReset:
         seg_np = np.array(segment_ids)
         mask_np = np.array(mask)
         count = np.zeros((2,), dtype=np.int32)
-        mean = np.zeros((2, num_groups), dtype=np.float32)
-        m2 = np.ones((2, num_groups), dtype=np.float32)
+        values = [[[] for _ in range(num_groups)] for _ in range(2)]
 
         for t in range(x_np.shape[1]):
-            group_means = x_np[:, t].reshape(2, num_groups, group_size).mean(axis=-1)
             for b in range(2):
                 if t > 0 and seg_np[b, t] != seg_np[b, t - 1]:
-                    # Segment boundary: fresh state
                     count[b] = 0
-                    mean[b] = 0.0
-                    m2[b] = 1.0
+                    values[b] = [[] for _ in range(num_groups)]
                 if not mask_np[b, t] or seg_np[b, t] == 0:
                     continue
                 count[b] += 1
-                delta = group_means[b] - mean[b]
-                mean[b] += delta / count[b]
-                delta2 = group_means[b] - mean[b]
-                m2[b] += delta * delta2
+                grouped = x_np[b, t].reshape(num_groups, group_size)
+                for group in range(num_groups):
+                    values[b][group].extend(grouped[group].tolist())
 
-        var = np.where(count[:, None] > 0, m2 / np.maximum(count[:, None], 1), 1.0)
-        var = np.maximum(var, VARIANCE_FLOOR)
+        mean = np.zeros((2, num_groups), dtype=np.float32)
+        var = np.ones((2, num_groups), dtype=np.float32)
+        for b in range(2):
+            for group in range(num_groups):
+                mean[b, group] = np.mean(values[b][group])
+                var[b, group] = np.var(values[b][group])
 
         np.testing.assert_array_equal(np.array(state.count), count)
         np.testing.assert_allclose(np.array(state.mean), mean, rtol=1e-5, atol=1e-5)

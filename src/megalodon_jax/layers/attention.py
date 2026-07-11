@@ -1223,7 +1223,9 @@ class MegalodonAttention(eqx.Module):
 
         # Sub-modules
         self.timenorm = TimestepNorm(
-            num_features=model_dim, num_groups=norm_num_groups, eps=norm_eps, affine=norm_affine
+            num_features=model_dim,
+            num_groups=norm_num_groups,
+            eps=norm_eps,
         )
         self.cema = ComplexEMA(embed_dim=model_dim, ndim=cema_ndim, key=keys[0])
         self.rmsnorm = RMSNorm(dim=model_dim, eps=norm_eps, affine=norm_affine)
