@@ -30,7 +30,7 @@ from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
 from megalodon_jax.ops import matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
-from megalodon_jax.utils import get_initializer, reinit_linear_weights
+from megalodon_jax.utils import get_boundary_initializer, reinit_linear_weights
 
 
 @eqx.filter_checkpoint
@@ -278,11 +278,15 @@ class MegalodonModel(eqx.Module):
             key=k_embed,
         )
 
-        # Apply init_mode to embedding weights
-        if config.init_mode != "none":
-            init_fn = get_initializer(config.init_mode, dim=config.model_dim)
-            new_embed_weight = init_fn(k_embed_reinit, embed.weight.shape, embed.weight.dtype)
-            embed = eqx.tree_at(lambda e: e.weight, embed, new_embed_weight)
+        # Boundary tensors use a fixed truncated-normal policy independent of
+        # the selected internal projection initializer.
+        boundary_init = get_boundary_initializer(config.model_dim)
+        new_embed_weight = boundary_init(
+            k_embed_reinit,
+            embed.weight.shape,
+            embed.weight.dtype,
+        )
+        embed = eqx.tree_at(lambda e: e.weight, embed, new_embed_weight)
         self.embed = embed
 
         # Initialize layers
@@ -543,12 +547,13 @@ class MegalodonForCausalLM(eqx.Module):
                 dtype=config.param_dtype,
                 key=k_head,
             )
-            # Apply init_mode to untied lm_head
-            # For gaussian init, match PyTorch reference: std = 1/sqrt(output_dim)
-            if config.init_mode != "none":
-                init_fn = get_initializer(config.init_mode, dim=lm_out)
-                new_weight = init_fn(k_head_reinit, lm_head.weight.shape, lm_head.weight.dtype)
-                lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
+            boundary_init = get_boundary_initializer(config.model_dim)
+            new_weight = boundary_init(
+                k_head_reinit,
+                lm_head.weight.shape,
+                lm_head.weight.dtype,
+            )
+            lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
             self.lm_head = lm_head
 
     def __call__(

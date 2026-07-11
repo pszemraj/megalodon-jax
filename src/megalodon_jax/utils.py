@@ -41,38 +41,86 @@ def _is_linear(x: Any) -> bool:
 def get_initializer(
     mode: InitMode, dim: int | None = None
 ) -> Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]:
-    """Get a JAX-compatible weight initializer.
+    """Return the exact released initializer for an internal weight tensor.
 
     :param InitMode mode: Initialization mode.
     :param int | None dim: Dimension for gaussian stddev; None uses stddev=1.0.
     :return Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]: Initializer.
 
-    Modes: he (He normal), xavier (Glorot uniform), bert (std=0.02),
-    gaussian (truncated normal with std=1/sqrt(dim) or 1.0 when dim is None).
+    Equinox Linear weights are stored as (out_features, in_features), so fan-in
+    is shape[-1] and fan-out is shape[-2]. The released ``he`` mode is
+    ``kaiming_normal_(a=sqrt(5))``, not canonical ReLU He normal.
     """
     if mode == "none":
         raise ValueError("Init mode 'none' skips reinitialization and has no initializer.")
 
+    def require_matrix(shape: tuple[int, ...]) -> tuple[int, int]:
+        if len(shape) < 2:
+            raise ValueError(f"{mode} initializer requires a matrix shape, got {shape}")
+        return int(shape[-1]), int(shape[-2])
+
     if mode == "he":
-        return jax.nn.initializers.he_normal()
+
+        def he(key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32) -> Array:
+            fan_in, _ = require_matrix(shape)
+            std = 1.0 / jnp.sqrt(3.0 * fan_in)
+            return jax.random.normal(key, shape, dtype=dtype) * std
+
+        return he
 
     if mode == "xavier":
-        return jax.nn.initializers.glorot_uniform()
+
+        def xavier(
+            key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
+        ) -> Array:
+            fan_in, fan_out = require_matrix(shape)
+            bound = jnp.sqrt(6.0 / (fan_in + fan_out))
+            return jax.random.uniform(
+                key,
+                shape,
+                dtype=dtype,
+                minval=-bound,
+                maxval=bound,
+            )
+
+        return xavier
 
     if mode == "bert":
-        return jax.nn.initializers.normal(stddev=0.02)
+
+        def bert(
+            key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
+        ) -> Array:
+            return jax.random.normal(key, shape, dtype=dtype) * 0.02
+
+        return bert
 
     if mode == "gaussian":
-        # Match PyTorch: std=1.0 when dim is None, else 1/sqrt(dim)
-        if dim is None:
-            std = 1.0
-        else:
-            std = 1.0 / jnp.sqrt(dim)
-        # Bounds are in standard-normal units (before scaling by stddev).
-        # Final output range: lower*stddev < x < upper*stddev = (-3*std, 3*std)
-        return jax.nn.initializers.truncated_normal(stddev=std, lower=-3.0, upper=3.0)
+        std = 1.0 if dim is None else 1.0 / jnp.sqrt(dim)
+
+        def gaussian(
+            key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
+        ) -> Array:
+            values = jax.random.truncated_normal(
+                key,
+                lower=-3.0,
+                upper=3.0,
+                shape=shape,
+                dtype=dtype,
+            )
+            return values * jnp.asarray(std, dtype=dtype)
+
+        return gaussian
 
     raise ValueError(f"Unknown init mode: {mode}")
+
+
+def get_boundary_initializer(
+    model_dim: int,
+) -> Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]:
+    """Return the fixed embedding/output-head initializer from upstream."""
+    if model_dim <= 0:
+        raise ValueError(f"model_dim must be positive, got {model_dim}")
+    return get_initializer("gaussian", dim=model_dim)
 
 
 def reinit_linear_weights(

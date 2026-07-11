@@ -58,7 +58,7 @@ class MegalodonConfig:
     bos_token_id: int = 1
     eos_token_id: int = 2
     max_positions: int = 1_000_000
-    init_mode: InitMode = "gaussian"
+    init_mode: InitMode = "he"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
     # Segmented CEMA path for packed sequences: parallel associative scan
     # (fast, materializes (L, B, D, N) complex64 tensors) vs sequential scan

@@ -679,10 +679,12 @@ def main() -> int:
         shapes = {
             "wz": (256, 1024),
             "wv": (2048, 1024),
+            "wr": (2048, 1024),
             "wh1": (1024, 1024),
             "wh2": (1024, 2048),
             "fc1": (2560, 1024),
             "fc2": (1024, 2560),
+            "fc3": (2560, 1024),
         }
         initializer = get_initializer("he")
         rows: dict[str, Any] = {}
@@ -713,6 +715,56 @@ def main() -> int:
         )
 
     audit.run("he_initialization_gain_and_axis", "P0", check_he_distribution)
+
+    def check_other_initializer_distributions() -> tuple[bool, str, dict[str, Any]]:
+        shape = (2048, 1024)
+        fan_in, fan_out = shape[-1], shape[-2]
+        truncated_variance = 0.9733369246625415
+        cases = {
+            "xavier": (
+                get_initializer("xavier")(jax.random.PRNGKey(81), shape, jnp.float32),
+                math.sqrt(2.0 / (fan_in + fan_out)),
+            ),
+            "bert": (
+                get_initializer("bert")(jax.random.PRNGKey(82), shape, jnp.float32),
+                0.02,
+            ),
+            "gaussian": (
+                get_initializer("gaussian")(jax.random.PRNGKey(83), shape, jnp.float32),
+                math.sqrt(truncated_variance),
+            ),
+        }
+        rows = {}
+        passed = True
+        for name, (values, expected_std) in cases.items():
+            array = np.asarray(values)
+            actual_std = float(array.std(ddof=0))
+            ratio = actual_std / expected_std
+            rows[name] = {
+                "shape_out_in": shape,
+                "actual_std": actual_std,
+                "expected_std": expected_std,
+                "actual_to_expected_ratio": ratio,
+                "minimum": float(array.min()),
+                "maximum": float(array.max()),
+            }
+            passed = passed and abs(ratio - 1.0) <= 0.03
+        xavier_bound = math.sqrt(6.0 / (fan_in + fan_out))
+        passed = passed and rows["xavier"]["minimum"] >= -xavier_bound
+        passed = passed and rows["xavier"]["maximum"] <= xavier_bound
+        passed = passed and rows["gaussian"]["minimum"] >= -3.0
+        passed = passed and rows["gaussian"]["maximum"] <= 3.0
+        return (
+            passed,
+            "Xavier, BERT, and Gaussian distributions match released contracts",
+            {"distributions": rows, "xavier_bound": xavier_bound},
+        )
+
+    audit.run(
+        "other_initialization_distributions",
+        "P0",
+        check_other_initializer_distributions,
+    )
 
     def check_embedding_init_policy() -> tuple[bool, str, dict[str, Any]]:
         cfg = MegalodonConfig(

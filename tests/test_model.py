@@ -1278,12 +1278,9 @@ class TestFix6InitMode:
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
 
-        # Check that weights are not the Equinox default (which is different from He)
-        embed_weight = model.model.embed.weight
-        assert embed_weight is not None
-        # He init should have reasonable variance
-        var = jnp.var(embed_weight)
-        assert var > 0.001, "Embedding weights should have non-trivial variance"
+        weight = np.asarray(model.model.layers[0].attn.wz.weight)
+        expected_std = 1.0 / np.sqrt(3.0 * weight.shape[-1])
+        np.testing.assert_allclose(weight.std(), expected_std, rtol=0.12)
 
     def test_none_init_keeps_defaults(self, random_seed: int) -> None:
         """Test that init_mode='none' doesn't reinitialize weights.
@@ -1311,8 +1308,8 @@ class TestFix6InitMode:
         # Weights should exist
         assert model.model.embed.weight is not None
 
-    def test_different_init_modes_produce_different_weights(self, random_seed: int) -> None:
-        """Test that different init modes produce different weight distributions.
+    def test_internal_modes_do_not_change_embedding_policy(self, random_seed: int) -> None:
+        """Internal modes change projections but never boundary tensors.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1339,16 +1336,27 @@ class TestFix6InitMode:
         )
         model_bert = MegalodonForCausalLM(MegalodonConfig(**base_config, init_mode="bert"), key=key)
 
-        # BERT init has stddev=0.02, which should have much smaller variance than He
-        bert_var = jnp.var(model_bert.model.embed.weight)
-        he_var = jnp.var(model_he.model.embed.weight)
-        xavier_var = jnp.var(model_xavier.model.embed.weight)
+        np.testing.assert_array_equal(
+            np.asarray(model_he.model.embed.weight),
+            np.asarray(model_xavier.model.embed.weight),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(model_he.model.embed.weight),
+            np.asarray(model_bert.model.embed.weight),
+        )
 
-        # BERT has fixed small stddev, He scales with dimensions
-        # BERT std=0.02 means var ~0.0004
-        assert bert_var < 0.01, f"BERT init variance {bert_var} should be small"
-        assert xavier_var > bert_var, "Xavier init variance should exceed BERT variance"
-        assert he_var > xavier_var, "He init variance should exceed Xavier variance"
+        he_weight = np.asarray(model_he.model.layers[0].attn.wz.weight)
+        xavier_weight = np.asarray(model_xavier.model.layers[0].attn.wz.weight)
+        bert_weight = np.asarray(model_bert.model.layers[0].attn.wz.weight)
+        np.testing.assert_allclose(
+            he_weight.std(), 1.0 / np.sqrt(3.0 * he_weight.shape[-1]), rtol=0.12
+        )
+        np.testing.assert_allclose(
+            xavier_weight.std(),
+            np.sqrt(2.0 / sum(xavier_weight.shape[-2:])),
+            rtol=0.12,
+        )
+        np.testing.assert_allclose(bert_weight.std(), 0.02, rtol=0.12)
 
 
 class TestComputeLossMasking:
@@ -1537,8 +1545,8 @@ class TestComputeLossMasking:
 class TestUntiedHeadInit:
     """Tests for untied LM head initialization."""
 
-    def test_untied_head_gaussian_uses_output_dim_scale(self, random_seed: int) -> None:
-        """Test that untied LM head with gaussian init uses std=1/sqrt(output_size).
+    def test_untied_head_uses_model_dim_scale(self, random_seed: int) -> None:
+        """Untied heads use the boundary policy based on model width.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1561,18 +1569,19 @@ class TestUntiedHeadInit:
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
 
-        # Expect variance near 1/output_size (std = 1/sqrt(output_size)).
         lm_head_var = jnp.var(model.lm_head.weight)
-        expected_var = 1.0 / config.output_size
+        # Variance of a standard normal truncated to [-3, 3].
+        truncated_variance = 0.9733369246625415
+        expected_var = truncated_variance / config.model_dim
 
         np.testing.assert_allclose(
             np.array(lm_head_var),
             expected_var,
-            rtol=0.25,
+            rtol=0.08,
             atol=5e-4,
             err_msg=(
                 f"Untied LM head variance {lm_head_var} deviates from expected "
-                f"{expected_var} (std=1/sqrt(output_size))."
+                f"{expected_var} (truncated std=1/sqrt(model_dim))."
             ),
         )
 
