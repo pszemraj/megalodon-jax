@@ -444,13 +444,11 @@ class TestChunkedAttention:
         v = jax.random.normal(kv, (1, 9, 1, 3))
         _, cache, _ = module(q[:, :5], k[:, :5], v[:, :5], return_cache=True)
         assert cache is not None
-        restored = type(cache)(k=jnp.array(cache.k), v=jnp.array(cache.v), count=jnp.array(cache.count))
-        expected, _, _ = module(
-            q[:, 5:], k[:, 5:], v[:, 5:], cache=cache, return_cache=True
+        restored = type(cache)(
+            k=jnp.array(cache.k), v=jnp.array(cache.v), count=jnp.array(cache.count)
         )
-        actual, _, _ = module(
-            q[:, 5:], k[:, 5:], v[:, 5:], cache=restored, return_cache=True
-        )
+        expected, _, _ = module(q[:, 5:], k[:, 5:], v[:, 5:], cache=cache, return_cache=True)
+        actual, _, _ = module(q[:, 5:], k[:, 5:], v[:, 5:], cache=restored, return_cache=True)
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
     def test_forward_shapes(self, random_seed: int) -> None:
@@ -1533,7 +1531,9 @@ class TestParity:
         init_v = jax.random.normal(jax.random.fold_in(k1, 1), (batch, 2, heads, value_dim))
         # Apply RoPE to initial K
         init_k_rot, _ = attn.rotary(init_k, init_k, jnp.array(0))
-        cache = AttentionCache(k=init_k_rot, v=init_v, count=jnp.array(2, dtype=jnp.int32))
+        cache_k = jnp.zeros((batch, chunk_size, heads, head_dim)).at[:, :2].set(init_k_rot)
+        cache_v = jnp.zeros((batch, chunk_size, heads, value_dim)).at[:, :2].set(init_v)
+        cache = AttentionCache(k=cache_k, v=cache_v, count=jnp.array(2, dtype=jnp.int32))
 
         # Process multi-token call that spans boundary
         out_multi, cache_multi, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
