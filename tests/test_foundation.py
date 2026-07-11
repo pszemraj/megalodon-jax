@@ -10,6 +10,7 @@ import pytest
 
 from megalodon_jax import MegalodonConfig
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
+from megalodon_jax.layers.norms import BatchedLayerNorm
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
 from tests.utils import require_torch_modeling, to_jax
 
@@ -220,6 +221,23 @@ class TestRMSNormParity:
             x = jnp.ones(shape)
             y = norm(x)
             assert y.shape == shape
+
+
+class TestLayerNormStorage:
+    """Tests for released plus-one LayerNorm parameter storage."""
+
+    def test_zero_stored_weight_has_identity_effective_scale(self) -> None:
+        """Serialized zero gamma must produce ordinary LayerNorm output."""
+        norm = BatchedLayerNorm(4, eps=1e-5)
+        np.testing.assert_array_equal(np.asarray(norm.weight), np.zeros(4))
+
+        x = jnp.asarray([[[1.0, 2.0, 4.0, 8.0]]], dtype=jnp.float32)
+        output = norm(x)
+        x_np = np.asarray(x)
+        mean = x_np.mean(axis=-1, keepdims=True)
+        var = np.square(x_np - mean).mean(axis=-1, keepdims=True)
+        expected = (x_np - mean) / np.sqrt(var + 1e-5)
+        np.testing.assert_allclose(np.asarray(output), expected, atol=2e-6, rtol=2e-6)
 
 
 class TestRotaryEmbeddingParity:

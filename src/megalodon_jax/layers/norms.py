@@ -85,7 +85,7 @@ class BatchedLayerNorm(eqx.Module):
     """LayerNorm for batched inputs with normalization over the last dimension.
 
     This implementation accepts arbitrary leading dimensions and normalizes over
-    the final axis, matching PyTorch LayerNorm semantics for [*, D] inputs.
+    the final axis. Stored weight uses the released plus-one parameterization.
     """
 
     dim: int = eqx.field(static=True)
@@ -115,7 +115,7 @@ class BatchedLayerNorm(eqx.Module):
         self.eps = eps
         self.affine = affine
         if affine:
-            self.weight = jnp.ones((dim,), dtype=jnp.float32)
+            self.weight = jnp.zeros((dim,), dtype=jnp.float32)
             self.bias = jnp.zeros((dim,), dtype=jnp.float32)
         else:
             self.weight = None
@@ -133,7 +133,7 @@ class BatchedLayerNorm(eqx.Module):
         y = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)
         y = y.astype(x.dtype)
         if self.affine and self.weight is not None and self.bias is not None:
-            weight = self.weight.astype(x.dtype)
+            weight = (self.weight + 1.0).astype(x.dtype)
             bias = self.bias.astype(x.dtype)
             y = y * weight + bias
         return y
