@@ -588,6 +588,27 @@ class TestNormalizedFFN:
         assert out.shape == (batch, seq, model_dim)
         assert ffn.fc3 is not None  # SwiGLU has fc3
 
+    def test_source_bias_topology_and_trainable_rescale(self, random_seed: int) -> None:
+        """FFN projections are bias-free and layer scale is a vector parameter."""
+        ffn = NormalizedFFN(
+            model_dim=16,
+            ffn_hidden_dim=32,
+            swiglu=True,
+            rescale=True,
+            layer_id=2,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        assert ffn.fc1.bias is None
+        assert ffn.fc2.bias is None
+        assert ffn.fc3 is not None and ffn.fc3.bias is None
+        assert ffn.alpha is not None
+        assert ffn.alpha.shape == (16,)
+        np.testing.assert_array_equal(
+            np.asarray(ffn.alpha),
+            np.full(16, 0.025, dtype=np.float32),
+        )
+        assert any(leaf is ffn.alpha for leaf in jax.tree_util.tree_leaves(ffn))
+
     def test_two_hop_residual(self, random_seed: int) -> None:
         """Test NormalizedFFN with two-hop residual.
 
@@ -685,6 +706,24 @@ class TestNormalizedFFN:
 
 class TestMegalodonAttention:
     """Tests for MegalodonAttention block."""
+
+    def test_source_projection_bias_topology(self, random_seed: int) -> None:
+        """Only released attention projections retain bias parameters."""
+        module = MegalodonAttention(
+            model_dim=16,
+            z_dim=8,
+            value_dim=16,
+            num_heads=1,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=4,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        assert module.wz.bias is not None
+        assert module.wv.bias is not None
+        assert module.wr.bias is not None
+        assert module.wh1.bias is not None
+        assert module.wh2.bias is None
 
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test MegalodonAttention forward pass shapes.

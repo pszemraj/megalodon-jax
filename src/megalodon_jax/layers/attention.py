@@ -1247,7 +1247,13 @@ class MegalodonAttention(eqx.Module):
         self.wv = eqx.nn.Linear(model_dim, value_dim, dtype=param_dtype, key=keys[3])
         self.wr = eqx.nn.Linear(model_dim, value_dim, dtype=param_dtype, key=keys[4])
         self.wh1 = eqx.nn.Linear(model_dim, model_dim, dtype=param_dtype, key=keys[5])
-        self.wh2 = eqx.nn.Linear(value_dim, model_dim, dtype=param_dtype, key=keys[6])
+        self.wh2 = eqx.nn.Linear(
+            value_dim,
+            model_dim,
+            use_bias=False,
+            dtype=param_dtype,
+            key=keys[6],
+        )
 
         # Per-head affine parameters (gamma+1 parameterization, init zeros)
         self.gamma = jnp.zeros((2, z_dim), dtype=jnp.float32)
@@ -1430,7 +1436,7 @@ class MegalodonAttention(eqx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         accum_dtype: jnp.dtype = jnp.float32,
         gemm_backend: str = "default",
-        init_mode: InitMode = "gaussian",
+        init_mode: InitMode = "he",
         *,
         key: PRNGKeyArray,
     ) -> "MegalodonAttention":
@@ -1520,7 +1526,7 @@ class NormalizedFFN(eqx.Module):
     swiglu: bool = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
-    alpha: float | None = eqx.field(static=True)  # Residual rescale factor
+    alpha: Float[Array, "dim"] | None
     param_dtype: jnp.dtype = eqx.field(static=True)
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
@@ -1570,17 +1576,37 @@ class NormalizedFFN(eqx.Module):
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
         self.gemm_backend = gemm_backend
-        # Compute rescale alpha: 0.1 * (0.5 ** layer_id)
-        self.alpha = (0.1 * (0.5**layer_id)) if rescale else None
+        # Released layer scale is a trainable per-feature vector.
+        self.alpha = (
+            jnp.full((model_dim,), 0.1 * (0.5**layer_id), dtype=jnp.float32) if rescale else None
+        )
 
         keys = jax.random.split(key, 3)
 
         self.norm = BatchedLayerNorm(model_dim, eps=norm_eps, affine=norm_affine)
-        self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, dtype=param_dtype, key=keys[0])
-        self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, dtype=param_dtype, key=keys[1])
+        self.fc1 = eqx.nn.Linear(
+            model_dim,
+            ffn_hidden_dim,
+            use_bias=False,
+            dtype=param_dtype,
+            key=keys[0],
+        )
+        self.fc2 = eqx.nn.Linear(
+            ffn_hidden_dim,
+            model_dim,
+            use_bias=False,
+            dtype=param_dtype,
+            key=keys[1],
+        )
 
         if swiglu:
-            self.fc3 = eqx.nn.Linear(model_dim, ffn_hidden_dim, dtype=param_dtype, key=keys[2])
+            self.fc3 = eqx.nn.Linear(
+                model_dim,
+                ffn_hidden_dim,
+                use_bias=False,
+                dtype=param_dtype,
+                key=keys[2],
+            )
         else:
             self.fc3 = None
 
@@ -1639,7 +1665,7 @@ class NormalizedFFN(eqx.Module):
 
         # Apply residual rescaling if enabled (cast to preserve bf16)
         if self.alpha is not None:
-            out = out * jnp.asarray(self.alpha, dtype=out.dtype)
+            out = out * self.alpha.astype(out.dtype)
 
         return residual + out
 
@@ -1659,7 +1685,7 @@ class NormalizedFFN(eqx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         accum_dtype: jnp.dtype = jnp.float32,
         gemm_backend: str = "default",
-        init_mode: InitMode = "gaussian",
+        init_mode: InitMode = "he",
         *,
         key: PRNGKeyArray,
     ) -> "NormalizedFFN":
