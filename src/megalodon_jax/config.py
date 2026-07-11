@@ -42,20 +42,20 @@ class MegalodonConfig:
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16  # complex EMA orders per channel
     chunk_size: int = 2048
-    attention_window: int | None = None
+    attention_window: int | None = None  # None = released chunk-local; int = sliding extension
     norm_num_groups: int = 32
     norm_eps: float = 1e-5
     rope_base: float | None = None  # defaults to 10000.0 if None
     swiglu: bool = False
     rescale_nffn: bool = False
     scale_emb: bool = False
-    share_emb: bool = False
-    norm_affine: bool = True
+    share_emb: bool = False  # Explicit embedding/output tying; never inferred from shape
+    norm_affine: bool = True  # RMSNorm and FFN LayerNorm only; TimestepNorm is always affine
     dropout: float = 0.0
     attention_dropout: float = 0.0
     attention_dropout_mode: AttentionDropoutMode = "post_softmax"
     hidden_dropout: float = 0.0
-    pad_token_id: int | None = None
+    pad_token_id: int | None = None  # Metadata only; token IDs are never zero-masked implicitly
     bos_token_id: int = 1
     eos_token_id: int = 2
     init_mode: InitMode = "he"

@@ -748,7 +748,8 @@ class MegalodonAttention(eqx.Module):
         :param int chunk_size: Attention chunk size.
         :param int norm_num_groups: Number of groups for TimestepNorm.
         :param float norm_eps: Epsilon for normalization.
-        :param bool norm_affine: Whether normalization layers include affine parameters.
+        :param bool norm_affine: Whether RMSNorm includes an affine scale. TimestepNorm is always
+            affine for released-source compatibility.
         :param float rope_base: Base for rotary embeddings.
         :param int | None attention_window: Optional sliding-window width.
         :param float dropout: Output dropout rate.
@@ -1013,7 +1014,8 @@ class MegalodonAttention(eqx.Module):
         :param int chunk_size: Attention chunk size.
         :param int norm_num_groups: Number of groups for TimestepNorm.
         :param float norm_eps: Epsilon for normalization.
-        :param bool norm_affine: Whether normalization layers include affine parameters.
+        :param bool norm_affine: Whether RMSNorm includes an affine scale. TimestepNorm is always
+            affine for released-source compatibility.
         :param float rope_base: Base for rotary embeddings.
         :param int | None attention_window: Optional sliding-window width.
         :param float dropout: Output dropout rate.
@@ -1112,7 +1114,7 @@ class NormalizedFFN(eqx.Module):
         :param int model_dim: Model hidden dimension.
         :param int ffn_hidden_dim: FFN intermediate dimension.
         :param float norm_eps: Epsilon for layer normalization.
-        :param bool norm_affine: Whether normalization includes affine parameters.
+        :param bool norm_affine: Whether the FFN LayerNorm includes affine parameters.
         :param bool swiglu: Whether to use SwiGLU activation.
         :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
         :param int layer_id: Layer index for computing rescale factor (0-indexed).
@@ -1250,7 +1252,7 @@ class NormalizedFFN(eqx.Module):
         :param int model_dim: Model hidden dimension.
         :param int ffn_hidden_dim: FFN intermediate dimension.
         :param float norm_eps: Epsilon for layer normalization.
-        :param bool norm_affine: Whether normalization includes affine parameters.
+        :param bool norm_affine: Whether the FFN LayerNorm includes affine parameters.
         :param bool swiglu: Whether to use SwiGLU activation.
         :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
         :param int layer_id: Layer index for computing rescale factor (0-indexed).
