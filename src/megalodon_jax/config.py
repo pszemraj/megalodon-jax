@@ -42,8 +42,7 @@ class MegalodonConfig:
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16  # complex EMA orders per channel
     chunk_size: int = 2048
-    max_cache_len: int | None = None  # defaults to chunk_size if None; must be >= chunk_size
-    cache_unbounded: bool = False
+    attention_window: int | None = None
     norm_num_groups: int = 32
     norm_eps: float = 1e-5
     rope_base: float | None = None  # defaults to 10000.0 if None
@@ -112,10 +111,8 @@ class MegalodonConfig:
             raise ValueError(
                 f"pad_token_id must be in [0, {self.vocab_size}) or None, got {self.pad_token_id}"
             )
-        if self.max_cache_len is not None and self.max_cache_len <= 0:
-            raise ValueError("max_cache_len must be positive when provided.")
-        if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
-            raise ValueError("max_cache_len must be >= chunk_size to preserve causal attention.")
+        if self.attention_window is not None and self.attention_window <= 0:
+            raise ValueError("attention_window must be positive when provided")
         for name, dtype in (
             ("param_dtype", self.param_dtype),
             ("compute_dtype", self.compute_dtype),
@@ -165,12 +162,9 @@ class MegalodonConfig:
         return self.rope_base if self.rope_base is not None else 10000.0
 
     @property
-    def effective_max_cache_len(self) -> int:
-        """Max cache length, defaulting to chunk_size if not specified.
-
-        :return int: max_cache_len if set, otherwise chunk_size.
-        """
-        return self.max_cache_len if self.max_cache_len is not None else self.chunk_size
+    def cache_capacity(self) -> int:
+        """Return the fixed KV ring capacity for the selected attention mode."""
+        return self.chunk_size if self.attention_window is None else self.attention_window
 
     @property
     def effective_output_size(self) -> int:

@@ -388,6 +388,71 @@ class TestAttentionPrimitives:
 class TestChunkedAttention:
     """Tests for ChunkedAttention module."""
 
+    @pytest.mark.parametrize("attention_window", [None, 3, 8])
+    def test_arbitrary_call_partition_invariance(
+        self,
+        random_seed: int,
+        attention_window: int | None,
+    ) -> None:
+        """Full, chunked, and tokenwise calls share one semantic timeline."""
+        key = jax.random.PRNGKey(random_seed)
+        k_module, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=1,
+            head_dim=4,
+            value_head_dim=3,
+            chunk_size=4,
+            attention_window=attention_window,
+            key=k_module,
+        )
+        q = jax.random.normal(kq, (1, 12, 1, 4))
+        k = jax.random.normal(kk, (1, 12, 1, 4))
+        v = jax.random.normal(kv, (1, 12, 1, 3))
+
+        reference, reference_cache, _ = module(q, k, v, return_cache=True)
+        assert reference_cache is not None
+        for partitions in ([1] * 12, [3, 2, 7], [5, 4, 3], [4, 4, 4]):
+            outputs = []
+            cache = None
+            offset = 0
+            for width in partitions:
+                part, cache, _ = module(
+                    q[:, offset : offset + width],
+                    k[:, offset : offset + width],
+                    v[:, offset : offset + width],
+                    cache=cache,
+                    return_cache=True,
+                )
+                outputs.append(part)
+                offset += width
+            actual = jnp.concatenate(outputs, axis=1)
+            np.testing.assert_allclose(actual, reference, atol=2e-6, rtol=2e-6)
+            np.testing.assert_allclose(cache.k, reference_cache.k, atol=0.0, rtol=0.0)
+            np.testing.assert_allclose(cache.v, reference_cache.v, atol=0.0, rtol=0.0)
+            np.testing.assert_array_equal(cache.count, reference_cache.count)
+
+        noncached, _, _ = module(q, k, v)
+        np.testing.assert_allclose(noncached, reference, atol=2e-6, rtol=2e-6)
+
+    def test_cache_copy_continuation_is_identical(self, random_seed: int) -> None:
+        """A reloaded array-identical cache resumes without numerical drift."""
+        key = jax.random.PRNGKey(random_seed)
+        km, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(1, 4, 3, 4, attention_window=6, key=km)
+        q = jax.random.normal(kq, (1, 9, 1, 4))
+        k = jax.random.normal(kk, (1, 9, 1, 4))
+        v = jax.random.normal(kv, (1, 9, 1, 3))
+        _, cache, _ = module(q[:, :5], k[:, :5], v[:, :5], return_cache=True)
+        assert cache is not None
+        restored = type(cache)(k=jnp.array(cache.k), v=jnp.array(cache.v), count=jnp.array(cache.count))
+        expected, _, _ = module(
+            q[:, 5:], k[:, 5:], v[:, 5:], cache=cache, return_cache=True
+        )
+        actual, _, _ = module(
+            q[:, 5:], k[:, 5:], v[:, 5:], cache=restored, return_cache=True
+        )
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test ChunkedAttention forward pass shapes.
 
@@ -453,7 +518,7 @@ class TestChunkedAttention:
         # Check final cache state
         assert cache is not None
         assert cache.count == 8
-        # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
+        # Fixed-size buffer uses chunk_size in released chunk-local mode.
         assert cache.k.shape[1] == chunk_size
 
     def test_streaming_rejects_strict_metadata(self, random_seed: int) -> None:
@@ -529,8 +594,7 @@ class TestChunkedAttention:
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            max_cache_len=cache_size,
-            cache_unbounded=True,
+            attention_window=cache_size,
             key=k1,
         )
 
@@ -572,6 +636,54 @@ class TestChunkedAttention:
             rtol=1e-6,
             atol=1e-6,
         )
+
+    @pytest.mark.parametrize("attention_window", [None, 8])
+    def test_arbitrary_cache_partition_invariance(
+        self,
+        random_seed: int,
+        attention_window: int | None,
+    ) -> None:
+        """Cached outputs and state cannot depend on caller chunk boundaries."""
+        key = jax.random.PRNGKey(random_seed)
+        k_module, k_q, k_k, k_v = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=1,
+            head_dim=4,
+            value_head_dim=3,
+            chunk_size=4,
+            attention_window=attention_window,
+            key=k_module,
+        )
+        q = jax.random.normal(k_q, (1, 12, 1, 4))
+        k = jax.random.normal(k_k, (1, 12, 1, 4))
+        v = jax.random.normal(k_v, (1, 12, 1, 3))
+
+        expected, expected_cache, _ = module(q, k, v, return_cache=True)
+        assert expected_cache is not None
+        for partition in ((1,) * 12, (3, 5, 4), (7, 1, 4)):
+            outputs = []
+            cache = None
+            start = 0
+            for width in partition:
+                stop = start + width
+                output, cache, _ = module(
+                    q[:, start:stop],
+                    k[:, start:stop],
+                    v[:, start:stop],
+                    cache=cache,
+                    return_cache=True,
+                )
+                outputs.append(output)
+                start = stop
+            actual = jnp.concatenate(outputs, axis=1)
+            assert cache is not None
+            np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6)
+            np.testing.assert_array_equal(np.asarray(cache.k), np.asarray(expected_cache.k))
+            np.testing.assert_array_equal(np.asarray(cache.v), np.asarray(expected_cache.v))
+            np.testing.assert_array_equal(np.asarray(cache.count), np.asarray(expected_cache.count))
+
+        batch_output, _, _ = module(q, k, v)
+        np.testing.assert_allclose(np.asarray(batch_output), np.asarray(expected), atol=2e-6)
 
 
 # -----------------------------------------------------------------------------
@@ -1287,8 +1399,8 @@ class TestStreamingEquivalence:
             # The count tracks absolute position
             assert cache.count == i + 1, f"Cache count should be {i + 1}, got {cache.count}"
 
-    def test_cache_resize_on_input(self, random_seed: int) -> None:
-        """Test that incoming caches are resized to fixed buffer size.
+    def test_incompatible_cache_shape_is_rejected(self, random_seed: int) -> None:
+        """Cache schema mismatches fail instead of silently resizing state.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1320,15 +1432,8 @@ class TestStreamingEquivalence:
         k = jax.random.normal(jax.random.fold_in(k4, 1), (batch, 1, heads, head_dim))
         v = jax.random.normal(jax.random.fold_in(k4, 2), (batch, 1, heads, value_dim))
 
-        _, new_cache, new_pos = attn(q, k, v, cache=fake_cache, return_cache=True)
-
-        # Output cache should be fixed size (chunk_size)
-        assert new_cache.k.shape[1] == chunk_size, (
-            f"Cache should be fixed size {chunk_size}, got {new_cache.k.shape[1]}"
-        )
-        # Position should advance
-        assert new_pos == 3, f"Position should be 3, got {new_pos}"
-        assert new_cache.count == 3, f"Cache count should be 3, got {new_cache.count}"
+        with pytest.raises(ValueError, match="cache shapes"):
+            attn(q, k, v, cache=fake_cache, return_cache=True)
 
 
 # -----------------------------------------------------------------------------

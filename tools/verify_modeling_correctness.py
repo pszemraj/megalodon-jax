@@ -1006,7 +1006,7 @@ def main() -> int:
 
         audit.run("fp32_output_logits", "P1", check_logits_dtype)
 
-        def cache_partition_error(cache_size: int, cache_unbounded: bool) -> float:
+        def cache_partition_error(attention_window: int | None) -> float:
             key = jax.random.PRNGKey(17)
             k_module, kq, kk, kv = jax.random.split(key, 4)
             batch, length, heads, dim, value_dim = 1, 12, 1, 4, 3
@@ -1015,8 +1015,7 @@ def main() -> int:
                 head_dim=dim,
                 value_head_dim=value_dim,
                 chunk_size=4,
-                max_cache_len=cache_size,
-                cache_unbounded=cache_unbounded,
+                attention_window=attention_window,
                 key=k_module,
             )
             q = jax.random.normal(kq, (batch, length, heads, dim))
@@ -1038,7 +1037,7 @@ def main() -> int:
             return float(jnp.max(jnp.abs(full - tokenwise)))
 
         def check_faithful_cache() -> tuple[bool, str, dict[str, Any]]:
-            error = cache_partition_error(4, False)
+            error = cache_partition_error(None)
             passed = error <= 2e-6
             return (
                 passed,
@@ -1051,14 +1050,14 @@ def main() -> int:
         audit.run("faithful_cache_partition_invariance", "P1", check_faithful_cache)
 
         def check_sliding_cache() -> tuple[bool, str, dict[str, Any]]:
-            error = cache_partition_error(8, False)
+            error = cache_partition_error(8)
             passed = error <= 2e-6
             return (
                 passed,
                 "Sliding cache is call-partition invariant"
                 if passed
                 else "Sliding-window semantics depend on call granularity",
-                {"max_abs_error": error, "chunk_size": 4, "max_cache_len": 8},
+                {"max_abs_error": error, "chunk_size": 4, "attention_window": 8},
             )
 
         audit.run("sliding_cache_partition_invariance", "P1", check_sliding_cache)

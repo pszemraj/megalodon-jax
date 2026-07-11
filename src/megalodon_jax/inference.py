@@ -52,7 +52,7 @@ def init_cache(
     :return ModelCache: Initialized cache with per-layer state.
     """
 
-    cache_len = config.effective_max_cache_len
+    cache_len = config.cache_capacity
     cache_dtype = config.compute_dtype if dtype is None else dtype
     num_heads = config.num_heads
     head_dim = config.head_dim

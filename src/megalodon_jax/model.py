@@ -132,8 +132,7 @@ class MegalodonBlock(eqx.Module):
             norm_eps=config.norm_eps,
             norm_affine=config.norm_affine,
             rope_base=config.effective_rope_base,
-            max_cache_len=config.effective_max_cache_len,
-            cache_unbounded=config.cache_unbounded,
+            attention_window=config.attention_window,
             dropout=config.dropout,
             attention_dropout=config.attention_dropout,
             attention_dropout_mode=config.attention_dropout_mode,
@@ -418,15 +417,9 @@ class MegalodonModel(eqx.Module):
             )
         uses_streaming = layer_return_cache or cache is not None
         if uses_streaming and attention_mask is not None:
-            # Check if any position is masked (False = padding)
-            # Use eqx.error_if for traced-value-safe conditional errors
-            has_padding = ~jnp.all(attention_mask)
-            x = eqx.error_if(
-                x,  # Value to pass through (and attach error to)
-                has_padding,
-                "Cannot use cache with padding in attention_mask. "
-                "Caching is only supported for autoregressive generation without padding. "
-                "Use cache=None and return_cache=False for padded prefill.",
+            raise ValueError(
+                "attention_mask is unsupported with cached calls; cached validity is not "
+                "inferred from token IDs. Use an unmasked generation batch or disable cache."
             )
 
         # Parse cache with validation

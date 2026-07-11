@@ -55,7 +55,7 @@ class TestCacheUtilities:
         assert layer0 is not None and layer0.attn is not None
         assert layer0.attn.k.shape == (
             2,
-            config.effective_max_cache_len,
+            config.cache_capacity,
             config.num_heads,
             config.head_dim,
         )
@@ -79,10 +79,10 @@ class TestCacheUtilities:
             final_norm=cache.final_norm,
         )
 
-        trimmed = trim_cache(extended_cache, config.effective_max_cache_len)
+        trimmed = trim_cache(extended_cache, config.cache_capacity)
         trimmed_attn = trimmed.layer_caches[0].attn
         assert trimmed_attn is not None
-        assert trimmed_attn.k.shape[1] == config.effective_max_cache_len
+        assert trimmed_attn.k.shape[1] == config.cache_capacity
 
     def test_index_cache_slices_batch(self) -> None:
         """Ensure index_cache slices the batch dimension correctly.

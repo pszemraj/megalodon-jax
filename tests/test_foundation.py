@@ -122,17 +122,17 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match="model_dim.*divisible by.*norm_num_groups"):
             MegalodonConfig(model_dim=1000, norm_num_groups=32)
 
-    def test_max_cache_len_validation(self) -> None:
-        """Test max_cache_len must be positive and >= chunk_size when provided.
+    def test_attention_window_validation(self) -> None:
+        """Sliding-window width is optional and positive when present.
 
         :return None: None.
         """
-        with pytest.raises(ValueError, match="max_cache_len.*positive"):
-            MegalodonConfig(chunk_size=8, max_cache_len=0)
-        with pytest.raises(ValueError, match="max_cache_len.*positive"):
-            MegalodonConfig(chunk_size=8, max_cache_len=-1)
-        with pytest.raises(ValueError, match="max_cache_len.*chunk_size"):
-            MegalodonConfig(chunk_size=8, max_cache_len=4)
+        assert MegalodonConfig(chunk_size=8).cache_capacity == 8
+        assert MegalodonConfig(chunk_size=8, attention_window=4).cache_capacity == 4
+        with pytest.raises(ValueError, match="attention_window.*positive"):
+            MegalodonConfig(chunk_size=8, attention_window=0)
+        with pytest.raises(ValueError, match="attention_window.*positive"):
+            MegalodonConfig(chunk_size=8, attention_window=-1)
 
     def test_dtype_validation(self) -> None:
         """Test dtype constraints reject float16.
