@@ -99,18 +99,6 @@ class TestTimestepNorm:
         np.testing.assert_array_equal(np.array(norm.weight), np.zeros(64))
         np.testing.assert_array_equal(np.array(norm.bias), np.zeros(64))
 
-    def test_effective_scale_is_one(self) -> None:
-        """Test that effective scale is 1.0 with zero weight.
-
-        :return None: None.
-        """
-        norm = TimestepNorm(64, 8)
-        # Effective scale = weight + 1.0 = 1.0
-        x = jnp.ones((2, 16, 64))
-        y, _ = norm(x)
-        # Output should be normalized (mean~0, var~1 per group, then scaled by 1.0)
-        assert y.shape == x.shape
-
     def test_exact_scalar_population_moments(self) -> None:
         """Each valid token contributes all scalar features in its group."""
         norm = TimestepNorm(4, 2, eps=0.0)
@@ -123,6 +111,9 @@ class TestTimestepNorm:
         )
         np.testing.assert_allclose(np.asarray(output), expected_output, atol=2e-6, rtol=2e-6)
         np.testing.assert_array_equal(np.asarray(state.count), [2])
+
+        constant_output, _ = TimestepNorm(4, 2)(jnp.ones((1, 2, 4), dtype=jnp.float32))
+        np.testing.assert_array_equal(np.asarray(constant_output), np.zeros((1, 2, 4)))
         np.testing.assert_allclose(np.asarray(state.mean), [[4.0, 8.0]], atol=1e-6)
         np.testing.assert_allclose(np.asarray(state.var), [[5.0, 20.0]], atol=1e-6)
 

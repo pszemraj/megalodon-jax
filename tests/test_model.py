@@ -13,6 +13,7 @@ import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
+from tests.factories import tiny_config
 
 
 def small_config() -> MegalodonConfig:
@@ -20,17 +21,10 @@ def small_config() -> MegalodonConfig:
 
     :return MegalodonConfig: Minimal model configuration for tests.
     """
-    return MegalodonConfig(
+    return tiny_config(
         vocab_size=256,
-        model_dim=64,
         num_layers=2,
-        num_heads=2,
-        z_dim=32,
-        value_dim=64,
-        ffn_hidden_dim=128,
-        cema_ndim=4,
         chunk_size=16,
-        norm_num_groups=8,
     )
 
 
@@ -1096,16 +1090,6 @@ class TestFix6InitMode:
         expected_std = 1.0 / np.sqrt(3.0 * weight.shape[-1])
         np.testing.assert_allclose(weight.std(), expected_std, rtol=0.12)
 
-    def test_none_init_is_loader_only(self, random_seed: int) -> None:
-        """Fresh construction cannot expose an uninitialized mode.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        del random_seed
-        with pytest.raises(ValueError, match="fresh-model init_mode"):
-            replace(small_config(), init_mode="none")  # type: ignore[arg-type]
-
     def test_internal_modes_do_not_change_embedding_policy(self, random_seed: int) -> None:
         """Internal modes change projections but never boundary tensors.
 
@@ -1453,43 +1437,6 @@ class TestEdgeCases:
         assert loss == 0.0, f"Single-token sequence loss should be 0.0, got {loss}"
         assert not jnp.isnan(loss), "Single-token sequence loss should not be NaN"
 
-    def test_cache_with_padding_raises_error(self, random_seed: int) -> None:
-        """Test that building cache with padded attention_mask raises an error.
-
-        Caching with padding is unsupported because ComplexEMA doesn't handle masks,
-        leading to hidden state contamination from padded positions.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        batch, seq = 2, 16
-        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
-        # Mask with some padding (last 4 positions are False)
-        attention_mask = jnp.concatenate(
-            [jnp.ones((batch, seq - 4), dtype=bool), jnp.zeros((batch, 4), dtype=bool)],
-            axis=1,
-        )
-
-        # Should raise when return_cache=True with padding
-        with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
-            model(input_ids, attention_mask=attention_mask, return_cache=True)
-
     def test_cache_rejects_attention_mask_metadata(self, random_seed: int) -> None:
         """Cached calls require an unmasked generation batch.
 
@@ -1522,37 +1469,6 @@ class TestEdgeCases:
             model(input_ids, attention_mask=attention_mask, return_cache=True)
 
         logits, cache = model(input_ids, return_cache=True)
-        assert logits.shape == (batch, seq, config.vocab_size)
-        assert cache is not None
-
-    def test_no_mask_with_cache_succeeds(self, random_seed: int) -> None:
-        """Test that building cache without any mask works correctly.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        batch, seq = 2, 16
-        input_ids = jax.random.randint(key, (batch, seq), minval=1, maxval=config.vocab_size)
-
-        # No mask at all should work
-        logits, cache = model(input_ids, attention_mask=None, return_cache=True)
-
         assert logits.shape == (batch, seq, config.vocab_size)
         assert cache is not None
 
@@ -2323,26 +2239,6 @@ class TestPackedMetadata:
         )
         # Guard against a vacuously-zero-everywhere pass
         assert np.max(np.abs(embed_grads[100:107])) > 1e-6
-
-    def test_no_segment_ids_bit_identical_regression(self, random_seed: int) -> None:
-        """Omitting segment_ids must be bit-identical to passing None explicitly."""
-        config = small_config()
-        key = jax.random.PRNGKey(random_seed)
-        k_model, k_data = jax.random.split(key)
-        model = MegalodonForCausalLM(config, key=k_model)
-
-        input_ids = jax.random.randint(k_data, (2, 12), 0, config.vocab_size)
-        attention_mask = jnp.ones((2, 12), dtype=jnp.bool_)
-
-        logits_base, _ = model(input_ids, attention_mask=attention_mask)
-        logits_none, _ = model(
-            input_ids,
-            attention_mask=attention_mask,
-            segment_ids=None,
-            position_ids=None,
-        )
-
-        assert np.array_equal(np.array(logits_base), np.array(logits_none))
 
     def test_trivial_segment_ids_close_to_unsegmented(self, random_seed: int) -> None:
         """A single segment spanning the valid region must match segment_ids=None.

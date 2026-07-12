@@ -30,6 +30,7 @@ from megalodon_jax.convert import (
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token, trim_cache
 from megalodon_jax.types import AttentionCache, LayerCache, ModelCache
+from tests.factories import tiny_config
 
 
 def small_config() -> MegalodonConfig:
@@ -37,18 +38,7 @@ def small_config() -> MegalodonConfig:
 
     :return MegalodonConfig: Minimal configuration for inference tests.
     """
-    return MegalodonConfig(
-        vocab_size=64,
-        model_dim=64,
-        num_layers=1,
-        num_heads=2,
-        z_dim=32,
-        value_dim=64,
-        ffn_hidden_dim=128,
-        cema_ndim=4,
-        chunk_size=8,
-        norm_num_groups=8,
-    )
+    return tiny_config()
 
 
 class TestCacheUtilities:
@@ -415,77 +405,37 @@ class TestSamplingAndGeneration:
                 temperature=1.0,
             )
 
-    def test_generate_padded_left_padding_cached_generation_raises(self) -> None:
-        """Ensure padded attention masks reject cached generation.
-
-        :return None: None.
-        """
+    @pytest.mark.parametrize(
+        ("attention_mask", "max_new_tokens", "return_cache", "with_cache"),
+        [
+            pytest.param([[False, False, True, True]], 2, False, False, id="left-multistep"),
+            pytest.param([[True, True, False, False]], 2, False, False, id="right-multistep"),
+            pytest.param([[False, True, True, True]], 1, True, False, id="return-cache"),
+            pytest.param([[False, True, True, True]], 1, False, True, id="existing-cache"),
+        ],
+    )
+    def test_generate_padded_cache_modes_raise(
+        self,
+        attention_mask: list[list[bool]],
+        max_new_tokens: int,
+        return_cache: bool,
+        with_cache: bool,
+    ) -> None:
+        """Every cache-enabling mode rejects padded generation explicitly."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        prompt = jnp.array(
-            [
-                [0, 0, 1, 2],
-                [0, 3, 4, 5],
-            ],
-            dtype=jnp.int32,
-        )
-        attention_mask = jnp.array(
-            [
-                [False, False, True, True],
-                [False, True, True, True],
-            ]
-        )
-
-        with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
-            generate(
-                model,
-                prompt,
-                max_new_tokens=2,
-                temperature=0.0,
-                attention_mask=attention_mask,
-                return_cache=False,
-            )
-
-    def test_generate_right_padding_raises(self) -> None:
-        """Ensure right padding is rejected for generation.
-
-        :return None: None.
-        """
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        prompt = jnp.array([[1, 2, 0, 0]], dtype=jnp.int32)
-        attention_mask = jnp.array([[True, True, False, False]])
-
-        with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
-            generate(
-                model,
-                prompt,
-                max_new_tokens=2,
-                temperature=0.0,
-                attention_mask=attention_mask,
-            )
-
-    def test_generate_padded_return_cache_raises(self) -> None:
-        """Ensure return_cache is rejected for padded batches.
-
-        :return None: None.
-        """
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
         prompt = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
-        attention_mask = jnp.array([[False, True, True, True]])
+        cache = init_cache(config, batch_size=1) if with_cache else None
 
         with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
             generate(
                 model,
                 prompt,
-                max_new_tokens=2,
+                max_new_tokens=max_new_tokens,
                 temperature=0.0,
-                attention_mask=attention_mask,
-                return_cache=True,
+                attention_mask=jnp.asarray(attention_mask),
+                cache=cache,
+                return_cache=return_cache,
             )
 
 

@@ -11,7 +11,7 @@ import pytest
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.layers.norms import BatchedLayerNorm
-from megalodon_jax.types import AttentionCache, LayerCache, NormState
+from megalodon_jax.types import LayerCache
 
 
 class TestMegalodonConfig:
@@ -329,23 +329,6 @@ class TestRotaryEmbeddingParity:
 class TestCacheTypes:
     """Tests for cache/state type definitions."""
 
-    def test_attention_cache_structure(self) -> None:
-        """Test AttentionCache fields and structure.
-
-        :return None: None.
-        """
-        k = jnp.zeros((2, 16, 4, 64))
-        v = jnp.zeros((2, 16, 4, 128))
-        count = jnp.array(16, dtype=jnp.int32)
-
-        cache = AttentionCache(k=k, v=v, count=count)
-        # Check field values
-        assert cache.k.shape == (2, 16, 4, 64)
-        assert cache.v.shape == (2, 16, 4, 128)
-        assert cache.count == 16
-        # Buffer capacity available via shape (not properties - see types.py docstring)
-        assert cache.k.shape[1] == 16
-
     def test_layer_cache_default_position(self) -> None:
         """Test LayerCache has JAX scalar position by default.
 
@@ -380,17 +363,3 @@ class TestCacheTypes:
         for i in range(5):
             cache = increment_position(cache)
             assert cache.position == i + 1
-
-    def test_norm_state_shapes(self) -> None:
-        """Test NormState shape handling.
-
-        :return None: None.
-        """
-        count = jnp.zeros((4,), dtype=jnp.int32)
-        mean = jnp.zeros((4, 32))
-        var = jnp.ones((4, 32))
-
-        state = NormState(count=count, mean=mean, var=var)
-        assert state.count.shape == (4,)
-        assert state.mean.shape == (4, 32)
-        assert state.var.shape == (4, 32)

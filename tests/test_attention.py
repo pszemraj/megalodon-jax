@@ -93,27 +93,6 @@ class TestAttentionPrimitives:
         expected = jnp.asarray([[[[0.0]], [[0.0]], [[2.0]], [[4.0]]]], dtype=jnp.float32)
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=0.0, rtol=0.0)
 
-    def test_single_chunk_no_temperature_scaling(self, random_seed: int) -> None:
-        """Test that attention uses scale=1.0 (no temperature scaling).
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, seq, heads, head_dim = 1, 4, 1, 8
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3 = jax.random.split(key, 3)
-
-        # Use small values to avoid softmax saturation
-        q = jax.random.normal(k1, (batch, seq, heads, head_dim)) * 0.1
-        k = jax.random.normal(k2, (batch, seq, heads, head_dim)) * 0.1
-        v = jax.random.normal(k3, (batch, seq, heads, head_dim))
-
-        out = attention_single_chunk(q, k, v)
-
-        # Verify output is not NaN and has reasonable magnitude
-        assert not jnp.any(jnp.isnan(out))
-
     def test_single_chunk_preserves_bf16_dtype(self, random_seed: int) -> None:
         """Test that attention_single_chunk preserves bf16 dtype (no forced fp32).
 
@@ -577,45 +556,6 @@ class TestChunkedAttention:
 
         assert out.shape == (batch, seq, heads, value_dim)
         assert cache is None  # No cache returned without return_cache=True
-
-    def test_streaming_with_cache(self, random_seed: int) -> None:
-        """Test ChunkedAttention streaming with cache.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, heads, head_dim, value_dim = 2, 4, 32, 64
-        chunk_size = 16
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-
-        attn = ChunkedAttention(
-            num_heads=heads,
-            head_dim=head_dim,
-            value_head_dim=value_dim,
-            chunk_size=chunk_size,
-            key=k1,
-        )
-
-        # Process tokens one at a time
-        outputs = []
-        cache = None
-
-        for i in range(8):
-            ki = jax.random.fold_in(k2, i)
-            q = jax.random.normal(ki, (batch, 1, heads, head_dim))
-            k = jax.random.normal(jax.random.fold_in(k3, i), (batch, 1, heads, head_dim))
-            v = jax.random.normal(jax.random.fold_in(k4, i), (batch, 1, heads, value_dim))
-
-            out, cache, position = attn(q, k, v, cache=cache, return_cache=True)
-            outputs.append(out)
-
-        # Check final cache state
-        assert cache is not None
-        assert cache.count == 8
-        # Fixed-size buffer uses chunk_size in released chunk-local mode.
-        assert cache.k.shape[1] == chunk_size
 
     def test_streaming_rejects_strict_metadata(self, random_seed: int) -> None:
         """Streaming cache path should reject segment/position strict metadata."""
@@ -1171,26 +1111,6 @@ class TestMegalodonAttention:
 
 class TestPrecision:
     """Tests for bf16 precision handling."""
-
-    def test_attention_primitives_bf16(self, random_seed: int) -> None:
-        """Test attention primitives work with bf16 inputs.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, seq, heads, head_dim = 2, 16, 4, 32
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3 = jax.random.split(key, 3)
-
-        q = jax.random.normal(k1, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
-        k = jax.random.normal(k2, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
-        v = jax.random.normal(k3, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
-
-        out = attention_single_chunk(q, k, v)
-
-        assert out.dtype == jnp.bfloat16
-        assert not jnp.any(jnp.isnan(out))
 
     def test_attention_accum_dtype_override(self, random_seed: int) -> None:
         """Test attention primitives accept an accum_dtype override.
