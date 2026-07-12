@@ -110,11 +110,9 @@ The suite covers:
 - Source-derived Torch/JAX full-logit and every-parameter gradient parity
 - Three-step AdamW parity and deterministic tiny-batch overfit
 - Arbitrary cache partitioning, cache save/reload, and packed-document isolation
-
-Before resuming an expensive training run, execute both complete gates from the repository root: `conda run --name mega-jax pytest` and `conda run --name mega-jax python tools/verify_modeling_correctness.py --include-slow`. A verifier run without `--include-slow` records the omitted training/cache checks as skipped and is not a training-resumption gate.
 - Exact preset parameter counts, initialization distributions, non-trainable buffer audits, and strict checkpoint conversion
 - FP32 and BF16 dtype behavior; FP16 rejection
 - JIT stability: no retracing on repeated calls with same shapes
 - GPU/CPU coverage via pytest fixtures
 
-`tools/verify_modeling_correctness.py --include-slow` is the training-resumption gate. It reads the exact local paper/source, records source hashes and environment details, reports skipped runtime-only checks, writes machine-readable JSON, and exits nonzero on a failed invariant. The original fused CUDA implementation is never built as part of this gate.
+Before resuming an expensive training run, execute both complete gates from the repository root: `conda run --name mega-jax pytest` and `conda run --name mega-jax python tools/verify_modeling_correctness.py --include-slow`. The verifier reads the exact local paper/source, records source hashes and environment details, reports skipped runtime-only checks, writes machine-readable JSON, and exits nonzero on a failed invariant. A run without `--include-slow` records the omitted training/cache checks as skipped and is not a training-resumption gate. The original fused CUDA implementation is never built as part of this gate.
