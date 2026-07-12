@@ -15,7 +15,7 @@ from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM,
 from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE
 from megalodon_jax.inference import init_cache
 from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
-from megalodon_jax.types import ModelCache
+from megalodon_jax.types import EMAState, LayerCache, ModelCache
 from tests.factories import floating_to_bf16, tiny_config
 
 
@@ -751,13 +751,13 @@ class TestModelCache:
         }
         next_token = jnp.asarray([[4]], dtype=jnp.int32)
         for invalid in malformed.values():
-            with pytest.raises(Exception, match="pristine zero-history initializer"):
+            with pytest.raises(Exception, match="sparse zero-history initializer"):
                 jax.block_until_ready(model(next_token, cache=invalid, return_cache=True))
 
         compiled = eqx.filter_jit(
             lambda values, state: model(values, cache=state, return_cache=True)
         )
-        with pytest.raises(Exception, match="pristine zero-history initializer"):
+        with pytest.raises(Exception, match="sparse zero-history initializer"):
             jax.block_until_ready(compiled(next_token, malformed["attention"]))
         with pytest.raises(ValueError, match="non-empty input_ids"):
             jax.block_until_ready(
@@ -798,24 +798,28 @@ class TestModelCache:
             with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
                 jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
 
-    def test_pristine_partial_cache_rejects_hidden_state(self, random_seed: int) -> None:
-        """A zero-timeline partial initializer cannot hide active EMA history."""
+    def test_pristine_cache_rejects_history_buffers(self, random_seed: int) -> None:
+        """A zero timeline cannot carry zero-filled or active history buffers."""
         config = small_config()
         model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
-        cache = init_cache(config, batch_size=1, allocate_ema=True)
-        first = cache.layer_caches[0]
-        assert first is not None and first.ema is not None
-        active_ema = replace(
-            first.ema,
-            h=first.ema.h.at[0, 0, 0].set(jnp.asarray(1.0 + 0.0j, dtype=jnp.complex64)),
+        cache = init_cache(config)
+        first = LayerCache(
+            attn=None,
+            norm=None,
+            ema=None,
+            position=jnp.asarray(0, dtype=jnp.int32),
         )
-        invalid = replace(
-            cache,
-            layer_caches=(replace(first, ema=active_ema), *cache.layer_caches[1:]),
-        )
-
-        with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
-            jax.block_until_ready(model(jnp.asarray([[1]], dtype=jnp.int32), cache=invalid))
+        zero_history = jnp.zeros((1, config.model_dim, config.cema_ndim), dtype=jnp.complex64)
+        for history in (zero_history, zero_history.at[0, 0, 0].set(1.0 + 0.0j)):
+            invalid = replace(
+                cache,
+                layer_caches=(
+                    replace(first, ema=EMAState(h=history)),
+                    *cache.layer_caches[1:],
+                ),
+            )
+            with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+                jax.block_until_ready(model(jnp.asarray([[1]], dtype=jnp.int32), cache=invalid))
 
 
 # -----------------------------------------------------------------------------

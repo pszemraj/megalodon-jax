@@ -27,7 +27,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
-from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
+from megalodon_jax.types import AttentionCache, LayerCache, ModelCache, NormState
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -36,72 +36,15 @@ from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache
 
 def init_cache(
     config: MegalodonConfig,
-    batch_size: int,
-    *,
-    allocate_kv: bool = False,
-    allocate_norm: bool = False,
-    allocate_ema: bool = False,
 ) -> ModelCache:
-    """Create an empty ModelCache for autoregressive generation.
+    """Create a sparse zero-history cache for autoregressive generation.
 
     :param MegalodonConfig config: Model configuration.
-    :param int batch_size: Batch size for cached tensors.
-    :param bool allocate_kv: Whether to pre-allocate KV buffers.
-    :param bool allocate_norm: Whether to pre-allocate TimestepNorm state.
-    :param bool allocate_ema: Whether to pre-allocate ComplexEMA state.
     :return ModelCache: Initialized cache with per-layer state.
     """
 
-    cache_len = config.cache_capacity
-    cache_dtype = config.compute_dtype
-    num_heads = config.num_heads
-    head_dim = config.head_dim
-    value_head_dim = config.value_head_dim
-
-    def make_attn_cache() -> AttentionCache | None:
-        """Build an AttentionCache when KV preallocation is requested.
-
-        :return AttentionCache | None: Allocated cache or None.
-        """
-        if not allocate_kv:
-            return None
-        k = jnp.zeros((batch_size, cache_len, num_heads, head_dim), dtype=cache_dtype)
-        v = jnp.zeros((batch_size, cache_len, num_heads, value_head_dim), dtype=cache_dtype)
-        return AttentionCache(k=k, v=v, count=jnp.array(0, dtype=jnp.int32))
-
-    def make_norm_state() -> NormState:
-        """Create an initialized NormState for a batch.
-
-        :return NormState: Initialized norm state.
-        """
-        return NormState(
-            count=jnp.zeros((batch_size,), dtype=jnp.int32),
-            mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=jnp.float32),
-            var=jnp.ones((batch_size, config.norm_num_groups), dtype=jnp.float32),
-        )
-
-    def make_ema_state() -> EMAState:
-        """Create an initialized EMAState for a batch.
-
-        :return EMAState: Initialized EMA state.
-        """
-        h = jnp.zeros((batch_size, config.model_dim, config.cema_ndim), dtype=jnp.complex64)
-        return EMAState(h=h)
-
-    layer_caches = []
-    for _ in range(config.num_layers):
-        layer_caches.append(
-            LayerCache(
-                attn=make_attn_cache(),
-                norm=make_norm_state() if allocate_norm else None,
-                ema=make_ema_state() if allocate_ema else None,
-                position=jnp.array(0, dtype=jnp.int32),
-            )
-        )
-
-    final_norm = make_norm_state()
-
-    return ModelCache(layer_caches=tuple(layer_caches), final_norm=final_norm)
+    layer_caches = tuple(None for _ in range(config.num_layers))
+    return ModelCache(layer_caches=layer_caches, final_norm=None)
 
 
 def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCache:

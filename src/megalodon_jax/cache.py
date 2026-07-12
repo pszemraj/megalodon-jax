@@ -24,7 +24,7 @@ from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.types import ModelCache, NormState
 
 CACHE_INVARIANT_MESSAGE = (
-    "cache must be either a pristine zero-history initializer or a complete, "
+    "cache must be either a sparse zero-history initializer or a complete, "
     "timeline-aligned continuation"
 )
 
@@ -160,6 +160,7 @@ def cache_invariant_violation(
 
     counters = [*positions, *attention_counts, *(state.count for state in norm_states)]
     violations = [jnp.any(counter < 0) for counter in counters]
+    has_history_buffers = bool(attention_arrays or ema_states)
     if check_finite:
         violations.extend(jnp.any(~jnp.isfinite(value)) for value in attention_arrays)
         violations.extend(jnp.any(~jnp.isfinite(value)) for value in ema_states)
@@ -198,6 +199,7 @@ def cache_invariant_violation(
         violations.extend(position != timeline for position in positions)
         violations.extend(count != timeline for count in attention_counts)
         violations.extend(jnp.any(state.count != timeline) for state in norm_states)
+        violations.append((timeline == 0) & has_history_buffers)
         violations.append(
             jax.lax.cond(
                 timeline == 0,
@@ -207,6 +209,7 @@ def cache_invariant_violation(
         )
     else:
         violations.extend(jnp.any(counter != 0) for counter in counters)
+        violations.append(jnp.asarray(has_history_buffers))
         violations.append(pristine_violation())
 
     return _any(violations)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from itertools import product
 from pathlib import Path
 
 import jax
@@ -46,35 +45,21 @@ def small_config() -> MegalodonConfig:
 class TestCacheUtilities:
     """Cache initialization and batch-indexing helpers."""
 
-    def test_init_cache_shapes(self) -> None:
-        """Validate fixed-capacity cache initialization shapes.
+    def test_init_cache_is_sparse(self) -> None:
+        """A pristine cache carries structure but allocates no history buffers.
 
         :return None: None.
         """
         config = small_config()
-        cache = init_cache(config, batch_size=2, allocate_kv=True)
+        cache = init_cache(config)
 
-        layer0 = cache.layer_caches[0]
-        assert layer0 is not None and layer0.attn is not None
-        assert layer0.attn.k.shape == (
-            2,
-            config.cache_capacity,
-            config.num_heads,
-            config.head_dim,
-        )
+        assert cache.layer_caches == (None,) * config.num_layers
+        assert cache.final_norm is None
 
-    def test_all_pristine_allocation_combinations_are_valid(self) -> None:
-        """Lazy and preallocated zero-history structures share one valid contract."""
+    def test_pristine_cache_is_valid(self) -> None:
+        """The public sparse zero-history representation satisfies cache invariants."""
         config = small_config()
-        for allocate_kv, allocate_norm, allocate_ema in product((False, True), repeat=3):
-            cache = init_cache(
-                config,
-                batch_size=2,
-                allocate_kv=allocate_kv,
-                allocate_norm=allocate_norm,
-                allocate_ema=allocate_ema,
-            )
-            validate_model_cache_host(cache, config)
+        validate_model_cache_host(init_cache(config), config)
 
     def test_index_cache_slices_batch(self) -> None:
         """Ensure index_cache slices the batch dimension correctly.
@@ -82,7 +67,12 @@ class TestCacheUtilities:
         :return None: None.
         """
         config = small_config()
-        cache = init_cache(config, batch_size=2, allocate_kv=True)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        _, cache = model(
+            jnp.asarray([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32),
+            return_cache=True,
+        )
+        assert cache is not None
         layer0 = cache.layer_caches[0]
         assert layer0 is not None and layer0.attn is not None
 
@@ -113,32 +103,25 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
-    def test_preallocated_and_lazy_cache_defaults_match(self) -> None:
-        """Config-built initial states match the layers' lazy state constructors."""
+    def test_explicit_pristine_and_none_cache_match(self) -> None:
+        """The public sparse initializer is equivalent to an omitted cache."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
-        lazy = init_cache(config, batch_size=1)
-        preallocated = init_cache(
-            config,
-            batch_size=1,
-            allocate_kv=True,
-            allocate_norm=True,
-            allocate_ema=True,
-        )
+        pristine = init_cache(config)
 
-        lazy_logits, lazy_result = model(tokens, cache=lazy, return_cache=True)
-        allocated_logits, allocated_result = model(
+        expected_logits, expected_cache = model(tokens, return_cache=True)
+        actual_logits, actual_cache = model(
             tokens,
-            cache=preallocated,
+            cache=pristine,
             return_cache=True,
         )
 
-        np.testing.assert_array_equal(np.asarray(allocated_logits), np.asarray(lazy_logits))
-        assert lazy_result is not None and allocated_result is not None
+        np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
+        assert expected_cache is not None and actual_cache is not None
         for expected, actual in zip(
-            jax.tree.leaves(lazy_result),
-            jax.tree.leaves(allocated_result),
+            jax.tree.leaves(expected_cache),
+            jax.tree.leaves(actual_cache),
             strict=True,
         ):
             np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
@@ -455,7 +438,7 @@ class TestSamplingAndGeneration:
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
-        cache = init_cache(config, batch_size=1) if with_cache else None
+        cache = init_cache(config) if with_cache else None
 
         with pytest.raises(ValueError, match="Cannot use cache with padded attention_mask"):
             generate(
@@ -829,9 +812,14 @@ class TestConversion:
         from safetensors.flax import load_file, save_file
 
         config = small_config()
-        initialized = init_cache(config, batch_size=1, allocate_kv=True)
+        pristine_layer = LayerCache(
+            attn=None,
+            norm=None,
+            ema=None,
+            position=jnp.asarray(0, dtype=jnp.int32),
+        )
         sparse = ModelCache(
-            layer_caches=(initialized.layer_caches[0], *([None] * (config.num_layers - 1))),
+            layer_caches=(pristine_layer, *([None] * (config.num_layers - 1))),
             final_norm=None,
         )
         valid = tmp_path / "sparse-zero.safetensors"
@@ -841,7 +829,6 @@ class TestConversion:
             metadata = dict(handle.metadata() or {})
 
         tensors["layers.0.position"] = jnp.asarray(1, dtype=jnp.int32)
-        tensors["layers.0.attn.count"] = jnp.asarray(1, dtype=jnp.int32)
         corrupted = tmp_path / "sparse-nonzero.safetensors"
         save_file(tensors, str(corrupted), metadata=metadata)
 
@@ -881,9 +868,14 @@ class TestConversion:
     def test_sparse_cache_layer_presence_uses_exact_layer_names(self, tmp_path: Path) -> None:
         """Layer 10 presence must not imply that similarly prefixed layer 1 exists."""
         config = replace(small_config(), num_layers=11)
-        initialized = init_cache(config, batch_size=1, allocate_kv=True)
+        pristine_layer = LayerCache(
+            attn=None,
+            norm=None,
+            ema=None,
+            position=jnp.asarray(0, dtype=jnp.int32),
+        )
         sparse = ModelCache(
-            layer_caches=(*([None] * 10), initialized.layer_caches[10]),
+            layer_caches=(*([None] * 10), pristine_layer),
             final_norm=None,
         )
         path = tmp_path / "sparse-cache.safetensors"

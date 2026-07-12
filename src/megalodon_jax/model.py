@@ -358,6 +358,15 @@ class MegalodonModel(eqx.Module):
             raise ValueError(
                 "cache input and return_cache are inference-only; use deterministic=True"
             )
+        if (
+            cache is not None
+            and len(cache.layer_caches) == len(self.layers)
+            and cache.final_norm is None
+            and all(layer is None for layer in cache.layer_caches)
+        ):
+            # Canonicalize the public sparse initializer before tracing so it
+            # is exactly the same program as an omitted cache.
+            cache = None
         B, L = input_ids.shape
         if cache is not None and (B == 0 or L == 0):
             raise ValueError("cache input requires non-empty input_ids")

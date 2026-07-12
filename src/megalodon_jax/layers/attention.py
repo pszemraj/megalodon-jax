@@ -783,13 +783,6 @@ class ChunkedAttention(eqx.Module):
             )
             return out, new_cache, final_count
 
-        if cache is not None and return_cache and deterministic:
-            return jax.lax.cond(
-                count == 0,
-                lambda _: self._prefill(q, k, v, deterministic, key),
-                run_streaming,
-                operand=None,
-            )
         return run_streaming(None)
 
 
@@ -1019,11 +1012,6 @@ class MegalodonAttention(eqx.Module):
         norm_state = cache.norm if cache is not None else None
         ema_state = cache.ema.h if cache is not None and cache.ema is not None else None
         attn_cache = cache.attn if cache is not None else None
-        if cache is not None and ema_state is None:
-            # Canonicalize explicit lazy and preallocated zero-history caches
-            # onto one dynamic program. Model validation only permits missing
-            # components at position zero.
-            ema_state = jnp.zeros((B, D, self.cema.ndim), dtype=jnp.complex64)
 
         # TimestepNorm (segment_ids resets running stats at packed-doc boundaries)
         x_tn, new_norm_state = self.timenorm(
@@ -1046,17 +1034,7 @@ class MegalodonAttention(eqx.Module):
                 use_associative_segment_scan=self.use_associative_segment_scan,
             )
 
-        if cache is not None and ema_state is not None:
-            # Preallocated zero-history state is semantically identical to the
-            # lazy None state and must use the same FFT prefill output path.
-            y_cema, h_last = jax.lax.cond(
-                cache.position == 0,
-                lambda _: run_cema(None),
-                lambda _: run_cema(ema_state),
-                operand=None,
-            )
-        else:
-            y_cema, h_last = run_cema(ema_state)
+        y_cema, h_last = run_cema(ema_state)
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)

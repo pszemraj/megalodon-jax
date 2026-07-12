@@ -56,7 +56,7 @@ _FAST_TEST_PREFIXES = (
     "tests/test_core_layers.py::TestPrecisionPolicy::test_complex_ema_fft_vs_sequential_bf16",
     "tests/test_attention.py::TestChunkedAttention::test_pristine_prefill_partition_smoke",
     "tests/test_attention.py::TestChunkedAttention::test_pristine_prefill_has_no_sequence_loop",
-    "tests/test_inference.py::TestCacheUtilities::test_preallocated_and_lazy_cache_defaults_match",
+    "tests/test_inference.py::TestCacheUtilities::test_explicit_pristine_and_none_cache_match",
     "tests/test_inference.py::TestSamplingAndGeneration::test_sample_controls_validate_before_greedy",
     "tests/test_inference.py::TestSamplingAndGeneration::test_generate_canonicalizes_all_true_mask",
     "tests/test_inference.py::TestSamplingAndGeneration::test_generate_rejects_left_padding",
