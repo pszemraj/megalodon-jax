@@ -13,7 +13,7 @@ import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
-from tests.factories import tiny_config
+from tests.factories import floating_to_bf16, tiny_config
 
 
 def small_config() -> MegalodonConfig:
@@ -690,73 +690,28 @@ class TestModelCache:
 class TestFix1GradientCheckpointing:
     """Tests for gradient checkpointing (Fix 1)."""
 
-    def test_checkpointing_disables_cache_during_training(self, random_seed: int) -> None:
-        """Test that use_checkpoint=True produces None caches during training.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=2,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            use_checkpoint=True,  # Enable checkpointing
-        )
+    @pytest.mark.parametrize("use_checkpoint", [False, True])
+    @pytest.mark.parametrize("deterministic", [False, True])
+    def test_cache_population_respects_execution_mode(
+        self,
+        random_seed: int,
+        use_checkpoint: bool,
+        deterministic: bool,
+    ) -> None:
+        """Only deterministic inference populates caches, with or without remat."""
+        config = replace(small_config(), use_checkpoint=use_checkpoint)
         batch, seq = 2, 16
-
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
-
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
-
-        # Training mode (deterministic=False) with checkpointing
-        # The PRNG key is needed for dropout even if dropout=0
         dropout_key = jax.random.PRNGKey(42)
-        _, cache = model(input_ids, return_cache=True, deterministic=False, key=dropout_key)
-
-        # All layer caches should be None when checkpointing
-        for layer_cache in cache.layer_caches:
-            assert layer_cache is None, "Layer cache should be None when checkpointing"
-
-    def test_checkpointing_disabled_returns_cache(self, random_seed: int) -> None:
-        """Test that use_checkpoint=False returns caches normally.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=2,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            use_checkpoint=False,  # Disable checkpointing
+        _, cache = model(
+            input_ids,
+            return_cache=True,
+            deterministic=deterministic,
+            key=dropout_key,
         )
-        batch, seq = 2, 16
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonModel(config, key=key)
-
-        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
-
-        # Deterministic mode returns caches
-        _, cache = model(input_ids, return_cache=True, deterministic=True)
-
-        # Layer caches should be populated
-        for layer_cache in cache.layer_caches:
-            assert layer_cache is not None, "Layer cache should be returned when not checkpointing"
+        assert all(layer is not None for layer in cache.layer_caches) is deterministic
 
 
 class TestFixDropoutKeyGuard:
@@ -1784,17 +1739,7 @@ class TestPrecisionAudit:
         mismatches = audit_sensitive_param_dtypes(model)
         assert mismatches == {}
 
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16.
-
-            :param Any x: Input value to cast when floating point.
-            :return Any: Casted value or original input.
-            """
-            if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
-                return x.astype(jnp.bfloat16)
-            return x
-
-        model_bf16 = jax.tree.map(to_bf16, model)
+        model_bf16 = jax.tree.map(floating_to_bf16, model)
         mismatches = audit_sensitive_param_dtypes(model_bf16)
         assert "layers.0.attn.cema.alpha" in mismatches
         assert "layers.0.ffn.alpha" in mismatches

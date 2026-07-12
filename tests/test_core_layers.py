@@ -12,6 +12,7 @@ import pytest
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
 from megalodon_jax.layers.segments import segment_boundaries, segment_runs_and_local_positions
+from tests.factories import floating_to_bf16
 
 
 class TestSegmentHelpers:
@@ -832,18 +833,7 @@ class TestPrecisionPolicy:
         key = jax.random.PRNGKey(random_seed)
         ema_f32 = ComplexEMA(dim, ndim, key=key)
 
-        # Cast parameters to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if eqx.is_array(x) and x.dtype == jnp.float32:
-                return x.astype(jnp.bfloat16)
-            return x
-
-        ema_bf16 = jax.tree.map(to_bf16, ema_f32)
+        ema_bf16 = jax.tree.map(floating_to_bf16, ema_f32)
 
         # Coefficients should be computed in fp32
         p_f32, q_f32, gamma_f32 = ema_f32._coeffs()
@@ -881,18 +871,7 @@ class TestPrecisionPolicy:
 
         jax_ema = ComplexEMA(dim, ndim, key=k1)
 
-        # Cast to bf16
-        def to_bf16(x: Any) -> Any:
-            """Cast floating-point arrays to bf16 for precision tests.
-
-            :param Any x: Input value to cast if it is a floating array.
-            :return Any: Casted value or original input.
-            """
-            if eqx.is_array(x) and x.dtype == jnp.float32:
-                return x.astype(jnp.bfloat16)
-            return x
-
-        jax_ema_bf16 = jax.tree.map(to_bf16, jax_ema)
+        jax_ema_bf16 = jax.tree.map(floating_to_bf16, jax_ema)
 
         # Generate bf16 input
         batch, seq = 2, 32

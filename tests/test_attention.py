@@ -466,52 +466,6 @@ class TestChunkedAttention:
         assert cache is not None and int(cache.count) == length
         np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=2e-6)
 
-    @pytest.mark.parametrize("attention_window", [None, 3, 8])
-    def test_arbitrary_call_partition_invariance(
-        self,
-        random_seed: int,
-        attention_window: int | None,
-    ) -> None:
-        """Full, chunked, and tokenwise calls share one semantic timeline."""
-        key = jax.random.PRNGKey(random_seed)
-        k_module, kq, kk, kv = jax.random.split(key, 4)
-        module = ChunkedAttention(
-            num_heads=1,
-            head_dim=4,
-            value_head_dim=3,
-            chunk_size=4,
-            attention_window=attention_window,
-            key=k_module,
-        )
-        q = jax.random.normal(kq, (1, 12, 1, 4))
-        k = jax.random.normal(kk, (1, 12, 1, 4))
-        v = jax.random.normal(kv, (1, 12, 1, 3))
-
-        reference, reference_cache, _ = module(q, k, v, return_cache=True)
-        assert reference_cache is not None
-        for partitions in ([1] * 12, [3, 2, 7], [5, 4, 3], [4, 4, 4]):
-            outputs = []
-            cache = None
-            offset = 0
-            for width in partitions:
-                part, cache, _ = module(
-                    q[:, offset : offset + width],
-                    k[:, offset : offset + width],
-                    v[:, offset : offset + width],
-                    cache=cache,
-                    return_cache=True,
-                )
-                outputs.append(part)
-                offset += width
-            actual = jnp.concatenate(outputs, axis=1)
-            np.testing.assert_allclose(actual, reference, atol=2e-6, rtol=2e-6)
-            np.testing.assert_allclose(cache.k, reference_cache.k, atol=0.0, rtol=0.0)
-            np.testing.assert_allclose(cache.v, reference_cache.v, atol=0.0, rtol=0.0)
-            np.testing.assert_array_equal(cache.count, reference_cache.count)
-
-        noncached, _, _ = module(q, k, v)
-        np.testing.assert_allclose(noncached, reference, atol=2e-6, rtol=2e-6)
-
     def test_cache_copy_continuation_is_identical(self, random_seed: int) -> None:
         """A reloaded array-identical cache resumes without numerical drift."""
         key = jax.random.PRNGKey(random_seed)
@@ -674,14 +628,21 @@ class TestChunkedAttention:
             atol=1e-6,
         )
 
-    @pytest.mark.parametrize("attention_window", [None, 8])
+    @pytest.mark.parametrize("attention_window", [None, 3, 8])
     def test_arbitrary_cache_partition_invariance(
         self,
         random_seed: int,
         attention_window: int | None,
     ) -> None:
         """Cached outputs and state cannot depend on caller chunk boundaries."""
-        for partition in ((1,) * 12, (3, 5, 4), (7, 1, 4)):
+        for partition in (
+            (1,) * 12,
+            (3, 2, 7),
+            (5, 4, 3),
+            (4, 4, 4),
+            (3, 5, 4),
+            (7, 1, 4),
+        ):
             errors = cache_partition_errors(
                 attention_window,
                 partition,
