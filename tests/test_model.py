@@ -689,13 +689,23 @@ class TestFix1GradientCheckpointing:
         model = MegalodonModel(config, key=key)
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
         dropout_key = jax.random.PRNGKey(42)
-        _, cache = model(
-            input_ids,
-            return_cache=True,
-            deterministic=deterministic,
-            key=dropout_key,
-        )
-        assert all(layer is not None for layer in cache.layer_caches) is deterministic
+        if not deterministic:
+            with pytest.raises(ValueError, match="inference-only"):
+                model(
+                    input_ids,
+                    return_cache=True,
+                    deterministic=False,
+                    key=dropout_key,
+                )
+        else:
+            _, cache = model(
+                input_ids,
+                return_cache=True,
+                deterministic=True,
+                key=dropout_key,
+            )
+            assert cache is not None
+            assert all(layer is not None for layer in cache.layer_caches)
 
 
 class TestFixDropoutKeyGuard:
@@ -750,12 +760,12 @@ class TestPaddingContract:
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
 
-        input_ids = jnp.array([[0, 5]], dtype=jnp.int32)
+        input_ids = jnp.array([[5, 0]], dtype=jnp.int32)
         valid_output, _ = model(input_ids, attention_mask=jnp.array([[True, True]]))
-        masked_output, _ = model(input_ids, attention_mask=jnp.array([[False, True]]))
+        masked_output, _ = model(input_ids, attention_mask=jnp.array([[True, False]]))
 
-        assert np.any(np.asarray(valid_output[0, 0]) != 0.0)
-        np.testing.assert_array_equal(np.asarray(masked_output[0, 0]), np.zeros(64))
+        assert np.any(np.asarray(valid_output[0, 1]) != 0.0)
+        np.testing.assert_array_equal(np.asarray(masked_output[0, 1]), np.zeros(64))
 
         replacement = model.embed.weight.at[0].add(jnp.linspace(-1.0, 1.0, 64))
         modified = eqx.tree_at(lambda current: current.embed.weight, model, replacement)
@@ -1198,6 +1208,29 @@ class TestEdgeCases:
         logits, cache = model(input_ids, return_cache=True)
         assert logits.shape == (batch, seq, config.vocab_size)
         assert cache is not None
+
+    @pytest.mark.parametrize("supply_cache", [False, True])
+    def test_nondeterministic_calls_reject_streaming_state(
+        self, random_seed: int, supply_cache: bool
+    ) -> None:
+        """Training cannot return or consume a partially advanced inference cache."""
+        config = small_config(num_layers=1)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        cache = None
+        return_cache = True
+        if supply_cache:
+            _, cache = model(tokens[:, :1], return_cache=True)
+            return_cache = False
+
+        with pytest.raises(ValueError, match="inference-only"):
+            model(
+                tokens,
+                cache=cache,
+                return_cache=return_cache,
+                deterministic=False,
+                key=jax.random.PRNGKey(1),
+            )
 
     def test_empty_batch_handling(self, random_seed: int) -> None:
         """Test that empty batch (B=0) is handled gracefully.
@@ -1683,7 +1716,7 @@ class TestPackedMetadata:
         input_ids = jnp.asarray([[1, 2, 3, 4, 5, 6, 7, 8]], dtype=jnp.int32)
         segment_ids = jnp.ones_like(input_ids, dtype=jnp.int32)
 
-        with pytest.raises(ValueError, match="non-cached training"):
+        with pytest.raises(ValueError, match="inference-only"):
             model(
                 input_ids,
                 segment_ids=segment_ids,

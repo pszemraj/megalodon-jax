@@ -122,6 +122,13 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
+    def test_init_cache_rejects_dtype_override(self, dtype: jnp.dtype) -> None:
+        """Cache construction and persistence share the model compute dtype."""
+        config = replace(small_config(), compute_dtype=jnp.bfloat16)
+        with pytest.raises(ValueError, match="cache dtype must equal config.compute_dtype"):
+            init_cache(config, batch_size=1, dtype=dtype, allocate_kv=True)
+
     def test_preallocated_and_lazy_cache_defaults_match(self) -> None:
         """Config-built initial states match the layers' lazy state constructors."""
         config = small_config()
@@ -218,6 +225,26 @@ class TestSamplingAndGeneration:
         )
         assert int(token[0]) == 1
 
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"temperature": float("nan")}, "temperature must be finite"),
+            ({"temperature": float("inf")}, "temperature must be finite"),
+            ({"temperature": -1.0}, "temperature must be finite"),
+            ({"temperature": 0.0, "top_k": -1}, "top_k must be"),
+            ({"temperature": 0.0, "top_k": 4}, "top_k must be"),
+            ({"temperature": 0.0, "top_p": 0.0}, "top_p must be finite"),
+            ({"temperature": 0.0, "top_p": float("nan")}, "top_p must be finite"),
+        ],
+    )
+    def test_sample_controls_validate_before_greedy(
+        self, kwargs: dict[str, float | int], message: str
+    ) -> None:
+        """Greedy execution must not bypass invalid sampling controls."""
+        logits = jnp.zeros((1, 3), dtype=jnp.float32)
+        with pytest.raises(ValueError, match=message):
+            sample_token(logits, None, **kwargs)
+
     def test_generate_shapes_and_determinism(self) -> None:
         """Test generate shape, determinism, and vocabulary bounds.
 
@@ -297,6 +324,46 @@ class TestSamplingAndGeneration:
         assert layer0 is not None and layer0.attn is not None
         assert int(layer0.attn.count) == prompt.shape[1] + 3
 
+    @pytest.mark.parametrize("max_new_tokens", [1, 2])
+    @pytest.mark.parametrize("return_cache", [False, True])
+    def test_generate_canonicalizes_all_true_mask(
+        self, max_new_tokens: int, return_cache: bool
+    ) -> None:
+        """An all-valid mask is exactly equivalent to omitting mask metadata."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        expected, _, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            return_cache=return_cache,
+        )
+        actual, cache, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            attention_mask=jnp.ones_like(prompt, dtype=jnp.bool_),
+            return_cache=return_cache,
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        assert (cache is not None) is return_cache
+
+    def test_generate_rejects_non_vocabulary_output_space(self) -> None:
+        """Autoregressive output IDs must always be valid embedding IDs."""
+        config = replace(small_config(), output_size=small_config().vocab_size + 1)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        with pytest.raises(ValueError, match="effective_output_size.*vocab_size"):
+            generate(
+                model,
+                jnp.asarray([[1, 2]], dtype=jnp.int32),
+                max_new_tokens=1,
+                temperature=0.0,
+            )
+
     def test_generate_zero_new_tokens_raises(self) -> None:
         """Ensure generate rejects zero-length outputs.
 
@@ -315,29 +382,17 @@ class TestSamplingAndGeneration:
                 temperature=0.0,
             )
 
-    @pytest.mark.parametrize(
-        ("prompt", "attention_mask"),
-        [
-            pytest.param(
-                [[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]],
-                [[True, True, True, True, True], [True, True, True, False, False]],
-                id="right-padding",
-            ),
-            pytest.param(
-                [[0, 0, 1, 2, 3], [0, 4, 5, 6, 7]],
-                [[False, False, True, True, True], [False, True, True, True, True]],
-                id="left-padding",
-            ),
-        ],
-    )
     def test_generate_uses_last_valid_token_with_padding(
         self,
-        prompt: list[list[int]],
-        attention_mask: list[list[bool]],
     ) -> None:
-        """Greedy generation selects logits from the last valid prompt token."""
+        """Greedy generation selects logits from the last valid right-padded token."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = [[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]]
+        attention_mask = [
+            [True, True, True, True, True],
+            [True, True, True, False, False],
+        ]
         prompt_array = jnp.asarray(prompt, dtype=jnp.int32)
         mask_array = jnp.asarray(attention_mask)
 
@@ -360,6 +415,18 @@ class TestSamplingAndGeneration:
         )
 
         np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
+
+    def test_generate_rejects_left_padding(self) -> None:
+        """Physical left padding cannot silently shift chunk-local semantics."""
+        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
+        with pytest.raises(Exception, match="left-padded.*right padding"):
+            generate(
+                model,
+                jnp.asarray([[0, 0, 1, 2]], dtype=jnp.int32),
+                max_new_tokens=1,
+                temperature=0.0,
+                attention_mask=jnp.asarray([[False, False, True, True]]),
+            )
 
     def test_generate_empty_prompt_uses_bos(self) -> None:
         """Ensure empty prompts use BOS token.

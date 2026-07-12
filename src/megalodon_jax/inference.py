@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable
 
 import equinox as eqx
@@ -53,7 +54,11 @@ def init_cache(
     """
 
     cache_len = config.cache_capacity
-    cache_dtype = config.compute_dtype if dtype is None else dtype
+    if dtype is not None and jnp.dtype(dtype) != jnp.dtype(config.compute_dtype):
+        raise ValueError(
+            f"cache dtype must equal config.compute_dtype ({config.compute_dtype}), got {dtype}"
+        )
+    cache_dtype = config.compute_dtype
     num_heads = config.num_heads
     head_dim = config.head_dim
     value_head_dim = config.value_head_dim
@@ -326,12 +331,7 @@ def sample_token(
     :return Int[Array, "batch"]: Sampled token IDs.
     """
 
-    if temperature < 0.0:
-        raise ValueError(f"temperature must be >= 0, got {temperature}")
-    if top_k is not None and top_k < 0:
-        raise ValueError(f"top_k must be >= 0, got {top_k}")
-    if temperature != 0.0 and top_p is not None and not (0.0 < top_p <= 1.0):
-        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+    _validate_sampling(temperature, top_k, top_p, logits.shape[-1])
 
     if temperature == 0.0:
         return greedy_token(logits)
@@ -371,6 +371,21 @@ def _sample_fn(
     return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
 
 
+def _validate_sampling(
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+    output_size: int,
+) -> None:
+    """Validate sampling controls before selecting greedy or stochastic execution."""
+    if not math.isfinite(temperature) or temperature < 0.0:
+        raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
+    if top_k is not None and not 0 <= top_k <= output_size:
+        raise ValueError(f"top_k must be in [0, {output_size}], got {top_k}")
+    if top_p is not None and (not math.isfinite(top_p) or not 0.0 < top_p <= 1.0):
+        raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
+
+
 def _generate_core(
     model: MegalodonForCausalLM,
     prompt_ids: Int[Array, "batch prompt_len"],
@@ -408,6 +423,14 @@ def _generate_core(
     :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
     """
 
+    if model.config.effective_output_size != model.config.vocab_size:
+        raise ValueError("generate requires effective_output_size to equal vocab_size")
+    _validate_sampling(
+        temperature,
+        top_k,
+        top_p,
+        model.config.effective_output_size,
+    )
     if max_new_tokens < 0:
         raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
     if max_new_tokens == 0:
@@ -643,6 +666,8 @@ def generate(
             "Cannot use cache with padded attention_mask. "
             "Provide unpadded prompts for cached generation."
         )
+    if not has_padding:
+        attention_mask = None
 
     return _generate_core(
         model,

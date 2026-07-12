@@ -353,6 +353,10 @@ class MegalodonModel(eqx.Module):
         :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
         _require_dropout_key(self.config, deterministic, key)
+        if not deterministic and (cache is not None or return_cache):
+            raise ValueError(
+                "cache input and return_cache are inference-only; use deterministic=True"
+            )
         B, L = input_ids.shape
         if key is not None:
             embedding_key, layers_key = jax.random.split(key)
@@ -374,8 +378,20 @@ class MegalodonModel(eqx.Module):
                 empty_cache = None
             return empty_hidden, empty_cache
 
-        # Disable streaming cache updates during training (matches PyTorch behavior).
-        layer_return_cache = return_cache and deterministic
+        layer_return_cache = return_cache
+
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    f"attention_mask must have shape {input_ids.shape}, got {attention_mask.shape}"
+                )
+            mask = attention_mask.astype(jnp.bool_)
+            has_left_padding = (~mask[:, 0]) & jnp.any(mask, axis=1)
+            attention_mask = eqx.error_if(
+                mask,
+                jnp.any(has_left_padding),
+                "left-padded attention masks are unsupported; use right padding",
+            )
 
         # Validate token bounds - prevents silent incorrect embeddings from OOB indices
         # Note: Uses eqx.error_if for JIT-safe traced-value errors
