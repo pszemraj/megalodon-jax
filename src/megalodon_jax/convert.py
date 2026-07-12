@@ -297,11 +297,20 @@ def _replicated(shards: list[torch.Tensor], key: str) -> torch.Tensor:
 
 
 def _merge_axis(key: str) -> int | None:
+    """Return the original-source model-parallel consolidation axis.
+
+    Parameters constructed from a dimension divided by the model-parallel
+    world size are concatenated. Full-width normalization and layer-scale
+    parameters are replicated and must agree across ranks.
+    """
     if key == "embed.weight" or key == "output.output.weight":
         return 1
     if key == "rope.freqs" or key.endswith(".prior_count"):
         return None
-    if ".rmsnorm.weight" in key or ".nffn.norm." in key:
+    # Attention RMSNorm, FFN LayerNorm, and FFN alpha are constructed at full
+    # model_dim in the released source, so each model-parallel rank stores an
+    # identical copy.
+    if ".rmsnorm.weight" in key or ".nffn.norm." in key or key.endswith(".nffn.alpha"):
         return None
     if ".cema." in key:
         return 0
@@ -310,6 +319,7 @@ def _merge_axis(key: str) -> int | None:
     if key.endswith(".mega.gamma") or key.endswith(".mega.beta"):
         return 1
     concat_zero = (
+        # TimestepNorm divides features/groups by model-parallel world size.
         ".timenorm." in key
         or key.endswith(".wz.weight")
         or key.endswith(".wz.bias")
@@ -321,7 +331,8 @@ def _merge_axis(key: str) -> int | None:
         or key.endswith(".wh1.bias")
         or key.endswith(".fc1.weight")
         or key.endswith(".fc3.weight")
-        or key.endswith(".nffn.alpha")
+        # Final TimestepNorm is partitioned by feature/group just like the
+        # per-layer TimestepNorm; prior_count was handled as replicated above.
         or key.startswith("output.final_norm.")
     )
     if concat_zero:

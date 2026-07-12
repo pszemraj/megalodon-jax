@@ -491,6 +491,101 @@ class TestSamplingAndGeneration:
 class TestConversion:
     """Strict native and original-upstream checkpoint tests."""
 
+    @pytest.mark.torch_ref
+    def test_original_upstream_manifest_is_source_transcribed(self) -> None:
+        """Check converter keys, shapes, and dtypes against a hand-authored source manifest."""
+        torch = pytest.importorskip("torch")
+        config = MegalodonConfig(
+            vocab_size=17,
+            output_size=19,
+            model_dim=8,
+            num_layers=2,
+            num_heads=2,
+            z_dim=8,
+            value_dim=8,
+            ffn_hidden_dim=12,
+            cema_ndim=2,
+            chunk_size=8,
+            norm_num_groups=2,
+            swiglu=True,
+            rescale_nffn=True,
+            share_emb=False,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        # Literal dimensions below are transcribed from the constructors in
+        # the released moving-average attention, CEMA, TimestepNorm, NFFN,
+        # rotary, and output-layer sources. Do not derive this mapping through
+        # either converter direction or through JAX parameter leaves.
+        manifest: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
+            "embed.weight": ((17, 8), torch.float32),
+            "rope.freqs": ((2,), torch.float32),
+            "output.final_norm.prior_count": ((), torch.int64),
+            "output.final_norm.prior_mean": ((2,), torch.float32),
+            "output.final_norm.prior_logv": ((2,), torch.float32),
+            "output.final_norm.weight": ((8,), torch.float32),
+            "output.final_norm.bias": ((8,), torch.float32),
+            "output.output.weight": ((19, 8), torch.float32),
+        }
+        for index in range(2):
+            ap = f"layers.{index}.mega"
+            fp = f"layers.{index}.nffn"
+            manifest.update(
+                {
+                    f"{ap}.timenorm.prior_count": ((), torch.int64),
+                    f"{ap}.timenorm.prior_mean": ((2,), torch.float32),
+                    f"{ap}.timenorm.prior_logv": ((2,), torch.float32),
+                    f"{ap}.timenorm.weight": ((8,), torch.float32),
+                    f"{ap}.timenorm.bias": ((8,), torch.float32),
+                    f"{ap}.cema.alpha": ((8, 2, 1), torch.float32),
+                    f"{ap}.cema.delta": ((8, 2, 1), torch.float32),
+                    f"{ap}.cema.theta": ((8, 1, 1), torch.float32),
+                    f"{ap}.cema.gamma": ((8, 2, 2), torch.float32),
+                    f"{ap}.cema.omega": ((8, 1), torch.float32),
+                    f"{ap}.rmsnorm.weight": ((8,), torch.float32),
+                    f"{ap}.wz.weight": ((8, 8), torch.float32),
+                    f"{ap}.wz.bias": ((8,), torch.float32),
+                    f"{ap}.wv.weight": ((8, 8), torch.float32),
+                    f"{ap}.wv.bias": ((8,), torch.float32),
+                    f"{ap}.wr.weight": ((8, 8), torch.float32),
+                    f"{ap}.wr.bias": ((8,), torch.float32),
+                    f"{ap}.wh1.weight": ((8, 8), torch.float32),
+                    f"{ap}.wh1.bias": ((8,), torch.float32),
+                    f"{ap}.wh2.weight": ((8, 8), torch.float32),
+                    f"{ap}.gamma": ((2, 8), torch.float32),
+                    f"{ap}.beta": ((2, 8), torch.float32),
+                    f"{fp}.norm.weight": ((8,), torch.float32),
+                    f"{fp}.norm.bias": ((8,), torch.float32),
+                    f"{fp}.fc1.weight": ((12, 8), torch.float32),
+                    f"{fp}.fc2.weight": ((8, 12), torch.float32),
+                    f"{fp}.fc3.weight": ((12, 8), torch.float32),
+                    f"{fp}.alpha": ((8,), torch.float32),
+                }
+            )
+
+        exported = export_upstream_state_dict(model)
+        assert set(exported) == set(manifest)
+        for name, (shape, dtype) in manifest.items():
+            assert tuple(exported[name].shape) == shape, name
+            assert exported[name].dtype == dtype, name
+
+        generator = torch.Generator().manual_seed(1729)
+        source_state: dict[str, torch.Tensor] = {}
+        for name, (shape, dtype) in manifest.items():
+            if dtype == torch.int64 or name.endswith("prior_mean") or name.endswith("prior_logv"):
+                source_state[name] = torch.zeros(shape, dtype=dtype)
+            elif name == "rope.freqs":
+                source_state[name] = torch.tensor([1.0, 0.01], dtype=torch.float32)
+            else:
+                source_state[name] = torch.randn(shape, dtype=dtype, generator=generator)
+        loaded = load_upstream_state_dict(
+            MegalodonForCausalLM(config, key=jax.random.PRNGKey(1)),
+            source_state,
+        )
+        roundtripped = export_upstream_state_dict(loaded)
+        for name in manifest:
+            assert torch.equal(roundtripped[name], source_state[name]), name
+
     def test_native_v2_roundtrip_is_exact(self, tmp_path: Path) -> None:
         """Native save/reload preserves every tensor and model output."""
         config = small_config()
@@ -606,12 +701,14 @@ class TestConversion:
         torch = pytest.importorskip("torch")
         from megalodon_jax.convert import _merge_axis
 
-        config = small_config()
+        config = replace(small_config(), rescale_nffn=True)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state = export_upstream_state_dict(model)
         shards: list[dict[str, torch.Tensor]] = [{}, {}]
         for name, value in state.items():
             axis = _merge_axis(name)
+            if name.endswith(".nffn.alpha"):
+                assert axis is None
             if axis is None:
                 shards[0][name] = value.clone()
                 shards[1][name] = value.clone()
@@ -636,6 +733,11 @@ class TestConversion:
         expected, _ = model(tokens)
         actual, _ = loaded(tokens)
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        assert loaded.model.layers[0].ffn.alpha is not None
+        np.testing.assert_array_equal(
+            np.asarray(loaded.model.layers[0].ffn.alpha),
+            np.asarray(model.model.layers[0].ffn.alpha),
+        )
 
     def test_cache_roundtrip_and_config_binding(self, tmp_path: Path) -> None:
         """Serialized continuation state resumes exactly and rejects other configs."""
