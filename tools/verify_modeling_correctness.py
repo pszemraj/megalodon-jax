@@ -40,6 +40,116 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import numpy as np
 
 
+def _max_abs_error(actual: Any, expected: Any) -> float:
+    """Return the maximum absolute difference between array-like values."""
+    return float(np.max(np.abs(np.asarray(actual) - np.asarray(expected))))
+
+
+def deterministic_tiny_overfit(seed: int = 405) -> dict[str, float | bool]:
+    """Run the shared deterministic FP32 tiny-batch overfit gate."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
+
+    config = MegalodonConfig(
+        vocab_size=8,
+        model_dim=8,
+        num_layers=1,
+        num_heads=1,
+        z_dim=4,
+        value_dim=8,
+        ffn_hidden_dim=12,
+        cema_ndim=2,
+        chunk_size=8,
+        norm_num_groups=2,
+    )
+    model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(seed))
+    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
+    learning_rate = 2e-2
+
+    @eqx.filter_jit
+    def step(candidate: MegalodonForCausalLM) -> tuple[MegalodonForCausalLM, Any]:
+        def loss_fn(current: MegalodonForCausalLM) -> Any:
+            return current.compute_loss(tokens, tokens)
+
+        loss, grads = eqx.filter_value_and_grad(loss_fn)(candidate)
+        updates = jax.tree.map(lambda gradient: -learning_rate * gradient, grads)
+        return eqx.apply_updates(candidate, updates), loss
+
+    initial = float(model.compute_loss(tokens, tokens))
+    for _ in range(80):
+        model, _ = step(model)
+    final = float(model.compute_loss(tokens, tokens))
+    ratio = final / initial
+    return {
+        "passed": math.isfinite(final) and ratio < 0.35,
+        "initial_loss": initial,
+        "final_loss": final,
+        "ratio": ratio,
+    }
+
+
+def cache_partition_errors(
+    attention_window: int | None,
+    partition: tuple[int, ...] = (1,) * 12,
+    *,
+    seed: int = 17,
+) -> dict[str, float]:
+    """Compare full and partitioned attention outputs and cache state."""
+    import jax
+    import jax.numpy as jnp
+
+    from megalodon_jax.layers.attention import ChunkedAttention
+
+    length = 12
+    if sum(partition) != length or any(width <= 0 for width in partition):
+        raise ValueError(f"partition must contain positive widths summing to {length}")
+    key = jax.random.PRNGKey(seed)
+    k_module, kq, kk, kv = jax.random.split(key, 4)
+    module = ChunkedAttention(
+        num_heads=1,
+        head_dim=4,
+        value_head_dim=3,
+        chunk_size=4,
+        attention_window=attention_window,
+        key=k_module,
+    )
+    q = jax.random.normal(kq, (1, length, 1, 4))
+    k = jax.random.normal(kk, (1, length, 1, 4))
+    v = jax.random.normal(kv, (1, length, 1, 3))
+    full, full_cache, _ = module(q, k, v, return_cache=True)
+    noncached, _, _ = module(q, k, v)
+    if full_cache is None:
+        raise AssertionError("full attention call did not return a cache")
+
+    pieces = []
+    cache = None
+    start = 0
+    for width in partition:
+        stop = start + width
+        part, cache, _ = module(
+            q[:, start:stop],
+            k[:, start:stop],
+            v[:, start:stop],
+            cache=cache,
+            return_cache=True,
+        )
+        pieces.append(part)
+        start = stop
+    if cache is None:
+        raise AssertionError("partitioned attention call did not return a cache")
+    partitioned = jnp.concatenate(pieces, axis=1)
+    return {
+        "output": _max_abs_error(partitioned, full),
+        "noncached_output": _max_abs_error(noncached, full),
+        "cache_k": _max_abs_error(cache.k, full_cache.k),
+        "cache_v": _max_abs_error(cache.v, full_cache.v),
+        "cache_count": _max_abs_error(cache.count, full_cache.count),
+    }
+
+
 @dataclass
 class CheckResult:
     name: str
@@ -613,10 +723,25 @@ def main() -> int:
     from megalodon_jax.checkpoint import model_state_dict
     from megalodon_jax.config import MegalodonConfig
     from megalodon_jax.layers import RotaryEmbedding, TimestepNorm
-    from megalodon_jax.layers.attention import ChunkedAttention
     from megalodon_jax.layers.norms import BatchedLayerNorm
     from megalodon_jax.model import MegalodonForCausalLM
     from megalodon_jax.utils import get_initializer
+
+    def tiny_config(**overrides: Any) -> MegalodonConfig:
+        """Return the canonical verifier config with explicit overrides."""
+        config = MegalodonConfig(
+            vocab_size=32,
+            model_dim=16,
+            num_layers=1,
+            num_heads=1,
+            z_dim=8,
+            value_dim=16,
+            ffn_hidden_dim=32,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=4,
+        )
+        return dataclasses.replace(config, **overrides)
 
     audit = Audit()
 
@@ -625,8 +750,8 @@ def main() -> int:
         module = TimestepNorm(4, 2, eps=0.0)
         actual, state = module(jnp.asarray(x))
         expected, count, mean, var = exact_timestep_norm(x, 2, eps=0.0)
-        y_err = float(np.max(np.abs(np.asarray(actual) - expected)))
-        var_err = float(np.max(np.abs(np.asarray(state.var) - var)))
+        y_err = _max_abs_error(actual, expected)
+        var_err = _max_abs_error(state.var, var)
         passed = (
             y_err <= 2e-6 and var_err <= 2e-6 and np.array_equal(np.asarray(state.count), count)
         )
@@ -692,7 +817,7 @@ def main() -> int:
         module = TimestepNorm(4, 2, eps=0.0)
         actual, state = module(jnp.asarray(x), segment_ids=jnp.asarray(segments))
         expected, count, mean, var = exact_timestep_norm(x, 2, segment_ids=segments, eps=0.0)
-        err = float(np.max(np.abs(np.asarray(actual) - expected)))
+        err = _max_abs_error(actual, expected)
         passed = (
             err <= 2e-6
             and np.array_equal(np.asarray(state.count), count)
@@ -725,8 +850,8 @@ def main() -> int:
         pos = np.array([[7]], dtype=np.float32)
         q_expected = adjacent_pair_rope(q, pos, 10000.0)
         k_expected = adjacent_pair_rope(k, pos, 10000.0)
-        q_err = float(np.max(np.abs(np.asarray(q_actual) - q_expected)))
-        k_err = float(np.max(np.abs(np.asarray(k_actual) - k_expected)))
+        q_err = _max_abs_error(q_actual, q_expected)
+        k_err = _max_abs_error(k_actual, k_expected)
         passed = q_err <= 2e-6 and k_err <= 2e-6
         return (
             passed,
@@ -779,7 +904,7 @@ def main() -> int:
         mean = x_np.mean(axis=-1, keepdims=True)
         var = ((x_np - mean) ** 2).mean(axis=-1, keepdims=True)
         identity_expected = (x_np - mean) / np.sqrt(var + 1e-5)
-        effective_identity = float(np.max(np.abs(y - identity_expected))) <= 2e-6
+        effective_identity = _max_abs_error(y, identity_expected) <= 2e-6
         # Source-compatible storage must be zero while effective scale is one.
         passed = np.array_equal(stored, np.zeros_like(stored)) and effective_identity
         return (
@@ -789,7 +914,7 @@ def main() -> int:
             else "LayerNorm uses direct one-scale storage; upstream checkpoint zeros would collapse output",
             {
                 "stored_weight": stored,
-                "effective_identity_error": float(np.max(np.abs(y - identity_expected))),
+                "effective_identity_error": _max_abs_error(y, identity_expected),
             },
         )
 
@@ -798,19 +923,7 @@ def main() -> int:
     def check_explicit_tying() -> tuple[bool, str, dict[str, Any]]:
         fields = {field.name for field in dataclasses.fields(MegalodonConfig)}
         has_flag = "share_emb" in fields
-        cfg = MegalodonConfig(
-            vocab_size=32,
-            output_size=32,
-            model_dim=16,
-            num_layers=1,
-            num_heads=1,
-            z_dim=8,
-            value_dim=16,
-            ffn_hidden_dim=32,
-            cema_ndim=2,
-            chunk_size=4,
-            norm_num_groups=4,
-        )
+        cfg = tiny_config(output_size=32)
         model = MegalodonForCausalLM(cfg, key=jax.random.PRNGKey(1))
         # Source default is untied even when output width equals vocab width.
         passed = has_flag and not bool(model.tied)
@@ -1179,19 +1292,7 @@ def main() -> int:
     )
 
     def check_source_biases() -> tuple[bool, str, dict[str, Any]]:
-        cfg = MegalodonConfig(
-            vocab_size=32,
-            model_dim=16,
-            num_layers=1,
-            num_heads=1,
-            z_dim=8,
-            value_dim=16,
-            ffn_hidden_dim=32,
-            cema_ndim=2,
-            chunk_size=4,
-            norm_num_groups=4,
-            swiglu=True,
-        )
+        cfg = tiny_config(swiglu=True)
         model = MegalodonForCausalLM(cfg, key=jax.random.PRNGKey(3))
         layer = model.model.layers[0]
         present = {
@@ -1328,17 +1429,7 @@ def main() -> int:
             return state, trainable
 
         def check_logits_dtype() -> tuple[bool, str, dict[str, Any]]:
-            cfg = MegalodonConfig(
-                vocab_size=32,
-                model_dim=16,
-                num_layers=1,
-                num_heads=1,
-                z_dim=8,
-                value_dim=16,
-                ffn_hidden_dim=32,
-                cema_ndim=2,
-                chunk_size=4,
-                norm_num_groups=4,
+            cfg = tiny_config(
                 param_dtype=jnp.float32,
                 compute_dtype=jnp.bfloat16,
                 accum_dtype=jnp.float32,
@@ -1406,7 +1497,7 @@ def main() -> int:
 
             jax_logits_np = np.asarray(jax_logits)
             torch_logits_np = torch_logits.detach().cpu().numpy()
-            output_error = float(np.max(np.abs(jax_logits_np - torch_logits_np)))
+            output_error = _max_abs_error(jax_logits_np, torch_logits_np)
             loss_error = abs(float(jax_loss) - float(torch_loss.detach()))
             forward_pass = bool(np.allclose(jax_logits_np, torch_logits_np, rtol=5e-4, atol=5e-5))
             passed = forward_pass and gradients_pass
@@ -1535,96 +1626,43 @@ def main() -> int:
         audit.run("source_torch_jax_three_step_adamw", "P0", check_short_adamw_parity)
 
         def check_tiny_overfit() -> tuple[bool, str, dict[str, Any]]:
-            config = MegalodonConfig(
-                vocab_size=8,
-                model_dim=8,
-                num_layers=1,
-                num_heads=1,
-                z_dim=4,
-                value_dim=8,
-                ffn_hidden_dim=12,
-                cema_ndim=2,
-                chunk_size=8,
-                norm_num_groups=2,
-            )
-            model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(405))
-            tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
-            learning_rate = 2e-2
-
-            @eqx.filter_jit
-            def step(candidate: MegalodonForCausalLM) -> tuple[MegalodonForCausalLM, Any]:
-                def loss_fn(current: MegalodonForCausalLM) -> Any:
-                    return current.compute_loss(tokens, tokens)
-
-                loss, grads = eqx.filter_value_and_grad(loss_fn)(candidate)
-                updates = jax.tree.map(lambda gradient: -learning_rate * gradient, grads)
-                return eqx.apply_updates(candidate, updates), loss
-
-            initial = float(model.compute_loss(tokens, tokens))
-            for _ in range(80):
-                model, _ = step(model)
-            final = float(model.compute_loss(tokens, tokens))
-            passed = math.isfinite(final) and final < 0.35 * initial
+            details = deterministic_tiny_overfit()
+            passed = bool(details.pop("passed"))
             return (
                 passed,
                 "Deterministic FP32 tiny-batch overfit gate succeeds",
-                {"initial_loss": initial, "final_loss": final, "ratio": final / initial},
+                details,
             )
 
         audit.run("deterministic_tiny_batch_overfit", "P0", check_tiny_overfit)
 
-        def cache_partition_error(attention_window: int | None) -> float:
-            key = jax.random.PRNGKey(17)
-            k_module, kq, kk, kv = jax.random.split(key, 4)
-            batch, length, heads, dim, value_dim = 1, 12, 1, 4, 3
-            module = ChunkedAttention(
-                num_heads=heads,
-                head_dim=dim,
-                value_head_dim=value_dim,
-                chunk_size=4,
-                attention_window=attention_window,
-                key=k_module,
-            )
-            q = jax.random.normal(kq, (batch, length, heads, dim))
-            k = jax.random.normal(kk, (batch, length, heads, dim))
-            v = jax.random.normal(kv, (batch, length, heads, value_dim))
-            full, _, _ = module(q, k, v, return_cache=True)
-            pieces = []
-            cache = None
-            for index in range(length):
-                part, cache, _ = module(
-                    q[:, index : index + 1],
-                    k[:, index : index + 1],
-                    v[:, index : index + 1],
-                    cache=cache,
-                    return_cache=True,
-                )
-                pieces.append(part)
-            tokenwise = jnp.concatenate(pieces, axis=1)
-            return float(jnp.max(jnp.abs(full - tokenwise)))
-
         def check_faithful_cache() -> tuple[bool, str, dict[str, Any]]:
-            error = cache_partition_error(None)
-            passed = error <= 2e-6
+            errors = cache_partition_errors(None)
+            passed = max(errors.values()) <= 2e-6
             return (
                 passed,
                 "Faithful chunk-local cache is call-partition invariant"
                 if passed
                 else "Faithful cache differs between full and tokenwise calls",
-                {"max_abs_error": error},
+                {"max_abs_error": max(errors.values()), "errors": errors},
             )
 
         audit.run("faithful_cache_partition_invariance", "P1", check_faithful_cache)
 
         def check_sliding_cache() -> tuple[bool, str, dict[str, Any]]:
-            error = cache_partition_error(8)
-            passed = error <= 2e-6
+            errors = cache_partition_errors(8)
+            passed = max(errors.values()) <= 2e-6
             return (
                 passed,
                 "Sliding cache is call-partition invariant"
                 if passed
                 else "Sliding-window semantics depend on call granularity",
-                {"max_abs_error": error, "chunk_size": 4, "attention_window": 8},
+                {
+                    "max_abs_error": max(errors.values()),
+                    "errors": errors,
+                    "chunk_size": 4,
+                    "attention_window": 8,
+                },
             )
 
         audit.run("sliding_cache_partition_invariance", "P1", check_sliding_cache)
@@ -1645,18 +1683,7 @@ def main() -> int:
                 required_flag="--include-slow",
             )
 
-    manifest_config = MegalodonConfig(
-        vocab_size=32,
-        model_dim=16,
-        num_layers=1,
-        num_heads=1,
-        z_dim=8,
-        value_dim=16,
-        ffn_hidden_dim=32,
-        cema_ndim=2,
-        chunk_size=4,
-        norm_num_groups=4,
-    )
+    manifest_config = tiny_config()
     manifest_model = MegalodonForCausalLM(manifest_config, key=jax.random.PRNGKey(2026))
     parameter_inventory: list[dict[str, Any]] = []
 

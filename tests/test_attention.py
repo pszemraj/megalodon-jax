@@ -18,6 +18,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
+from tools.verify_modeling_correctness import cache_partition_errors
 
 # -----------------------------------------------------------------------------
 # Attention Primitive Tests
@@ -680,46 +681,17 @@ class TestChunkedAttention:
         attention_window: int | None,
     ) -> None:
         """Cached outputs and state cannot depend on caller chunk boundaries."""
-        key = jax.random.PRNGKey(random_seed)
-        k_module, k_q, k_k, k_v = jax.random.split(key, 4)
-        module = ChunkedAttention(
-            num_heads=1,
-            head_dim=4,
-            value_head_dim=3,
-            chunk_size=4,
-            attention_window=attention_window,
-            key=k_module,
-        )
-        q = jax.random.normal(k_q, (1, 12, 1, 4))
-        k = jax.random.normal(k_k, (1, 12, 1, 4))
-        v = jax.random.normal(k_v, (1, 12, 1, 3))
-
-        expected, expected_cache, _ = module(q, k, v, return_cache=True)
-        assert expected_cache is not None
         for partition in ((1,) * 12, (3, 5, 4), (7, 1, 4)):
-            outputs = []
-            cache = None
-            start = 0
-            for width in partition:
-                stop = start + width
-                output, cache, _ = module(
-                    q[:, start:stop],
-                    k[:, start:stop],
-                    v[:, start:stop],
-                    cache=cache,
-                    return_cache=True,
-                )
-                outputs.append(output)
-                start = stop
-            actual = jnp.concatenate(outputs, axis=1)
-            assert cache is not None
-            np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6)
-            np.testing.assert_array_equal(np.asarray(cache.k), np.asarray(expected_cache.k))
-            np.testing.assert_array_equal(np.asarray(cache.v), np.asarray(expected_cache.v))
-            np.testing.assert_array_equal(np.asarray(cache.count), np.asarray(expected_cache.count))
-
-        batch_output, _, _ = module(q, k, v)
-        np.testing.assert_allclose(np.asarray(batch_output), np.asarray(expected), atol=2e-6)
+            errors = cache_partition_errors(
+                attention_window,
+                partition,
+                seed=random_seed,
+            )
+            assert errors["output"] <= 2e-6
+            assert errors["noncached_output"] <= 2e-6
+            assert errors["cache_k"] == 0.0
+            assert errors["cache_v"] == 0.0
+            assert errors["cache_count"] == 0.0
 
 
 # -----------------------------------------------------------------------------

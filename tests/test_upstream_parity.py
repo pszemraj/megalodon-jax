@@ -11,6 +11,7 @@ import pytest
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.convert import export_upstream_state_dict
 from tools.verify_modeling_correctness import (
+    deterministic_tiny_overfit,
     differentiable_state,
     source_forward,
     trainable_upstream_keys,
@@ -147,35 +148,7 @@ def test_three_step_sgd_matches_released_source_equations() -> None:
 
 def test_deterministic_tiny_batch_overfit() -> None:
     """Ensure a fresh FP32 model can substantially overfit a fixed tiny batch."""
-    config = MegalodonConfig(
-        vocab_size=8,
-        model_dim=8,
-        num_layers=1,
-        num_heads=1,
-        z_dim=4,
-        value_dim=8,
-        ffn_hidden_dim=12,
-        cema_ndim=2,
-        chunk_size=8,
-        norm_num_groups=2,
+    result = deterministic_tiny_overfit()
+    assert result["passed"], (
+        f"tiny-batch loss only improved from {result['initial_loss']} to {result['final_loss']}"
     )
-    model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(505))
-    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
-    learning_rate = 2e-2
-
-    @eqx.filter_jit
-    def step(candidate: MegalodonForCausalLM) -> tuple[MegalodonForCausalLM, jax.Array]:
-        def loss_fn(current: MegalodonForCausalLM) -> jax.Array:
-            return current.compute_loss(tokens, tokens)
-
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(candidate)
-        updates = jax.tree.map(lambda gradient: -learning_rate * gradient, grads)
-        return eqx.apply_updates(candidate, updates), loss
-
-    initial = float(model.compute_loss(tokens, tokens))
-    for _ in range(80):
-        model, _ = step(model)
-    final = float(model.compute_loss(tokens, tokens))
-
-    assert np.isfinite(final)
-    assert final < 0.35 * initial, f"tiny-batch loss only improved from {initial} to {final}"
