@@ -20,6 +20,7 @@ from megalodon_jax.layers.timestep_norm import (
 )
 from megalodon_jax.types import NormState
 from tests.factories import floating_to_bf16
+from tests.reference.timestep_norm import PaperNormState, central_difference, timestep_norm_paper
 
 
 class TestSegmentHelpers:
@@ -327,6 +328,217 @@ class TestTimestepNorm:
                 _, _, prefix_var = _shifted_cumsum_prefix(block_mean, block_var, initial)
                 assert bool(jnp.all(jnp.isfinite(prefix_var)))
                 assert float(jnp.min(prefix_var)) >= 0.0
+
+    @pytest.mark.parametrize("mode", ["plain", "masked", "packed", "continuation"])
+    def test_matches_float64_paper_oracle(self, mode: str) -> None:
+        """Production paths agree with an independent scalar paper equation."""
+        norm = TimestepNorm(8, 2, eps=1e-5)
+        weight = jnp.linspace(-0.15, 0.2, 8, dtype=jnp.float32)
+        bias = jnp.linspace(0.07, -0.05, 8, dtype=jnp.float32)
+        norm = eqx.tree_at(lambda item: item.weight, norm, weight)
+        norm = eqx.tree_at(lambda item: item.bias, norm, bias)
+        x = jax.random.normal(jax.random.PRNGKey(73), (2, 7, 8), dtype=jnp.float32) * 1.7 + 11.0
+        state = None
+        paper_state = None
+        mask = None
+        segment_ids = None
+        if mode == "masked":
+            mask = jnp.asarray(
+                [
+                    [True, False, True, True, False, True, True],
+                    [False, True, True, False, True, True, False],
+                ]
+            )
+        elif mode == "packed":
+            segment_ids = jnp.asarray(
+                [[0, 1, 1, 2, 2, 1, 0], [3, 3, 0, 4, 4, 4, 5]],
+                dtype=jnp.int32,
+            )
+        elif mode == "continuation":
+            state = NormState(
+                count=jnp.asarray([7, 11], dtype=jnp.int32),
+                mean=jnp.asarray([[8.0, 9.0], [-4.0, 2.0]], dtype=jnp.float32),
+                var=jnp.asarray([[0.25, 1.5], [3.0, 0.5]], dtype=jnp.float32),
+            )
+            paper_state = PaperNormState(
+                count=np.asarray(state.count, dtype=np.int64),
+                mean=np.asarray(state.mean, dtype=np.float64),
+                var=np.asarray(state.var, dtype=np.float64),
+            )
+
+        output, final = norm(x, state=state, mask=mask, segment_ids=segment_ids)
+        expected_output, expected_final, valid = timestep_norm_paper(
+            np.asarray(x, dtype=np.float64),
+            groups=2,
+            eps=norm.eps,
+            weight=np.asarray(weight),
+            bias=np.asarray(bias),
+            state=paper_state,
+            mask=None if mask is None else np.asarray(mask),
+            segment_ids=None if segment_ids is None else np.asarray(segment_ids),
+        )
+
+        np.testing.assert_allclose(np.asarray(output), expected_output, rtol=3e-5, atol=3e-5)
+        np.testing.assert_array_equal(np.asarray(final.count), expected_final.count)
+        np.testing.assert_allclose(np.asarray(final.mean), expected_final.mean, atol=3e-5)
+        np.testing.assert_allclose(np.asarray(final.var), expected_final.var, atol=3e-5)
+        np.testing.assert_array_equal(np.asarray(output)[~valid], 0.0)
+
+    def test_large_offset_continuation_matches_oracle_and_gradients(self) -> None:
+        """Large-count shifted continuation remains stable and differentiable."""
+        norm = TimestepNorm(4, 2, eps=1e-5)
+        x = jnp.asarray(
+            [
+                [
+                    [1_000_000.125, 999_999.875, 1_000_000.25, 999_999.75],
+                    [999_999.75, 1_000_000.25, 999_999.875, 1_000_000.125],
+                    [1_000_000.25, 1_000_000.0, 999_999.75, 1_000_000.0],
+                ]
+            ],
+            dtype=jnp.float32,
+        )
+        weight = jnp.asarray([-0.2, 0.1, 0.25, -0.05], dtype=jnp.float32)
+        bias = jnp.asarray([0.03, -0.07, 0.11, -0.02], dtype=jnp.float32)
+        mean = jnp.asarray([[999_999.75, 1_000_000.5]], dtype=jnp.float32)
+        var = jnp.asarray([[0.015625, 0.0625]], dtype=jnp.float32)
+        count = jnp.asarray([1_000_003], dtype=jnp.int32)
+        output_coefficients = jnp.linspace(-0.4, 0.7, x.size, dtype=jnp.float32).reshape(x.shape)
+        mean_coefficients = jnp.asarray([[0.17, -0.09]], dtype=jnp.float32)
+        var_coefficients = jnp.asarray([[-0.11, 0.13]], dtype=jnp.float32)
+
+        def objective(
+            values: jax.Array,
+            stored_weight: jax.Array,
+            stored_bias: jax.Array,
+            state_mean: jax.Array,
+            state_var: jax.Array,
+        ) -> jax.Array:
+            module = eqx.tree_at(lambda item: item.weight, norm, stored_weight)
+            module = eqx.tree_at(lambda item: item.bias, module, stored_bias)
+            result, final = module(
+                values,
+                state=NormState(count=count, mean=state_mean, var=state_var),
+            )
+            return (
+                jnp.sum(result * output_coefficients)
+                + jnp.sum(final.mean * mean_coefficients)
+                + jnp.sum(final.var * var_coefficients)
+            )
+
+        value, gradients = jax.value_and_grad(objective, argnums=(0, 1, 2, 3, 4))(
+            x, weight, bias, mean, var
+        )
+        module = eqx.tree_at(lambda item: item.weight, norm, weight)
+        module = eqx.tree_at(lambda item: item.bias, module, bias)
+        output, final = module(x, state=NormState(count=count, mean=mean, var=var))
+        grouped = x.reshape(1, 3, 2, 2)
+        block_mean, block_var = _block_moments(grouped)
+        _, _, prefix_var = _shifted_cumsum_prefix(
+            block_mean,
+            block_var,
+            NormState(count=count, mean=mean, var=var),
+        )
+
+        def paper_objective(
+            values: np.ndarray,
+            stored_weight: np.ndarray,
+            stored_bias: np.ndarray,
+            state_mean: np.ndarray,
+            state_var: np.ndarray,
+        ) -> float:
+            result, paper_final, _ = timestep_norm_paper(
+                values,
+                groups=2,
+                eps=norm.eps,
+                weight=stored_weight,
+                bias=stored_bias,
+                state=PaperNormState(
+                    count=np.asarray(count, dtype=np.int64),
+                    mean=state_mean,
+                    var=state_var,
+                ),
+            )
+            return float(
+                np.sum(result * np.asarray(output_coefficients, dtype=np.float64))
+                + np.sum(paper_final.mean * np.asarray(mean_coefficients, dtype=np.float64))
+                + np.sum(paper_final.var * np.asarray(var_coefficients, dtype=np.float64))
+            )
+
+        arrays = tuple(np.asarray(item, dtype=np.float64) for item in (x, weight, bias, mean, var))
+        steps = (0.125, 1e-3, 1e-3, 0.125, 1e-3)
+        expected_gradients = []
+        for argument, (array, step) in enumerate(zip(arrays, steps, strict=True)):
+            expected_gradients.append(
+                central_difference(
+                    lambda candidate, argument=argument: paper_objective(
+                        *(
+                            candidate if index == argument else value
+                            for index, value in enumerate(arrays)
+                        )
+                    ),
+                    array,
+                    step,
+                )
+            )
+
+        expected_output, expected_final, _ = timestep_norm_paper(
+            arrays[0],
+            groups=2,
+            eps=norm.eps,
+            weight=arrays[1],
+            bias=arrays[2],
+            state=PaperNormState(
+                count=np.asarray(count, dtype=np.int64),
+                mean=arrays[3],
+                var=arrays[4],
+            ),
+        )
+        assert bool(jnp.isfinite(value))
+        assert bool(jnp.all(jnp.isfinite(prefix_var)))
+        assert float(jnp.min(prefix_var)) >= 0.0
+        np.testing.assert_allclose(np.asarray(output), expected_output, rtol=2e-2, atol=6e-2)
+        np.testing.assert_array_equal(np.asarray(final.count), expected_final.count)
+        np.testing.assert_allclose(np.asarray(final.mean), expected_final.mean, atol=6.25e-2)
+        np.testing.assert_allclose(np.asarray(final.var), expected_final.var, rtol=2e-3, atol=2e-4)
+        for actual, expected in zip(gradients, expected_gradients, strict=True):
+            np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=5e-3)
+
+    @pytest.mark.parametrize("mode", ["plain", "masked", "packed"])
+    def test_forward_and_backward_have_no_sequence_while(self, mode: str) -> None:
+        """Production sequence work remains outside runtime WhileOps."""
+        norm = TimestepNorm(32, 4)
+        x = jnp.ones((1, 65, 32), dtype=jnp.float32)
+        mask = jnp.arange(65)[None] % 5 != 2 if mode == "masked" else None
+        segment_ids = None
+        if mode == "packed":
+            segment_ids = jnp.where(
+                jnp.arange(65)[None] % 11 == 0,
+                0,
+                jnp.arange(65)[None] // 13 + 1,
+            ).astype(jnp.int32)
+
+        def loss(values: jax.Array) -> jax.Array:
+            output, state = norm(values, mask=mask, segment_ids=segment_ids)
+            return (
+                jnp.sum(jnp.sin(output.astype(jnp.float32)))
+                + 1e-3 * jnp.sum(state.mean)
+                + 1e-4 * jnp.sum(state.var)
+            )
+
+        functions = {
+            "forward": jax.jit(lambda values: norm(values, mask=mask, segment_ids=segment_ids)),
+            "forward_backward": jax.jit(jax.value_and_grad(loss)),
+        }
+        for name, function in functions.items():
+            stablehlo = str(function.lower(x).compiler_ir(dialect="stablehlo"))
+            assert "stablehlo.while" not in stablehlo, f"{mode} {name}"
+            dynamic_updates = [
+                line for line in stablehlo.splitlines() if "stablehlo.dynamic_update_slice" in line
+            ]
+            if name == "forward":
+                assert not dynamic_updates, mode
+            else:
+                assert all("tensor<1x65x4x8xf32>" not in line for line in dynamic_updates), mode
 
     def test_masked_nonfinite_token_does_not_update_state(self) -> None:
         """Masked NaN/Inf blocks cannot contaminate later valid prefixes."""
