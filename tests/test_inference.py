@@ -113,13 +113,6 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
-    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
-    def test_init_cache_rejects_dtype_override(self, dtype: jnp.dtype) -> None:
-        """Cache construction and persistence share the model compute dtype."""
-        config = replace(small_config(), compute_dtype=jnp.bfloat16)
-        with pytest.raises(ValueError, match="cache dtype must equal config.compute_dtype"):
-            init_cache(config, batch_size=1, dtype=dtype, allocate_kv=True)
-
     def test_preallocated_and_lazy_cache_defaults_match(self) -> None:
         """Config-built initial states match the layers' lazy state constructors."""
         config = small_config()

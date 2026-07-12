@@ -37,7 +37,6 @@ from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache
 def init_cache(
     config: MegalodonConfig,
     batch_size: int,
-    dtype: jnp.dtype | None = None,
     *,
     allocate_kv: bool = False,
     allocate_norm: bool = False,
@@ -47,7 +46,6 @@ def init_cache(
 
     :param MegalodonConfig config: Model configuration.
     :param int batch_size: Batch size for cached tensors.
-    :param jnp.dtype | None dtype: Floating dtype for cached arrays (defaults to config.compute_dtype).
     :param bool allocate_kv: Whether to pre-allocate KV buffers.
     :param bool allocate_norm: Whether to pre-allocate TimestepNorm state.
     :param bool allocate_ema: Whether to pre-allocate ComplexEMA state.
@@ -55,10 +53,6 @@ def init_cache(
     """
 
     cache_len = config.cache_capacity
-    if dtype is not None and jnp.dtype(dtype) != jnp.dtype(config.compute_dtype):
-        raise ValueError(
-            f"cache dtype must equal config.compute_dtype ({config.compute_dtype}), got {dtype}"
-        )
     cache_dtype = config.compute_dtype
     num_heads = config.num_heads
     head_dim = config.head_dim

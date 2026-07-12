@@ -432,9 +432,7 @@ class MegalodonModel(eqx.Module):
         # - ComplexEMA and TimestepNorm have mask support for prefill, but
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
         # Guard both cache input AND output - streaming path is used in either case
-        # Packed metadata gates on raw return_cache, not layer_return_cache:
-        # with deterministic=False the layers skip caching, but a ModelCache is
-        # still assembled below and would carry segmented final-norm state.
+        # Cache use under nondeterministic execution is rejected at model entry.
         if (return_cache or cache is not None) and (
             segment_ids is not None or position_ids is not None
         ):
@@ -731,7 +729,7 @@ class MegalodonForCausalLM(eqx.Module):
         # Cross-entropy loss
         shift_logits_softmax = shift_logits.astype(softmax_dtype)
         log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
-        B, L, V = log_probs.shape
+        B, L, _ = log_probs.shape
 
         # Gather log prob of correct token
         batch_idx = jnp.arange(B)[:, None]
