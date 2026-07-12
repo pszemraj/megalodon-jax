@@ -531,7 +531,13 @@ def load_inference_cache(
     layers: list[LayerCache | None] = []
     for index in range(config.num_layers):
         prefix = f"layers.{index}"
-        if not any(item.startswith(prefix) for item in present):
+        layer_entries = {
+            f"{prefix}.position",
+            f"{prefix}.attn",
+            f"{prefix}.norm",
+            f"{prefix}.ema",
+        }
+        if not present & layer_entries:
             layers.append(None)
             continue
         position = require(f"{prefix}.position", (), jnp.int32)

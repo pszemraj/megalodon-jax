@@ -846,6 +846,22 @@ class TestConversion:
         with pytest.raises(ValueError, match="unknown entries"):
             load_inference_cache(presence_path, config)
 
+    def test_sparse_cache_layer_presence_uses_exact_layer_names(self, tmp_path: Path) -> None:
+        """Layer 10 presence must not imply that similarly prefixed layer 1 exists."""
+        config = replace(small_config(), num_layers=11)
+        initialized = init_cache(config, batch_size=1, allocate_kv=True)
+        sparse = ModelCache(
+            layer_caches=(*([None] * 10), initialized.layer_caches[10]),
+            final_norm=None,
+        )
+        path = tmp_path / "sparse-cache.safetensors"
+
+        save_inference_cache(sparse, path, config)
+        loaded = load_inference_cache(path, config)
+
+        assert loaded.layer_caches[:10] == (None,) * 10
+        assert loaded.layer_caches[10] is not None
+
     def test_ambiguous_legacy_apis_refuse(self, tmp_path: Path) -> None:
         """Historical schema-guessing entry points provide migration guidance."""
         model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
