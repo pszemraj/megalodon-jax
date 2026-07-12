@@ -651,6 +651,39 @@ class TestModelCache:
 
         assert isinstance(cache.layer_caches, tuple)
 
+    def test_returned_cache_stops_parameter_gradients(self, random_seed: int) -> None:
+        """A cache-only objective cannot backpropagate through its recorded history."""
+        config = MegalodonConfig(
+            vocab_size=17,
+            model_dim=8,
+            num_layers=1,
+            num_heads=2,
+            z_dim=8,
+            value_dim=8,
+            ffn_hidden_dim=12,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=2,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+
+        def cache_objective(candidate: MegalodonForCausalLM) -> jax.Array:
+            _, cache = candidate(tokens, return_cache=True)
+            assert cache is not None
+            total = jnp.asarray(0.0, dtype=jnp.float32)
+            for leaf in jax.tree_util.tree_leaves(cache):
+                if eqx.is_inexact_array(leaf):
+                    total = total + jnp.sum(jnp.real(leaf).astype(jnp.float32))
+            return total
+
+        gradients = eqx.filter_grad(cache_objective)(model)
+        gradient_leaves = [
+            leaf for leaf in jax.tree_util.tree_leaves(gradients) if eqx.is_inexact_array(leaf)
+        ]
+        assert gradient_leaves
+        assert max(float(jnp.max(jnp.abs(leaf))) for leaf in gradient_leaves) == 0.0
+
 
 # -----------------------------------------------------------------------------
 # Parity Tests (PyTorch Reference)
