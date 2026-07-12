@@ -122,8 +122,9 @@ def _default_position() -> Int[Array, ""]:
 class LayerCache:
     """Combined cache for a single transformer layer.
 
-    Groups attention cache, norm state, and EMA state together with
-    the absolute position for RoPE computation.
+    Groups attention cache, norm state, and EMA state. ``position`` is retained
+    as a schema-level compatibility mirror of ``AttentionCache.count``; cached
+    attention uses ``attn.count`` as the authoritative RoPE/ring position.
     """
 
     attn: AttentionCache | None = None

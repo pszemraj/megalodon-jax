@@ -41,8 +41,9 @@ class MegalodonConfig:
     value_dim: int = 2048
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16  # complex EMA orders per channel
-    chunk_size: int = 2048
-    attention_window: int | None = None  # None = released chunk-local; int = sliding extension
+    chunk_size: int = 2048  # Released chunk width; ignored by attention in sliding mode
+    # A positive width replaces chunk-local attention/cache semantics with the sliding extension.
+    attention_window: int | None = None
     norm_num_groups: int = 32
     norm_eps: float = 1e-5
     rope_base: float | None = None  # defaults to 10000.0 if None
@@ -79,6 +80,10 @@ class MegalodonConfig:
             raise ValueError(f"output_size must be -1 or positive, got {self.output_size}")
         if self.share_emb and self.effective_output_size != self.vocab_size:
             raise ValueError("share_emb requires output_size to resolve to vocab_size")
+        if self.num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
         if self.z_dim % self.num_heads != 0:
             raise ValueError(
                 f"z_dim ({self.z_dim}) must be divisible by num_heads ({self.num_heads})"

@@ -141,6 +141,13 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match="value_dim.*divisible by num_heads"):
             MegalodonConfig(value_dim=2047, num_heads=2)
 
+    def test_positive_head_and_chunk_validation(self) -> None:
+        """Invalid structural values fail at config construction with clear errors."""
+        with pytest.raises(ValueError, match="num_heads must be positive"):
+            MegalodonConfig(num_heads=0)
+        with pytest.raises(ValueError, match="chunk_size must be positive"):
+            MegalodonConfig(chunk_size=0)
+
     def test_model_dim_divisibility_validation(self) -> None:
         """Test model_dim must be divisible by norm_num_groups.
 
