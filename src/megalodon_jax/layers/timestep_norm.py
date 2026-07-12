@@ -184,6 +184,7 @@ class TimestepNorm(eqx.Module):
                 raise ValueError(
                     f"segment_ids must have shape {(batch_size, length)}, got {segment_ids.shape}"
                 )
+            # Anchor continuation at the last real token, matching ComplexEMA.
             valid = valid & valid_segment_mask(segment_ids)
             boundaries = segment_boundaries(segment_ids)
 

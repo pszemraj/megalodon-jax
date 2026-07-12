@@ -237,7 +237,8 @@ def attention_multi_chunk(
         position_ids = position_ids % chunk_size
 
     if L <= chunk_size:
-        # Single chunk: apply RoPE and attention directly.
+        # Single-chunk fast path avoids padding/chunk reshapes. Keep its RoPE,
+        # mask, and dropout semantics in lockstep with the multi-chunk path.
         q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
         qk_mask = None
         if segment_ids is not None:

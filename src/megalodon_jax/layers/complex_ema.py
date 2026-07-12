@@ -221,6 +221,8 @@ class ComplexEMA(eqx.Module):
         # document's.
         B, L = segment_ids.shape
         positions = jnp.arange(L, dtype=jnp.int32)
+        # Shared packed-state contract: anchor continuation at each row's last
+        # real token. Keep the segmented paths below and TimestepNorm aligned.
         last_valid = jnp.max(
             jnp.where(valid_segment_mask(segment_ids), positions[None, :], -1), axis=1
         )  # (B,)
@@ -355,6 +357,7 @@ class ComplexEMA(eqx.Module):
             h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
         else:
             reset_seq = jnp.moveaxis(segment_boundaries(segment_ids), -1, 0)  # (L, B)
+            # Preserve the same last-real-token continuation contract as the FFT path.
             valid_seq = jnp.moveaxis(valid_segment_mask(segment_ids), -1, 0)  # (L, B)
 
             def step_with_reset(
@@ -433,6 +436,7 @@ class ComplexEMA(eqx.Module):
 
         # Positions outside any real segment (padding, id 0) must not contribute
         if segment_ids is not None:
+            # Preserve the same last-real-token continuation contract as the FFT path.
             seg_valid = valid_segment_mask(segment_ids)
             mask = seg_valid if mask is None else (mask & seg_valid)
 
