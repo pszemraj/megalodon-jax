@@ -244,6 +244,11 @@ def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, "batch"]:
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
 
+def _top_k(logits: Array, k: int) -> tuple[Array, Array]:
+    """Run ``lax.top_k`` after clamping k to the vocabulary width."""
+    return jax.lax.top_k(logits, min(k, logits.shape[-1]))
+
+
 def _apply_top_k(
     logits: Float[Array, "batch vocab"], top_k: int | None
 ) -> Float[Array, "batch vocab"]:
@@ -255,8 +260,7 @@ def _apply_top_k(
     """
     if top_k is None or top_k <= 0:
         return logits
-    k = int(min(top_k, logits.shape[-1]))
-    values, _ = jax.lax.top_k(logits, k)
+    values, _ = _top_k(logits, top_k)
     thresh = values[:, -1][:, None]
     return jnp.where(logits < thresh, -jnp.inf, logits)
 
@@ -278,8 +282,7 @@ def _apply_top_p(
         return logits
 
     if top_k is not None and top_k > 0:
-        k = int(min(top_k, logits.shape[-1]))
-        sorted_logits, sorted_indices = jax.lax.top_k(logits, k)
+        sorted_logits, sorted_indices = _top_k(logits, top_k)
     else:
         sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
         sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)

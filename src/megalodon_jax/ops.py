@@ -25,6 +25,27 @@ from jaxtyping import Array, Float
 DOT_PRECISION = jax.lax.Precision.HIGHEST
 
 
+def _matmul_3d(
+    x: Array,
+    weight: Array,
+    compute_dtype: jnp.dtype,
+    accum_dtype: jnp.dtype,
+    output_dtype: jnp.dtype,
+    bias: Array | None = None,
+) -> Array:
+    """Apply the shared mixed-precision matrix product used by 3D projections."""
+    y = jnp.matmul(
+        x.astype(compute_dtype),
+        weight.astype(compute_dtype).T,
+        precision=DOT_PRECISION,
+        preferred_element_type=accum_dtype,
+    )
+    if bias is not None:
+        # Match upstream Linear semantics by adding bias before the final downcast.
+        y = y + bias.astype(compute_dtype)
+    return y.astype(output_dtype)
+
+
 def linear_3d(
     linear: eqx.nn.Linear,
     x: Float[Array, "batch seq in_dim"],
@@ -39,18 +60,14 @@ def linear_3d(
     :param jnp.dtype accum_dtype: Accumulation dtype for GEMM.
     :return jax.Array: Output tensor of shape (batch, seq, out_dim).
     """
-    x_c = x.astype(compute_dtype)
-    w_c = linear.weight.astype(compute_dtype)
-    y = jnp.matmul(
-        x_c,
-        w_c.T,
-        precision=DOT_PRECISION,
-        preferred_element_type=accum_dtype,
+    return _matmul_3d(
+        x,
+        linear.weight,
+        compute_dtype,
+        accum_dtype,
+        compute_dtype,
+        linear.bias,
     )
-    if linear.bias is not None:
-        y = y + linear.bias.astype(compute_dtype)
-    # Downcast from accum_dtype (e.g., fp32) to compute_dtype (e.g., bf16).
-    return y.astype(compute_dtype)
 
 
 def matmul_3d_weight(
@@ -69,12 +86,10 @@ def matmul_3d_weight(
     :param jnp.dtype | None output_dtype: Output dtype; defaults to compute_dtype.
     :return Float[Array, "batch seq out_dim"]: Output tensor.
     """
-    x_c = x.astype(compute_dtype)
-    w_c = weight.astype(compute_dtype)
-    y = jnp.matmul(
-        x_c,
-        w_c.T,
-        precision=DOT_PRECISION,
-        preferred_element_type=accum_dtype,
+    return _matmul_3d(
+        x,
+        weight,
+        compute_dtype,
+        accum_dtype,
+        compute_dtype if output_dtype is None else output_dtype,
     )
-    return y.astype(compute_dtype if output_dtype is None else output_dtype)
