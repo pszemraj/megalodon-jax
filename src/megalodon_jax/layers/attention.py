@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from megalodon_jax.config import AttentionDropoutMode, InitMode
+from megalodon_jax.config import AttentionDropoutMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
 from megalodon_jax.layers.rotary import RotaryEmbedding
@@ -40,7 +40,6 @@ from megalodon_jax.layers.segments import segment_runs_and_local_positions
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.ops import DOT_PRECISION, linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
-from megalodon_jax.utils import reinit_linear_weights
 
 # -----------------------------------------------------------------------------
 # Attention Primitives (Pure Functions)
@@ -997,90 +996,6 @@ class MegalodonAttention(eqx.Module):
 
         return y, new_cache
 
-    @classmethod
-    def with_init(
-        cls,
-        model_dim: int,
-        z_dim: int,
-        value_dim: int,
-        num_heads: int,
-        cema_ndim: int,
-        chunk_size: int,
-        norm_num_groups: int,
-        norm_eps: float = 1e-5,
-        norm_affine: bool = True,
-        rope_base: float = 10000.0,
-        attention_window: int | None = None,
-        dropout: float = 0.0,
-        attention_dropout: float = 0.0,
-        attention_dropout_mode: AttentionDropoutMode = "post_softmax",
-        hidden_dropout: float = 0.0,
-        param_dtype: jnp.dtype = jnp.float32,
-        compute_dtype: jnp.dtype = jnp.float32,
-        accum_dtype: jnp.dtype = jnp.float32,
-        attention_softmax_dtype: jnp.dtype = jnp.float32,
-        init_mode: InitMode = "he",
-        *,
-        key: PRNGKeyArray,
-    ) -> "MegalodonAttention":
-        """Create MegalodonAttention with custom weight initialization.
-
-        This is the recommended way to construct MegalodonAttention when using
-        custom initialization modes. Creates the module with default init,
-        then reinitializes all Linear weights according to init_mode.
-
-        :param int model_dim: Model hidden dimension D.
-        :param int z_dim: Shared Q/K dimension.
-        :param int value_dim: Value dimension.
-        :param int num_heads: Number of attention heads.
-        :param int cema_ndim: Number of EMA orders for ComplexEMA.
-        :param int chunk_size: Attention chunk size.
-        :param int norm_num_groups: Number of groups for TimestepNorm.
-        :param float norm_eps: Epsilon for normalization.
-        :param bool norm_affine: Whether RMSNorm includes an affine scale. TimestepNorm is always
-            affine for released-source compatibility.
-        :param float rope_base: Base for rotary embeddings.
-        :param int | None attention_window: Optional sliding-window width.
-        :param float dropout: Output dropout rate.
-        :param float attention_dropout: Attention weight dropout rate.
-        :param AttentionDropoutMode attention_dropout_mode: Post-softmax dropout or DropKey.
-        :param float hidden_dropout: Hidden layer dropout rate.
-        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
-        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
-        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
-        :param jnp.dtype attention_softmax_dtype: Attention softmax evaluation dtype.
-        :param InitMode init_mode: Initialization mode for Linear weights.
-        :param PRNGKeyArray key: PRNG key for initialization.
-        :return MegalodonAttention: Instance with reinitialized weights.
-        """
-        key1, key2 = jax.random.split(key)
-        instance = cls(
-            model_dim=model_dim,
-            z_dim=z_dim,
-            value_dim=value_dim,
-            num_heads=num_heads,
-            cema_ndim=cema_ndim,
-            chunk_size=chunk_size,
-            norm_num_groups=norm_num_groups,
-            norm_eps=norm_eps,
-            norm_affine=norm_affine,
-            rope_base=rope_base,
-            attention_window=attention_window,
-            dropout=dropout,
-            attention_dropout=attention_dropout,
-            attention_dropout_mode=attention_dropout_mode,
-            hidden_dropout=hidden_dropout,
-            param_dtype=param_dtype,
-            compute_dtype=compute_dtype,
-            accum_dtype=accum_dtype,
-            attention_softmax_dtype=attention_softmax_dtype,
-            key=key1,
-        )
-        if init_mode != "none":
-            # Don't pass dim - matches PyTorch behavior (std=1.0 for gaussian)
-            instance = reinit_linear_weights(instance, init_mode, key2)
-        return instance
-
 
 # -----------------------------------------------------------------------------
 # NormalizedFFN
@@ -1250,65 +1165,3 @@ class NormalizedFFN(eqx.Module):
             out = out * self.alpha.astype(out.dtype)
 
         return residual + out
-
-    @classmethod
-    def with_init(
-        cls,
-        model_dim: int,
-        ffn_hidden_dim: int,
-        norm_eps: float = 1e-5,
-        norm_affine: bool = True,
-        swiglu: bool = False,
-        rescale: bool = False,
-        layer_id: int = 0,
-        hidden_dropout: float = 0.0,
-        dropout: float = 0.0,
-        param_dtype: jnp.dtype = jnp.float32,
-        compute_dtype: jnp.dtype = jnp.float32,
-        accum_dtype: jnp.dtype = jnp.float32,
-        init_mode: InitMode = "he",
-        *,
-        key: PRNGKeyArray,
-    ) -> "NormalizedFFN":
-        """Create NormalizedFFN with custom weight initialization.
-
-        This is the recommended way to construct NormalizedFFN when using
-        custom initialization modes. Creates the module with default init,
-        then reinitializes all Linear weights according to init_mode.
-
-        :param int model_dim: Model hidden dimension.
-        :param int ffn_hidden_dim: FFN intermediate dimension.
-        :param float norm_eps: Epsilon for layer normalization.
-        :param bool norm_affine: Whether the FFN LayerNorm includes affine parameters.
-        :param bool swiglu: Whether to use SwiGLU activation.
-        :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
-        :param int layer_id: Layer index for computing rescale factor (0-indexed).
-        :param float hidden_dropout: Dropout after hidden layer.
-        :param float dropout: Dropout after output projection.
-        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
-        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
-        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
-        :param InitMode init_mode: Initialization mode for Linear weights.
-        :param PRNGKeyArray key: PRNG key for initialization.
-        :return NormalizedFFN: Instance with reinitialized weights.
-        """
-        key1, key2 = jax.random.split(key)
-        instance = cls(
-            model_dim=model_dim,
-            ffn_hidden_dim=ffn_hidden_dim,
-            norm_eps=norm_eps,
-            norm_affine=norm_affine,
-            swiglu=swiglu,
-            rescale=rescale,
-            layer_id=layer_id,
-            hidden_dropout=hidden_dropout,
-            dropout=dropout,
-            param_dtype=param_dtype,
-            compute_dtype=compute_dtype,
-            accum_dtype=accum_dtype,
-            key=key1,
-        )
-        if init_mode != "none":
-            # Don't pass dim - matches PyTorch behavior (std=1.0 for gaussian)
-            instance = reinit_linear_weights(instance, init_mode, key2)
-        return instance
