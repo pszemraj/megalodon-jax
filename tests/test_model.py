@@ -16,16 +16,12 @@ from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensiti
 from tests.factories import floating_to_bf16, tiny_config
 
 
-def small_config() -> MegalodonConfig:
+def small_config(**overrides: Any) -> MegalodonConfig:
     """Create a small config for fast testing.
 
     :return MegalodonConfig: Minimal model configuration for tests.
     """
-    return tiny_config(
-        vocab_size=256,
-        num_layers=2,
-        chunk_size=16,
-    )
+    return tiny_config(**{"vocab_size": 256, "num_layers": 2, "chunk_size": 16, **overrides})
 
 
 # -----------------------------------------------------------------------------
@@ -119,19 +115,7 @@ class TestMegalodonBlock:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=4,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            rescale_nffn=True,  # Enable rescaling
-        )
+        config = small_config(num_layers=4, rescale_nffn=True)
 
         key = jax.random.PRNGKey(random_seed)
         k1, k2 = jax.random.split(key)
@@ -722,20 +706,10 @@ class TestFixDropoutKeyGuard:
 
         :param int random_seed: Random seed fixture.
         """
-        config = MegalodonConfig(
+        config = small_config(
             vocab_size=128,
-            model_dim=64,
             num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
             dropout=0.1,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
         )
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
@@ -746,19 +720,7 @@ class TestFixDropoutKeyGuard:
 
     def test_embedding_dropout_uses_independent_deterministic_key(self, random_seed: int) -> None:
         """Embedding dropout is active before a zero-layer model's final norm."""
-        config = MegalodonConfig(
-            vocab_size=128,
-            model_dim=64,
-            num_layers=0,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            dropout=0.5,
-        )
+        config = small_config(vocab_size=128, num_layers=0, dropout=0.5)
         model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
         input_ids = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
         key_a = jax.random.PRNGKey(100)
@@ -783,19 +745,7 @@ class TestPaddingContract:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            pad_token_id=0,
-        )
+        config = small_config(num_layers=1, pad_token_id=0)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
@@ -818,17 +768,8 @@ class TestPaddingContract:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
+        config = small_config(
             num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
             pad_token_id=0,
             compute_dtype=jnp.bfloat16,
         )
@@ -858,20 +799,7 @@ class TestFix3UntiedLMHead:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            output_size=-1,
-            share_emb=True,
-        )
+        config = small_config(num_layers=1, output_size=-1, share_emb=True)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -898,19 +826,7 @@ class TestFix3UntiedLMHead:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            output_size=512,  # Different from vocab_size
-        )
+        config = small_config(num_layers=1, output_size=512)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -925,19 +841,7 @@ class TestFix3UntiedLMHead:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            output_size=512,  # Different from vocab_size
-        )
+        config = small_config(num_layers=1, output_size=512)
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -961,18 +865,7 @@ class TestFix4CacheValidation:
         """
         from megalodon_jax import ModelCache
 
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=2,  # Model expects 2 layer caches
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config()
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -996,19 +889,7 @@ class TestFix6InitMode:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            init_mode="gaussian",
-        )
+        config = small_config(num_layers=1, init_mode="gaussian")
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1024,19 +905,7 @@ class TestFix6InitMode:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            init_mode="he",
-        )
+        config = small_config(num_layers=1, init_mode="he")
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1105,18 +974,7 @@ class TestComputeLossMasking:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -1145,18 +1003,7 @@ class TestComputeLossMasking:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -1179,18 +1026,7 @@ class TestComputeLossMasking:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -1217,18 +1053,7 @@ class TestComputeLossMasking:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -1248,18 +1073,7 @@ class TestComputeLossMasking:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
         batch, seq = 2, 16
 
         key = jax.random.PRNGKey(random_seed)
@@ -1288,18 +1102,9 @@ class TestUntiedHeadInit:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
+        config = small_config(
             num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            output_size=1024,  # Large output_size to make the bug obvious
+            output_size=1024,
             init_mode="gaussian",
         )
 
@@ -1332,18 +1137,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1366,18 +1160,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1398,18 +1181,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1433,18 +1205,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=2,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config()
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1464,18 +1225,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=2,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config()
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1495,19 +1245,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            compute_dtype=jnp.bfloat16,
-        )
+        config = small_config(num_layers=1, compute_dtype=jnp.bfloat16)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1531,18 +1269,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1559,18 +1286,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-        )
+        config = small_config(num_layers=1)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1587,19 +1303,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            compute_dtype=jnp.bfloat16,
-        )
+        config = small_config(num_layers=1, compute_dtype=jnp.bfloat16)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1681,17 +1385,8 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
+        config = small_config(
             num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
             compute_dtype=jnp.bfloat16,
             loss_softmax_dtype=jnp.bfloat16,
         )
@@ -1718,17 +1413,10 @@ class TestPrecisionAudit:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = MegalodonConfig(
+        config = small_config(
             vocab_size=128,
-            model_dim=64,
             num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
             chunk_size=8,
-            norm_num_groups=8,
             compute_dtype=jnp.bfloat16,
             rescale_nffn=True,
         )
