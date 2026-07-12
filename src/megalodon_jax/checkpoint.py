@@ -24,6 +24,7 @@ from typing import Any
 
 import equinox as eqx
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array
 from safetensors import safe_open
 from safetensors.flax import load_file, save_file
@@ -36,6 +37,11 @@ MODEL_FORMAT = "megalodon-jax"
 MODEL_FORMAT_VERSION = "2"
 CACHE_FORMAT = "megalodon-jax-cache"
 CACHE_FORMAT_VERSION = "1"
+ROPE_LAYOUT = "adjacent_pair"
+NORMALIZATION_STORAGE = "plus_one"
+BIAS_SCHEMA = "upstream"
+INITIALIZER_SCHEMA = "split-boundary-internal-v1"
+DTYPE_POLICY = "fp32-params-fp32-or-bf16-compute"
 _DTYPE_FIELDS = (
     "param_dtype",
     "compute_dtype",
@@ -246,12 +252,22 @@ def _read_model_file(path: Path) -> tuple[dict[str, Array], dict[str, str]]:
     missing = sorted(required - metadata.keys())
     if missing:
         raise ValueError(f"checkpoint metadata is incomplete: missing {missing}")
-    if metadata["rope_layout"] != "adjacent_pair":
+    if metadata["rope_layout"] != ROPE_LAYOUT:
         raise ValueError("checkpoint RoPE convention is incompatible")
-    if metadata["normalization_storage"] != "plus_one":
+    if metadata["normalization_storage"] != NORMALIZATION_STORAGE:
         raise ValueError("checkpoint normalization storage is incompatible")
-    if metadata["bias_schema"] != "upstream":
+    if metadata["bias_schema"] != BIAS_SCHEMA:
         raise ValueError("checkpoint projection-bias schema is incompatible")
+    if metadata["initializer_schema"] != INITIALIZER_SCHEMA:
+        raise ValueError("checkpoint initializer schema is incompatible")
+    if metadata["dtype_policy"] != DTYPE_POLICY:
+        raise ValueError("checkpoint dtype policy is incompatible")
+    checkpoint_config = _config_from_json(metadata["config_json"])
+    if config_fingerprint(checkpoint_config) != metadata["config_fingerprint"]:
+        raise ValueError("checkpoint config fingerprint is invalid")
+    expected_tying = "tied" if checkpoint_config.share_emb else "untied"
+    if metadata["tying"] != expected_tying:
+        raise ValueError("checkpoint tying metadata disagrees with its configuration")
     tensors = load_file(str(path))
     actual_manifest = _manifest(tensors)
     if actual_manifest != metadata["parameter_manifest_sha256"]:
@@ -317,12 +333,12 @@ def save_checkpoint(model: MegalodonForCausalLM, path: str | Path) -> None:
         "config_json": config_json,
         "config_fingerprint": config_fingerprint(model.config),
         "parameter_manifest_sha256": _manifest(tensors),
-        "rope_layout": "adjacent_pair",
-        "normalization_storage": "plus_one",
-        "bias_schema": "upstream",
-        "initializer_schema": "split-boundary-internal-v1",
+        "rope_layout": ROPE_LAYOUT,
+        "normalization_storage": NORMALIZATION_STORAGE,
+        "bias_schema": BIAS_SCHEMA,
+        "initializer_schema": INITIALIZER_SCHEMA,
         "tying": "tied" if model.tied else "untied",
-        "dtype_policy": "fp32-params-fp32-or-bf16-compute",
+        "dtype_policy": DTYPE_POLICY,
     }
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     save_file(tensors, str(temporary), metadata=metadata)
@@ -337,13 +353,8 @@ def load_checkpoint(
     """Load a strict native v2 model checkpoint."""
     tensors, metadata = _read_model_file(Path(path))
     config = _config_from_json(metadata["config_json"])
-    if config_fingerprint(config) != metadata["config_fingerprint"]:
-        raise ValueError("checkpoint config fingerprint is invalid")
     model = MegalodonForCausalLM(config, key=key)
     model, _ = _apply_parameters(model, tensors)
-    expected_tying = "tied" if model.tied else "untied"
-    if metadata["tying"] != expected_tying:
-        raise ValueError("checkpoint tying metadata disagrees with its configuration")
     return model
 
 
@@ -355,9 +366,19 @@ def load_partial_checkpoint(
     key: Array,
 ) -> tuple[MegalodonForCausalLM, dict[str, Any]]:
     """Restore an explicit parameter allowlist into a freshly initialized model."""
-    tensors, _ = _read_model_file(Path(path))
+    tensors, metadata = _read_model_file(Path(path))
     model = MegalodonForCausalLM(config, key=key)
-    return _apply_parameters(model, tensors, include=include)
+    model, report = _apply_parameters(model, tensors, include=include)
+    source_fingerprint = metadata["config_fingerprint"]
+    target_fingerprint = config_fingerprint(config)
+    report.update(
+        {
+            "source_config_fingerprint": source_fingerprint,
+            "target_config_fingerprint": target_fingerprint,
+            "exact_config_match": source_fingerprint == target_fingerprint,
+        }
+    )
+    return model, report
 
 
 def _cache_tensors(cache: ModelCache) -> tuple[dict[str, Array], list[str]]:
@@ -370,6 +391,8 @@ def _cache_tensors(cache: ModelCache) -> tuple[dict[str, Array], list[str]]:
         tensors[f"{prefix}.position"] = layer.position
         present.append(f"{prefix}.position")
         if layer.attn is not None:
+            if not np.array_equal(np.asarray(layer.position), np.asarray(layer.attn.count)):
+                raise ValueError(f"{prefix} position must equal attention count")
             tensors[f"{prefix}.attn.k"] = layer.attn.k
             tensors[f"{prefix}.attn.v"] = layer.attn.v
             tensors[f"{prefix}.attn.count"] = layer.attn.count
@@ -433,9 +456,77 @@ def load_inference_cache(
     if _manifest(tensors) != metadata.get("tensor_manifest_sha256"):
         raise ValueError("cache tensor manifest mismatch")
     try:
-        present = set(json.loads(metadata["present_json"]))
+        present_payload = json.loads(metadata["present_json"])
     except (KeyError, json.JSONDecodeError) as exc:
         raise ValueError("cache presence metadata is invalid") from exc
+    if (
+        not isinstance(present_payload, list)
+        or any(not isinstance(item, str) for item in present_payload)
+        or len(present_payload) != len(set(present_payload))
+    ):
+        raise ValueError("cache presence metadata must be a unique string list")
+    present = set(present_payload)
+    allowed = {"final_norm"}
+    for index in range(config.num_layers):
+        prefix = f"layers.{index}"
+        allowed.update(
+            {
+                f"{prefix}.position",
+                f"{prefix}.attn",
+                f"{prefix}.norm",
+                f"{prefix}.ema",
+            }
+        )
+    unknown = sorted(present - allowed)
+    if unknown:
+        raise ValueError(f"cache presence metadata has unknown entries: {unknown}")
+
+    expected_tensor_keys: set[str] = set()
+    for index in range(config.num_layers):
+        prefix = f"layers.{index}"
+        components = present & {f"{prefix}.attn", f"{prefix}.norm", f"{prefix}.ema"}
+        if components and f"{prefix}.position" not in present:
+            raise ValueError(f"cache layer {index} components require a position tensor")
+        if f"{prefix}.position" in present:
+            expected_tensor_keys.add(f"{prefix}.position")
+        if f"{prefix}.attn" in present:
+            expected_tensor_keys.update(
+                {f"{prefix}.attn.k", f"{prefix}.attn.v", f"{prefix}.attn.count"}
+            )
+        if f"{prefix}.norm" in present:
+            expected_tensor_keys.update(
+                {f"{prefix}.norm.count", f"{prefix}.norm.mean", f"{prefix}.norm.var"}
+            )
+        if f"{prefix}.ema" in present:
+            expected_tensor_keys.update({f"{prefix}.ema.real", f"{prefix}.ema.imag"})
+    if "final_norm" in present:
+        expected_tensor_keys.update({"final_norm.count", "final_norm.mean", "final_norm.var"})
+    actual_tensor_keys = set(tensors)
+    if actual_tensor_keys != expected_tensor_keys:
+        raise ValueError(
+            "cache tensor keys disagree with presence metadata: "
+            f"missing={sorted(expected_tensor_keys - actual_tensor_keys)}, "
+            f"unexpected={sorted(actual_tensor_keys - expected_tensor_keys)}"
+        )
+
+    batch_size: int | None = None
+
+    def bind_batch(name: str, size: int) -> None:
+        nonlocal batch_size
+        if batch_size is None:
+            batch_size = size
+        elif size != batch_size:
+            raise ValueError(f"cache batch mismatch at {name}: {size} != {batch_size}")
+
+    def require(name: str, shape: tuple[int, ...], dtype: jnp.dtype) -> Array:
+        value = tensors[name]
+        if value.shape != shape:
+            raise ValueError(f"cache tensor {name} has shape {value.shape}, expected {shape}")
+        if value.dtype != jnp.dtype(dtype):
+            raise ValueError(
+                f"cache tensor {name} has dtype {value.dtype}, expected {jnp.dtype(dtype)}"
+            )
+        return value
 
     layers: list[LayerCache | None] = []
     for index in range(config.num_layers):
@@ -443,48 +534,86 @@ def load_inference_cache(
         if not any(item.startswith(prefix) for item in present):
             layers.append(None)
             continue
-        position = tensors[f"{prefix}.position"]
+        position = require(f"{prefix}.position", (), jnp.int32)
         attn = None
         if f"{prefix}.attn" in present:
-            attn = AttentionCache(
-                k=tensors[f"{prefix}.attn.k"],
-                v=tensors[f"{prefix}.attn.v"],
-                count=tensors[f"{prefix}.attn.count"],
-            )
+            k = tensors[f"{prefix}.attn.k"]
+            if k.ndim != 4:
+                raise ValueError(f"cache tensor {prefix}.attn.k must be rank 4")
+            bind_batch(f"{prefix}.attn.k", k.shape[0])
             expected_k = (
-                attn.k.shape[0],
+                k.shape[0],
                 config.cache_capacity,
                 config.num_heads,
                 config.head_dim,
             )
-            expected_v = (
-                attn.v.shape[0],
-                config.cache_capacity,
-                config.num_heads,
-                config.value_head_dim,
+            v = require(
+                f"{prefix}.attn.v",
+                (
+                    k.shape[0],
+                    config.cache_capacity,
+                    config.num_heads,
+                    config.value_head_dim,
+                ),
+                config.compute_dtype,
             )
-            if attn.k.shape != expected_k or attn.v.shape != expected_v:
-                raise ValueError("cache KV shape is incompatible with configuration")
+            k = require(f"{prefix}.attn.k", expected_k, config.compute_dtype)
+            count = require(f"{prefix}.attn.count", (), jnp.int32)
+            if not np.array_equal(np.asarray(position), np.asarray(count)):
+                raise ValueError(f"cache {prefix}.position does not equal attention count")
+            attn = AttentionCache(
+                k=k,
+                v=v,
+                count=count,
+            )
         norm = None
         if f"{prefix}.norm" in present:
+            count = tensors[f"{prefix}.norm.count"]
+            if count.ndim != 1:
+                raise ValueError(f"cache tensor {prefix}.norm.count must be rank 1")
+            bind_batch(f"{prefix}.norm.count", count.shape[0])
             norm = NormState(
-                count=tensors[f"{prefix}.norm.count"],
-                mean=tensors[f"{prefix}.norm.mean"],
-                var=tensors[f"{prefix}.norm.var"],
+                count=require(f"{prefix}.norm.count", (count.shape[0],), jnp.int32),
+                mean=require(
+                    f"{prefix}.norm.mean",
+                    (count.shape[0], config.norm_num_groups),
+                    jnp.float32,
+                ),
+                var=require(
+                    f"{prefix}.norm.var",
+                    (count.shape[0], config.norm_num_groups),
+                    jnp.float32,
+                ),
             )
         ema = None
         if f"{prefix}.ema" in present:
-            ema = EMAState(
-                h=tensors[f"{prefix}.ema.real"].astype(jnp.float32)
-                + 1j * tensors[f"{prefix}.ema.imag"].astype(jnp.float32)
-            )
+            real = tensors[f"{prefix}.ema.real"]
+            if real.ndim != 3:
+                raise ValueError(f"cache tensor {prefix}.ema.real must be rank 3")
+            bind_batch(f"{prefix}.ema.real", real.shape[0])
+            ema_shape = (real.shape[0], config.model_dim, config.cema_ndim)
+            real = require(f"{prefix}.ema.real", ema_shape, jnp.float32)
+            imag = require(f"{prefix}.ema.imag", ema_shape, jnp.float32)
+            ema = EMAState(h=real + 1j * imag)
         layers.append(LayerCache(attn=attn, norm=norm, ema=ema, position=position))
 
     final_norm = None
     if "final_norm" in present:
+        count = tensors["final_norm.count"]
+        if count.ndim != 1:
+            raise ValueError("cache tensor final_norm.count must be rank 1")
+        bind_batch("final_norm.count", count.shape[0])
         final_norm = NormState(
-            count=tensors["final_norm.count"],
-            mean=tensors["final_norm.mean"],
-            var=tensors["final_norm.var"],
+            count=require("final_norm.count", (count.shape[0],), jnp.int32),
+            mean=require(
+                "final_norm.mean",
+                (count.shape[0], config.norm_num_groups),
+                jnp.float32,
+            ),
+            var=require(
+                "final_norm.var",
+                (count.shape[0], config.norm_num_groups),
+                jnp.float32,
+            ),
         )
     return ModelCache(layer_caches=tuple(layers), final_norm=final_norm)

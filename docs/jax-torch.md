@@ -28,7 +28,7 @@ model, report = load_partial_checkpoint(
 )
 ```
 
-The report lists restored and freshly initialized leaves. A selection containing an unknown or unavailable name raises.
+The report lists restored and freshly initialized leaves plus source/target configuration fingerprints and an `exact_config_match` flag. A selection containing an unknown or unavailable name raises; intentional cross-config partial restores remain possible but cannot hide their provenance.
 
 ## Original upstream to JAX
 
@@ -87,7 +87,7 @@ save_inference_cache(cache, "cache.safetensors", config)
 cache = load_inference_cache("cache.safetensors", config)
 ```
 
-Cache files are bound to the full configuration fingerprint and validate fixed KV capacity, layer count, dtype/state representation, and tensor manifest. They are continuation artifacts, not portable model checkpoints.
+Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are continuation artifacts, not portable model checkpoints.
 
 ## Parity gates
 

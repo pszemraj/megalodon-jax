@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 
@@ -615,6 +616,36 @@ class TestConversion:
         with pytest.raises(ValueError, match="legacy JAX checkpoint"):
             load_checkpoint(path, key=jax.random.PRNGKey(0))
 
+    @pytest.mark.parametrize(
+        ("field", "invalid", "message"),
+        [
+            ("initializer_schema", "unknown", "initializer schema"),
+            ("dtype_policy", "float16-everywhere", "dtype policy"),
+        ],
+    )
+    def test_native_metadata_semantics_are_strict(
+        self,
+        tmp_path: Path,
+        field: str,
+        invalid: str,
+        message: str,
+    ) -> None:
+        """Required native metadata must carry recognized values, not just keys."""
+        from safetensors import safe_open
+        from safetensors.flax import load_file, save_file
+
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        valid = tmp_path / "valid.safetensors"
+        save_checkpoint(model, valid)
+        with safe_open(str(valid), framework="flax") as handle:
+            metadata = dict(handle.metadata() or {})
+        metadata[field] = invalid
+        corrupted = tmp_path / f"invalid-{field}.safetensors"
+        save_file(load_file(str(valid)), str(corrupted), metadata=metadata)
+        with pytest.raises(ValueError, match=message):
+            load_checkpoint(corrupted, key=jax.random.PRNGKey(1))
+
     def test_partial_restore_requires_explicit_names(self, tmp_path: Path) -> None:
         """Partial restore reports restored and freshly initialized leaves."""
         config = small_config()
@@ -634,6 +665,21 @@ class TestConversion:
         )
         assert report["restored"] == ["model.embed.weight"]
         assert report["initialized"]
+        assert report["exact_config_match"] is True
+        assert report["source_config_fingerprint"] == report["target_config_fingerprint"]
+
+        changed_config = replace(config, dropout=0.1)
+        _, changed_report = load_partial_checkpoint(
+            path,
+            changed_config,
+            include={"model.embed.weight"},
+            key=jax.random.PRNGKey(2),
+        )
+        assert changed_report["exact_config_match"] is False
+        assert (
+            changed_report["source_config_fingerprint"]
+            != changed_report["target_config_fingerprint"]
+        )
         with pytest.raises(ValueError, match="partial restore selection"):
             load_partial_checkpoint(
                 path,
@@ -739,9 +785,14 @@ class TestConversion:
             np.asarray(model.model.layers[0].ffn.alpha),
         )
 
-    def test_cache_roundtrip_and_config_binding(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16])
+    def test_cache_roundtrip_and_config_binding(
+        self,
+        tmp_path: Path,
+        compute_dtype: jnp.dtype,
+    ) -> None:
         """Serialized continuation state resumes exactly and rejects other configs."""
-        config = small_config()
+        config = replace(small_config(), compute_dtype=compute_dtype)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
         assert cache is not None
@@ -763,6 +814,36 @@ class TestConversion:
         incompatible = replace(config, attention_window=4)
         with pytest.raises(ValueError, match="fingerprint"):
             load_inference_cache(path, incompatible)
+
+    def test_cache_schema_and_position_invariants_fail_closed(self, tmp_path: Path) -> None:
+        """Presence metadata and redundant attention positions must remain self-consistent."""
+        from safetensors import safe_open
+        from safetensors.flax import load_file, save_file
+
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
+        assert cache is not None
+        valid = tmp_path / "valid-cache.safetensors"
+        save_inference_cache(cache, valid, config)
+        tensors = load_file(str(valid))
+        with safe_open(str(valid), framework="flax") as handle:
+            metadata = dict(handle.metadata() or {})
+
+        bad_position = dict(tensors)
+        bad_position["layers.0.position"] = bad_position["layers.0.position"] + 1
+        position_path = tmp_path / "bad-position.safetensors"
+        save_file(bad_position, str(position_path), metadata=metadata)
+        with pytest.raises(ValueError, match="does not equal attention count"):
+            load_inference_cache(position_path, config)
+
+        bad_presence = dict(metadata)
+        present = json.loads(bad_presence["present_json"])
+        bad_presence["present_json"] = json.dumps([*present, "layers.0.unknown"])
+        presence_path = tmp_path / "bad-presence.safetensors"
+        save_file(tensors, str(presence_path), metadata=bad_presence)
+        with pytest.raises(ValueError, match="unknown entries"):
+            load_inference_cache(presence_path, config)
 
     def test_ambiguous_legacy_apis_refuse(self, tmp_path: Path) -> None:
         """Historical schema-guessing entry points provide migration guidance."""
