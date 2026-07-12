@@ -122,6 +122,36 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
+    def test_preallocated_and_lazy_cache_defaults_match(self) -> None:
+        """Config-built initial states match the layers' lazy state constructors."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        lazy = init_cache(config, batch_size=1)
+        preallocated = init_cache(
+            config,
+            batch_size=1,
+            allocate_kv=True,
+            allocate_norm=True,
+            allocate_ema=True,
+        )
+
+        lazy_logits, lazy_result = model(tokens, cache=lazy, return_cache=True)
+        allocated_logits, allocated_result = model(
+            tokens,
+            cache=preallocated,
+            return_cache=True,
+        )
+
+        np.testing.assert_array_equal(np.asarray(allocated_logits), np.asarray(lazy_logits))
+        assert lazy_result is not None and allocated_result is not None
+        for expected, actual in zip(
+            jax.tree.leaves(lazy_result),
+            jax.tree.leaves(allocated_result),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
     def test_trim_cache_preserves_ring_order(self) -> None:
         """Ensure trim_cache preserves ring-buffer order.
 
@@ -285,31 +315,35 @@ class TestSamplingAndGeneration:
                 temperature=0.0,
             )
 
-    def test_generate_uses_last_valid_token_with_padding(self) -> None:
-        """Use last valid token when padding is present.
-
-        :return None: None.
-        """
+    @pytest.mark.parametrize(
+        ("prompt", "attention_mask"),
+        [
+            pytest.param(
+                [[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]],
+                [[True, True, True, True, True], [True, True, True, False, False]],
+                id="right-padding",
+            ),
+            pytest.param(
+                [[0, 0, 1, 2, 3], [0, 4, 5, 6, 7]],
+                [[False, False, True, True, True], [False, True, True, True, True]],
+                id="left-padding",
+            ),
+        ],
+    )
+    def test_generate_uses_last_valid_token_with_padding(
+        self,
+        prompt: list[list[int]],
+        attention_mask: list[list[bool]],
+    ) -> None:
+        """Greedy generation selects logits from the last valid prompt token."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt_array = jnp.asarray(prompt, dtype=jnp.int32)
+        mask_array = jnp.asarray(attention_mask)
 
-        prompt = jnp.array(
-            [
-                [1, 2, 3, 4, 5],
-                [6, 7, 8, 0, 0],
-            ],
-            dtype=jnp.int32,
-        )
-        attention_mask = jnp.array(
-            [
-                [True, True, True, True, True],
-                [True, True, True, False, False],
-            ]
-        )
-
-        logits, _ = model(prompt, attention_mask=attention_mask, return_cache=False)
-        positions = jnp.arange(prompt.shape[1], dtype=jnp.int32)
-        masked_positions = jnp.where(attention_mask, positions, -1)
+        logits, _ = model(prompt_array, attention_mask=mask_array, return_cache=False)
+        positions = jnp.arange(prompt_array.shape[1], dtype=jnp.int32)
+        masked_positions = jnp.where(mask_array, positions, -1)
         last_idx = masked_positions.max(axis=1)
         gather_idx = jnp.broadcast_to(last_idx[:, None, None], (2, 1, logits.shape[-1]))
         last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
@@ -317,53 +351,11 @@ class TestSamplingAndGeneration:
 
         out, _, _ = generate(
             model,
-            prompt,
+            prompt_array,
             max_new_tokens=1,
             key=jax.random.PRNGKey(123),
             temperature=0.0,
-            attention_mask=attention_mask,
-            return_cache=False,
-        )
-
-        np.testing.assert_array_equal(np.array(out[:, -1]), np.array(expected))
-
-    def test_generate_uses_last_valid_token_with_left_padding(self) -> None:
-        """Use last valid token when left padding is present.
-
-        :return None: None.
-        """
-        config = small_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-
-        prompt = jnp.array(
-            [
-                [0, 0, 1, 2, 3],
-                [0, 4, 5, 6, 7],
-            ],
-            dtype=jnp.int32,
-        )
-        attention_mask = jnp.array(
-            [
-                [False, False, True, True, True],
-                [False, True, True, True, True],
-            ]
-        )
-
-        logits, _ = model(prompt, attention_mask=attention_mask, return_cache=False)
-        positions = jnp.arange(prompt.shape[1], dtype=jnp.int32)
-        masked_positions = jnp.where(attention_mask, positions, -1)
-        last_idx = masked_positions.max(axis=1)
-        gather_idx = jnp.broadcast_to(last_idx[:, None, None], (2, 1, logits.shape[-1]))
-        last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
-        expected = jnp.argmax(last_logits, axis=-1)
-
-        out, _, _ = generate(
-            model,
-            prompt,
-            max_new_tokens=1,
-            key=jax.random.PRNGKey(123),
-            temperature=0.0,
-            attention_mask=attention_mask,
+            attention_mask=mask_array,
             return_cache=False,
         )
 
