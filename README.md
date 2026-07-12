@@ -94,6 +94,8 @@ tokens, cache, key = generate(
 
 Note: when `attention_mask` contains padding, cached generation (`max_new_tokens > 1`, `return_cache=True`, or `cache` provided) is not supported.
 
+Pass `attention_mask=None` when every token is valid. An all-True array is mathematically equivalent, but general model calls cannot statically select the faster unmasked TimestepNorm path from an array value.
+
 ### Training with Loss
 
 ```python
@@ -192,7 +194,7 @@ src/megalodon_jax/
 ## Limitations
 
 - Pure JAX implementation (no fused CUDA kernels)
-- Sequential CEMA is slower than FFT; training uses FFT automatically when no state or segment reset is required
+- Nonzero-cache CEMA continuation is sequential; training and pristine prefill compute outputs with FFT convolution
 - No 4D chunk parallelism (out of scope for single-device)
 - Cached decoding does not support padded batches
 - Packed-sequence metadata (`segment_ids`/`position_ids`) is training-only; rejected on cached/streaming calls

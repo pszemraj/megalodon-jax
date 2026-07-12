@@ -30,7 +30,7 @@ Pure JAX/Equinox reimplementation of Megalodon. No custom CUDA extension is requ
 - **FFT EMA path**: O(L log L), used during training (no cache)
 - **Sequential EMA path**: O(L), maintains complex hidden state for streaming
 - **Chunked attention**: Block-diagonal within chunks, no cross-chunk attention edges
-- **Streaming prefill**: Chunk-wise attention in faithful chunk-local mode; sub-chunk calls use token updates without padding
+- **Streaming prefill**: A pristine prompt uses vectorized attention plus exact ring-tail materialization; nonzero-cache continuation uses token updates
 
 ## Known Gaps
 
@@ -44,7 +44,7 @@ The paper's chunk-parallel axis requires multi-device coordination and sharded K
 
 ### Sequential CEMA vs FFT
 
-When state is required, CEMA uses `jax.lax.scan` over timesteps and is slower than the FFT path. Training uses FFT automatically when no cache or packed reset is required. Treat historical timing numbers as hardware/version-specific and rerun benchmarks after any correctness or dependency change.
+Pristine cached prefill computes CEMA outputs with FFT convolution and advances only the compact final state with `jax.lax.scan`. Continuation from a nonzero incoming state uses the sequential recurrence for both outputs and state. Training uses FFT automatically when no packed reset is required. Treat historical timing numbers as hardware/version-specific and rerun benchmarks after any correctness or dependency change.
 
 ### Packed-Sequence State Isolation
 

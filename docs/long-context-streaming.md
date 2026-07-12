@@ -91,7 +91,7 @@ flowchart TD
 ## 4) Training vs. Inference
 
 - **Training:** `attention_window=None` gives released block-diagonal attention per chunk; setting `attention_window` opts into sliding attention. EMA uses FFT when no state/reset is required. Packed rows may pass `segment_ids`/`position_ids` for full per-document isolation; see [dev.md](dev.md#packed-sequence-state-isolation).
-- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding KV. RoPE restarts per source chunk in faithful mode and remains absolute in sliding mode. Packed metadata is rejected on any cached/streaming call before compute.
+- **Inference:** pristine prefill uses vectorized attention and FFT CEMA outputs while materializing only final continuation state. Calls with nonzero history use sequential EMA and tokenwise ring updates. Attention is chunk-local by default with optional sliding KV. RoPE restarts per source chunk in faithful mode and remains absolute in sliding mode. Packed metadata is rejected on any cached/streaming call before compute.
 
 ## 5) Padding and Generation
 
