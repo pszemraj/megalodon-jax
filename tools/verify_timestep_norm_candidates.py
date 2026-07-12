@@ -649,6 +649,7 @@ def _gradient_cases(seed: int) -> list[CaseSpec]:
         mean=np.asarray([[2.0, -1.0]], dtype=np.float64),
         var=np.asarray([[0.7, 1.3]], dtype=np.float64),
     )
+    packed_segments = np.asarray([[0, 1, 1, 2, 2]], dtype=np.int64)
     return [
         CaseSpec("gradient_plain", "gradient_plain", values),
         CaseSpec("gradient_masked", "gradient_masked", values, mask=mask),
@@ -665,6 +666,16 @@ def _gradient_cases(seed: int) -> list[CaseSpec]:
             "gradient_continuation",
             values,
             state=continuation,
+        ),
+        CaseSpec(
+            "gradient_packed",
+            "gradient_packed",
+            values,
+            prior_count=3,
+            prior_mean=prior_mean,
+            prior_logv=prior_logv,
+            mask=packed_segments > 0,
+            segment_ids=packed_segments,
         ),
     ]
 

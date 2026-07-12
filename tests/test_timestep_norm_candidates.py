@@ -229,6 +229,37 @@ def test_candidate_gradients_match_serial_oracle(candidate) -> None:
         )
 
 
+@pytest.mark.parametrize("candidate", list(CANDIDATES.values()), ids=list(CANDIDATES))
+def test_candidate_packed_gradients_match_serial_oracle(candidate) -> None:
+    """Packed input, affine, and learned-prior gradients preserve reset semantics."""
+    norm = TimestepNorm(8, 2, prior_count=3)
+    x = (jax.random.normal(jax.random.PRNGKey(23), (1, 7, 8)) * 1.5 + 4.0).astype(jnp.float32)
+    segment_ids = jnp.asarray([[0, 1, 1, 2, 2, 3, 3]], dtype=jnp.int32)
+
+    def loss(function, module, values):
+        output, state = function(module, values, segment_ids=segment_ids)
+        return jnp.sum(jnp.sin(output)) + 0.1 * jnp.sum(state.mean) + 0.03 * jnp.sum(state.var)
+
+    _, expected = jax.value_and_grad(
+        lambda module, values: loss(serial_stats_only_oracle, module, values),
+        argnums=(0, 1),
+    )(norm, x)
+    _, actual = jax.value_and_grad(
+        lambda module, values: loss(candidate, module, values),
+        argnums=(0, 1),
+    )(norm, x)
+
+    for expected_leaf, actual_leaf in zip(
+        jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True
+    ):
+        np.testing.assert_allclose(
+            np.asarray(actual_leaf),
+            np.asarray(expected_leaf),
+            rtol=8e-4,
+            atol=8e-5,
+        )
+
+
 @pytest.mark.parametrize(
     ("name", "candidate", "expect_while"),
     [
