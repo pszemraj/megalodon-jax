@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import math
+import operator
 from collections.abc import Callable
 
 import equinox as eqx
@@ -324,8 +325,15 @@ def _validate_sampling(
     """Validate sampling controls before selecting greedy or stochastic execution."""
     if not math.isfinite(temperature) or temperature < 0.0:
         raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
-    if top_k is not None and not 0 <= top_k <= output_size:
-        raise ValueError(f"top_k must be in [0, {output_size}], got {top_k}")
+    if top_k is not None:
+        if isinstance(top_k, bool):
+            raise ValueError(f"top_k must be an integer, got {top_k!r}")
+        try:
+            top_k_value = operator.index(top_k)
+        except TypeError as error:
+            raise ValueError(f"top_k must be an integer, got {top_k!r}") from error
+        if not 0 <= top_k_value <= output_size:
+            raise ValueError(f"top_k must be in [0, {output_size}], got {top_k}")
     if top_p is not None and (not math.isfinite(top_p) or not 0.0 < top_p <= 1.0):
         raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
 
@@ -603,6 +611,12 @@ def generate(
             return_cache=return_cache,
         )
 
+    attention_mask = jnp.asarray(attention_mask)
+    if attention_mask.shape != prompt_ids.shape:
+        raise ValueError(
+            "attention_mask shape must match prompt_ids shape, got "
+            f"{attention_mask.shape} and {prompt_ids.shape}"
+        )
     has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
     needs_cache = cache is not None or return_cache or max_new_tokens > 1
     if has_padding and needs_cache:

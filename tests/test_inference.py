@@ -176,6 +176,8 @@ class TestSamplingAndGeneration:
             ({"temperature": -1.0}, "temperature must be finite"),
             ({"temperature": 0.0, "top_k": -1}, "top_k must be"),
             ({"temperature": 0.0, "top_k": 4}, "top_k must be"),
+            ({"temperature": 0.0, "top_k": 1.5}, "top_k must be an integer"),
+            ({"temperature": 0.0, "top_k": True}, "top_k must be an integer"),
             ({"temperature": 0.0, "top_p": 0.0}, "top_p must be finite"),
             ({"temperature": 0.0, "top_p": float("nan")}, "top_p must be finite"),
         ],
@@ -294,6 +296,22 @@ class TestSamplingAndGeneration:
 
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
         assert (cache is not None) is return_cache
+
+    @pytest.mark.parametrize("mask_shape", [(1, 1), (2, 3), (3,)])
+    def test_generate_rejects_wrong_shape_all_true_mask(self, mask_shape: tuple[int, ...]) -> None:
+        """Mask shape is validated before an all-valid mask is discarded."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="attention_mask shape.*prompt_ids shape"):
+            generate(
+                model,
+                prompt,
+                max_new_tokens=1,
+                temperature=0.0,
+                attention_mask=jnp.ones(mask_shape, dtype=jnp.bool_),
+            )
 
     def test_generate_rejects_non_vocabulary_output_space(self) -> None:
         """Autoregressive output IDs must always be valid embedding IDs."""
