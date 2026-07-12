@@ -195,6 +195,25 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match=message):
             MegalodonConfig(**{field: value})
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("chunk_size", 4.5),
+            ("attention_window", float("nan")),
+            ("model_dim", 1024.0),
+            ("num_layers", 1.5),
+            ("num_layers", True),
+            ("vocab_size", 32_000.0),
+            ("output_size", 3.5),
+            ("norm_num_groups", 32.0),
+            ("bos_token_id", 1.0),
+        ],
+    )
+    def test_structural_fields_require_integer_types(self, field: str, value: object) -> None:
+        """Shape, count, and token-ID fields reject coercible non-integers."""
+        with pytest.raises(ValueError, match=rf"{field} must be an integer"):
+            MegalodonConfig(**{field: value})
+
     def test_dtype_validation(self) -> None:
         """Test dtype constraints reject float16.
 

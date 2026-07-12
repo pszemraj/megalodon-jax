@@ -14,6 +14,7 @@
 """Megalodon configuration."""
 
 import math
+import operator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -75,6 +76,32 @@ class MegalodonConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
+        integer_fields = (
+            ("vocab_size", self.vocab_size),
+            ("model_dim", self.model_dim),
+            ("num_layers", self.num_layers),
+            ("num_heads", self.num_heads),
+            ("z_dim", self.z_dim),
+            ("value_dim", self.value_dim),
+            ("ffn_hidden_dim", self.ffn_hidden_dim),
+            ("cema_ndim", self.cema_ndim),
+            ("chunk_size", self.chunk_size),
+            ("norm_num_groups", self.norm_num_groups),
+            ("output_size", self.output_size),
+            ("attention_window", self.attention_window),
+            ("pad_token_id", self.pad_token_id),
+            ("bos_token_id", self.bos_token_id),
+            ("eos_token_id", self.eos_token_id),
+        )
+        for name, value in integer_fields:
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got {value!r}")
+            try:
+                operator.index(value)
+            except TypeError as error:
+                raise ValueError(f"{name} must be an integer, got {value!r}") from error
         if self.vocab_size <= 0:
             raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
         if self.output_size < -1 or self.output_size == 0:
