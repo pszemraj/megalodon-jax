@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon_jax.precision import audit_sensitive_param_dtypes
+from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
 
 
 def small_config() -> MegalodonConfig:
@@ -1826,6 +1826,7 @@ class TestPrecisionAudit:
             chunk_size=8,
             norm_num_groups=8,
             compute_dtype=jnp.bfloat16,
+            rescale_nffn=True,
         )
 
         key = jax.random.PRNGKey(random_seed)
@@ -1847,6 +1848,10 @@ class TestPrecisionAudit:
         model_bf16 = jax.tree.map(to_bf16, model)
         mismatches = audit_sensitive_param_dtypes(model_bf16)
         assert "layers.0.attn.cema.alpha" in mismatches
+        assert "layers.0.ffn.alpha" in mismatches
+
+        restored = ensure_sensitive_param_dtype(model_bf16)
+        assert audit_sensitive_param_dtypes(restored) == {}
 
 
 class TestComplexEMAMask:

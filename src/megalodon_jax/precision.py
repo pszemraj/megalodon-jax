@@ -58,6 +58,8 @@ def _iter_sensitive_params(
             yield f"layers.{i}.ffn.norm.weight", layer.ffn.norm.weight
         if layer.ffn.norm.bias is not None:
             yield f"layers.{i}.ffn.norm.bias", layer.ffn.norm.bias
+        if layer.ffn.alpha is not None:
+            yield f"layers.{i}.ffn.alpha", layer.ffn.alpha
 
     if core.norm.weight is not None:
         yield "norm.weight", core.norm.weight
@@ -168,6 +170,12 @@ def ensure_sensitive_param_dtype(
                     lambda m: m.layers[i].ffn.norm.bias,
                     core,
                     cast_if_present(layer.ffn.norm.bias),
+                )
+            if layer.ffn.alpha is not None:
+                core = eqx.tree_at(
+                    lambda m: m.layers[i].ffn.alpha,
+                    core,
+                    cast_if_present(layer.ffn.alpha),
                 )
 
         if core.norm.weight is not None:

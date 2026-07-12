@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from megalodon_jax import MegalodonConfig
+from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.layers.norms import BatchedLayerNorm
 from megalodon_jax.types import AttentionCache, LayerCache, NormState
@@ -90,6 +91,34 @@ class TestMegalodonConfig:
         assert presets["paper_7b"][0].chunk_size == 4_096
         assert presets["paper_7b"][0].effective_rope_base == 100_000.0
         assert presets["mega1_3b_pg19"][0].share_emb is True
+
+    @pytest.mark.parametrize("share_emb", [False, True])
+    @pytest.mark.parametrize("swiglu", [False, True])
+    def test_parameter_count_matches_allocated_trainable_leaves(
+        self,
+        share_emb: bool,
+        swiglu: bool,
+    ) -> None:
+        """The independent count formula matches every allocated inexact array leaf."""
+        config = MegalodonConfig(
+            vocab_size=17,
+            model_dim=8,
+            num_layers=2,
+            num_heads=2,
+            z_dim=8,
+            value_dim=8,
+            ffn_hidden_dim=12,
+            cema_ndim=2,
+            chunk_size=8,
+            norm_num_groups=2,
+            share_emb=share_emb,
+            swiglu=swiglu,
+            rescale_nffn=True,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        trainable = eqx.filter(model, eqx.is_inexact_array)
+        allocated = sum(int(leaf.size) for leaf in jax.tree_util.tree_leaves(trainable))
+        assert allocated == config.parameter_count_breakdown()["total"]
 
     def test_ambiguous_7b_factory_is_rejected(self) -> None:
         """The historical hybrid factory must never select semantics silently."""
