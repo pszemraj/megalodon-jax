@@ -76,6 +76,8 @@ The associative path is ~5x slower than FFT (training-viable); the sequential fa
 
 State uses FP32 population mean/variance and a token-block count. A valid token contributes all features in each group, including within-token variance, using the same block-Welford algebra as the released CUDA implementation. The configured `norm_eps` is added only when normalizing; no artificial state variance floor or nonzero empty-state M2 is injected.
 
+The production training and continuation paths evaluate this causal recurrence with a sequential `jax.lax.scan`. This replaces the former vectorized cumulative-sum path to preserve exact block-Welford, masking, reset, and chunk-continuation semantics, with a throughput tradeoff that should be measured separately from correctness.
+
 ### EMA Eigenvalue Stability
 
 Stable by construction:

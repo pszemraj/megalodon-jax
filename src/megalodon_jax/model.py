@@ -263,7 +263,7 @@ class MegalodonModel(eqx.Module):
 
         # Split keys explicitly for each purpose (clearer allocation)
         # - k_embed: initial embedding weights
-        # - k_embed_reinit: embedding reinitialization (if init_mode != "none")
+        # - k_embed_reinit: unconditional boundary-policy embedding reinitialization
         # - k_layer_reinit: layer reinitialization (if init_mode != "none")
         # - layer_keys: one key per MegalodonBlock
         k_embed, k_embed_reinit, k_layer_reinit, k_layers = jax.random.split(key, 4)

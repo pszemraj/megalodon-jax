@@ -43,6 +43,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 ## Fixed precision behavior
 
 - TimestepNorm state, running moments, RMSNorm statistics, and LayerNorm statistics are FP32.
+- TimestepNorm uses plain FP32 block-Welford accumulation; unlike the released CUDA kernel, it does not carry Kahan compensation terms across updates.
 - CEMA coefficients and state are FP32/complex64.
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
 - FP32 matrix contractions request JAX's per-operation `HIGHEST` precision, so NVIDIA GPUs do not silently substitute TensorFloat-32 products. BF16 contractions retain BF16 inputs with FP32 accumulation.
