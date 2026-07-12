@@ -99,6 +99,68 @@ def _manifest(tensors: dict[str, Array]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _require_exact_keys(
+    actual: Collection[str],
+    expected: Collection[str],
+    *,
+    context: str,
+) -> None:
+    """Require an exact key set and report both sides of any mismatch."""
+    actual_set = set(actual)
+    expected_set = set(expected)
+    missing = sorted(expected_set - actual_set)
+    unexpected = sorted(actual_set - expected_set)
+    if missing or unexpected:
+        raise ValueError(f"{context}: missing={missing}, unexpected={unexpected}")
+
+
+def _require_tensor(
+    tensors: dict[str, Array],
+    name: str,
+    shape: tuple[int, ...],
+    dtype: jnp.dtype,
+    *,
+    context: str,
+) -> Array:
+    """Return a tensor only when its shape and dtype match exactly."""
+    value = tensors[name]
+    if value.shape != shape:
+        raise ValueError(f"{context} {name} has shape {value.shape}, expected {shape}")
+    expected_dtype = jnp.dtype(dtype)
+    if value.dtype != expected_dtype:
+        raise ValueError(f"{context} {name} has dtype {value.dtype}, expected {expected_dtype}")
+    return value
+
+
+def _load_manifest_tensors(
+    path: Path,
+    metadata: dict[str, str],
+    *,
+    manifest_key: str,
+    error: str,
+) -> dict[str, Array]:
+    """Load tensors and validate the schema manifest recorded in metadata."""
+    tensors = load_file(str(path))
+    if _manifest(tensors) != metadata.get(manifest_key):
+        raise ValueError(error)
+    return tensors
+
+
+def _save_atomic_safetensors(
+    destination: Path,
+    tensors: dict[str, Array],
+    metadata: dict[str, str],
+    *,
+    suffix_error: str,
+) -> None:
+    """Write a SafeTensors file atomically after validating its suffix."""
+    if destination.suffix != ".safetensors":
+        raise ValueError(suffix_error)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    save_file(tensors, str(temporary), metadata=metadata)
+    temporary.replace(destination)
+
+
 Entry = tuple[
     str,
     Array,
@@ -268,10 +330,12 @@ def _read_model_file(path: Path) -> tuple[dict[str, Array], dict[str, str]]:
     expected_tying = "tied" if checkpoint_config.share_emb else "untied"
     if metadata["tying"] != expected_tying:
         raise ValueError("checkpoint tying metadata disagrees with its configuration")
-    tensors = load_file(str(path))
-    actual_manifest = _manifest(tensors)
-    if actual_manifest != metadata["parameter_manifest_sha256"]:
-        raise ValueError("checkpoint parameter manifest does not match its metadata")
+    tensors = _load_manifest_tensors(
+        path,
+        metadata,
+        manifest_key="parameter_manifest_sha256",
+        error="checkpoint parameter manifest does not match its metadata",
+    )
     return tensors, metadata
 
 
@@ -286,12 +350,7 @@ def _apply_parameters(
     available = set(tensors)
     selected = expected if include is None else set(include)
     if include is None:
-        missing = sorted(expected - available)
-        unexpected = sorted(available - expected)
-        if missing or unexpected:
-            raise ValueError(
-                f"strict checkpoint key mismatch: missing={missing}, unexpected={unexpected}"
-            )
+        _require_exact_keys(available, expected, context="strict checkpoint key mismatch")
     else:
         unknown = sorted(selected - expected)
         unavailable = sorted(selected - available)
@@ -306,15 +365,13 @@ def _apply_parameters(
         if name not in selected:
             initialized.append(name)
             continue
-        value = tensors[name]
-        if value.shape != template.shape:
-            raise ValueError(
-                f"shape mismatch for {name}: checkpoint {value.shape}, model {template.shape}"
-            )
-        if value.dtype != template.dtype:
-            raise ValueError(
-                f"dtype mismatch for {name}: checkpoint {value.dtype}, model {template.dtype}"
-            )
+        value = _require_tensor(
+            tensors,
+            name,
+            template.shape,
+            template.dtype,
+            context="checkpoint tensor",
+        )
         model = eqx.tree_at(where, model, value)
         restored.append(name)
     return model, {"restored": restored, "initialized": initialized}
@@ -323,8 +380,6 @@ def _apply_parameters(
 def save_checkpoint(model: MegalodonForCausalLM, path: str | Path) -> None:
     """Save a strict native v2 model checkpoint."""
     destination = Path(path)
-    if destination.suffix != ".safetensors":
-        raise ValueError("native checkpoints must use the .safetensors suffix")
     tensors = model_state_dict(model)
     config_json = _config_json(model.config)
     metadata = {
@@ -340,9 +395,12 @@ def save_checkpoint(model: MegalodonForCausalLM, path: str | Path) -> None:
         "tying": "tied" if model.tied else "untied",
         "dtype_policy": DTYPE_POLICY,
     }
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    save_file(tensors, str(temporary), metadata=metadata)
-    temporary.replace(destination)
+    _save_atomic_safetensors(
+        destination,
+        tensors,
+        metadata,
+        suffix_error="native checkpoints must use the .safetensors suffix",
+    )
 
 
 def load_checkpoint(
@@ -421,8 +479,6 @@ def save_inference_cache(
 ) -> None:
     """Save an inference cache bound to an exact model configuration."""
     destination = Path(path)
-    if destination.suffix != ".safetensors":
-        raise ValueError("cache files must use the .safetensors suffix")
     if len(cache.layer_caches) != config.num_layers:
         raise ValueError("cache layer count does not match configuration")
     tensors, present = _cache_tensors(cache)
@@ -433,9 +489,12 @@ def save_inference_cache(
         "present_json": json.dumps(present, separators=(",", ":")),
         "tensor_manifest_sha256": _manifest(tensors),
     }
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    save_file(tensors, str(temporary), metadata=metadata)
-    temporary.replace(destination)
+    _save_atomic_safetensors(
+        destination,
+        tensors,
+        metadata,
+        suffix_error="cache files must use the .safetensors suffix",
+    )
 
 
 def load_inference_cache(
@@ -452,9 +511,12 @@ def load_inference_cache(
         raise ValueError("incompatible or legacy inference cache")
     if metadata.get("config_fingerprint") != config_fingerprint(config):
         raise ValueError("cache configuration fingerprint mismatch")
-    tensors = load_file(str(source))
-    if _manifest(tensors) != metadata.get("tensor_manifest_sha256"):
-        raise ValueError("cache tensor manifest mismatch")
+    tensors = _load_manifest_tensors(
+        source,
+        metadata,
+        manifest_key="tensor_manifest_sha256",
+        error="cache tensor manifest mismatch",
+    )
     try:
         present_payload = json.loads(metadata["present_json"])
     except (KeyError, json.JSONDecodeError) as exc:
@@ -501,13 +563,11 @@ def load_inference_cache(
             expected_tensor_keys.update({f"{prefix}.ema.real", f"{prefix}.ema.imag"})
     if "final_norm" in present:
         expected_tensor_keys.update({"final_norm.count", "final_norm.mean", "final_norm.var"})
-    actual_tensor_keys = set(tensors)
-    if actual_tensor_keys != expected_tensor_keys:
-        raise ValueError(
-            "cache tensor keys disagree with presence metadata: "
-            f"missing={sorted(expected_tensor_keys - actual_tensor_keys)}, "
-            f"unexpected={sorted(actual_tensor_keys - expected_tensor_keys)}"
-        )
+    _require_exact_keys(
+        tensors,
+        expected_tensor_keys,
+        context="cache tensor keys disagree with presence metadata",
+    )
 
     batch_size: int | None = None
 
@@ -519,14 +579,7 @@ def load_inference_cache(
             raise ValueError(f"cache batch mismatch at {name}: {size} != {batch_size}")
 
     def require(name: str, shape: tuple[int, ...], dtype: jnp.dtype) -> Array:
-        value = tensors[name]
-        if value.shape != shape:
-            raise ValueError(f"cache tensor {name} has shape {value.shape}, expected {shape}")
-        if value.dtype != jnp.dtype(dtype):
-            raise ValueError(
-                f"cache tensor {name} has dtype {value.dtype}, expected {jnp.dtype(dtype)}"
-            )
-        return value
+        return _require_tensor(tensors, name, shape, dtype, context="cache tensor")
 
     layers: list[LayerCache | None] = []
     for index in range(config.num_layers):

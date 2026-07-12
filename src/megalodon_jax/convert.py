@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from jaxtyping import Array
 
-from megalodon_jax.checkpoint import _apply_parameters
+from megalodon_jax.checkpoint import _apply_parameters, _require_exact_keys
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
 
@@ -178,12 +178,7 @@ def load_upstream_state_dict(
     """Load an exact released world-size-one state dictionary, strictly."""
     expected = set(export_upstream_state_dict(model))
     actual = set(state_dict)
-    missing = sorted(expected - actual)
-    unexpected = sorted(actual - expected)
-    if missing or unexpected:
-        raise ValueError(
-            f"strict original-upstream key mismatch: missing={missing}, unexpected={unexpected}"
-        )
+    _require_exact_keys(actual, expected, context="strict original-upstream key mismatch")
 
     config = model.config
     native: dict[str, Array] = {
