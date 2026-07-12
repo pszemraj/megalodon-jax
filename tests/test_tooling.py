@@ -7,17 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from tools import verify_modeling_correctness, verify_timestep_norm_candidates
+from tools import verify_modeling_correctness
 
 
-@pytest.mark.parametrize(
-    "module",
-    [verify_modeling_correctness, verify_timestep_norm_candidates],
-)
 def test_git_revision_accepts_only_requested_checkout_root(
-    module, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A source archive nested in another checkout cannot inherit its revision."""
+    module = verify_modeling_correctness
     source = tmp_path / "source-archive"
     source.mkdir()
     parent_revision = "a" * 40
