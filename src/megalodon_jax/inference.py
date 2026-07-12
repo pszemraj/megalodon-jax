@@ -655,7 +655,3 @@ def generate(
         cache=cache,
         return_cache=return_cache,
     )
-
-
-# Convenience JIT wrapper for generation with static knobs
-generate_jit = eqx.filter_jit(_generate_core)

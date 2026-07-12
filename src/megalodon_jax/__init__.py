@@ -10,7 +10,6 @@ from megalodon_jax.checkpoint import (
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.inference import (
     generate,
-    generate_jit,
     greedy_token,
     index_cache,
     init_cache,
@@ -46,7 +45,6 @@ __all__ = [
     "greedy_token",
     "sample_token",
     "generate",
-    "generate_jit",
 ]
 
 # Original-upstream conversion requires torch and is imported explicitly from
