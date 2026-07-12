@@ -69,6 +69,7 @@ pythonpath = ["src"]
 # Run all tests in tests/ directory
 testpaths = ["tests"]
 markers = [
+  "fast: authoritative CPU correctness gate intended for routine CI",
   "torch_ref: independent PyTorch checks derived from the exact local released source",
 ]
 

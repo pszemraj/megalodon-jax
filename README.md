@@ -201,6 +201,7 @@ src/megalodon_jax/
 ## Testing
 
 ```bash
+pytest -m fast                    # Routine CPU correctness gate
 pytest                          # All CPU tests
 pytest -m "not torch_ref"       # JAX-only tests
 pytest -m torch_ref             # Independent source-derived Torch parity tests

@@ -699,6 +699,16 @@ class TestChunkedAttention:
             assert errors["cache_v"] == 0.0
             assert errors["cache_count"] == 0.0
 
+    def test_pristine_prefill_partition_smoke(self, random_seed: int) -> None:
+        """Routine gate covers faithful and sliding prefill with one uneven split."""
+        for attention_window in (None, 8):
+            errors = cache_partition_errors(
+                attention_window,
+                (3, 5, 4),
+                seed=random_seed,
+            )
+            assert max(errors.values()) <= 2e-6
+
     @pytest.mark.parametrize("attention_window", [None, 8])
     def test_pristine_prefill_has_no_sequence_loop(
         self,
