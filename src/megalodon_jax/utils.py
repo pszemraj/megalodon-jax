@@ -51,8 +51,6 @@ def get_initializer(
     is shape[-1] and fan-out is shape[-2]. The released ``he`` mode is
     ``kaiming_normal_(a=sqrt(5))``, not canonical ReLU He normal.
     """
-    if mode == "none":
-        raise ValueError("Init mode 'none' skips reinitialization and has no initializer.")
 
     def require_matrix(shape: tuple[int, ...]) -> tuple[int, int]:
         if len(shape) < 2:
@@ -140,9 +138,6 @@ def reinit_linear_weights(
     :param int | None dim: Dimension for gaussian stddev; None uses stddev=1.0.
     :return T: Model with reinitialized Linear weights.
     """
-    if mode == "none":
-        return model  # Skip reinitialization
-
     init_fn = get_initializer(mode, dim)
 
     # Find all Linear layers using module-level predicate

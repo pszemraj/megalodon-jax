@@ -455,7 +455,6 @@ class ChunkedAttention(eqx.Module):
     ) -> Float[Array, "batch seq heads value_dim"]:
         """Evaluate the optional sliding extension without a cache."""
         batch, length = q.shape[:2]
-        assert self.attention_window is not None
         if segment_ids is not None:
             run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
             positions = local_positions if position_ids is None else position_ids
@@ -902,7 +901,7 @@ class MegalodonAttention(eqx.Module):
 
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
         mx = self.rmsnorm(y_cema)
-        if not deterministic and self.hidden_dropout > 0.0 and k2 is not None:
+        if not deterministic and self.hidden_dropout > 0.0:
             keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, mx.shape)
             inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=mx.dtype)
             mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
@@ -958,7 +957,7 @@ class MegalodonAttention(eqx.Module):
         gated = out * r
 
         # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
-        if not deterministic and self.hidden_dropout > 0.0 and k3 is not None:
+        if not deterministic and self.hidden_dropout > 0.0:
             keep = jax.random.bernoulli(k3, 1.0 - self.hidden_dropout, gated.shape)
             inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=gated.dtype)
             gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
@@ -969,7 +968,7 @@ class MegalodonAttention(eqx.Module):
         )
 
         # Output dropout
-        if not deterministic and self.dropout > 0.0 and k4 is not None:
+        if not deterministic and self.dropout > 0.0:
             keep = jax.random.bernoulli(k4, 1.0 - self.dropout, h.shape)
             inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=h.dtype)
             h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
@@ -1136,14 +1135,10 @@ class NormalizedFFN(eqx.Module):
 
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
-            if key is not None:
-                k1, k2 = jax.random.split(key)
-            else:
-                k1 = k2 = None
-            if k1 is not None:
-                keep = jax.random.bernoulli(k1, 1.0 - self.hidden_dropout, h.shape)
-                inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=h.dtype)
-                h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
+            k1, k2 = jax.random.split(key)
+            keep = jax.random.bernoulli(k1, 1.0 - self.hidden_dropout, h.shape)
+            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=h.dtype)
+            h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
         else:
             k2 = key
 
@@ -1151,7 +1146,7 @@ class NormalizedFFN(eqx.Module):
         out = linear_3d(self.fc2, h, self.compute_dtype, self.accum_dtype)
 
         # Output dropout
-        if not deterministic and self.dropout > 0.0 and k2 is not None:
+        if not deterministic and self.dropout > 0.0:
             keep = jax.random.bernoulli(k2, 1.0 - self.dropout, out.shape)
             inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=out.dtype)
             out = jnp.where(keep, out * inv_keep, jnp.zeros((), dtype=out.dtype))

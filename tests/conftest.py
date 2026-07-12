@@ -83,33 +83,3 @@ def clear_gpu_caches() -> Iterator[None]:
     if _TORCH_CUDA_AVAILABLE:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-
-@pytest.fixture
-def torch_device() -> torch.device:
-    """Get the appropriate torch device and require full FP32 matmuls.
-
-    :return torch.device: Selected torch device for the session.
-    """
-    if not _TORCH_AVAILABLE:
-        pytest.skip("torch is not installed")
-    if _TORCH_CUDA_AVAILABLE:
-        device = torch.device("cuda")
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-    else:
-        device = torch.device("cpu")
-    return device
-
-
-def sync_and_clear_torch() -> None:
-    """Synchronize and clear PyTorch GPU memory before switching to JAX.
-
-    :return None: None.
-    """
-    import gc
-
-    gc.collect()
-    if _TORCH_CUDA_AVAILABLE:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()

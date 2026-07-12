@@ -39,7 +39,6 @@ class TimestepNorm(eqx.Module):
     group_size: int = eqx.field(static=True)
     prior_count: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
-    affine: bool = eqx.field(static=True)
     prior_mean: Float[Array, "groups"] | None
     prior_logv: Float[Array, "groups"] | None
     weight: Float[Array, "dim"]
@@ -94,7 +93,6 @@ class TimestepNorm(eqx.Module):
         self.group_size = num_features // resolved_groups
         self.prior_count = prior_count
         self.eps = eps
-        self.affine = True
         if prior_count > 0:
             self.prior_mean = jnp.zeros(resolved_groups, dtype=jnp.float32)
             self.prior_logv = jnp.zeros(resolved_groups, dtype=jnp.float32)

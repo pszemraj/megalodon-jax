@@ -69,7 +69,6 @@ pythonpath = ["src"]
 # Run all tests in tests/ directory
 testpaths = ["tests"]
 markers = [
-  "cuda: tests that require a CUDA-capable device",
   "torch_ref: independent PyTorch checks derived from the exact local released source",
 ]
 

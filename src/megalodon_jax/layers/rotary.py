@@ -95,8 +95,6 @@ class RotaryEmbedding(eqx.Module):
             angles = positions[:, :, None] * inv_freq[None, None, :]  # (B, seq, half_dim)
             cos = jnp.cos(angles)[:, :, None, :]  # (B, seq, 1, half_dim)
             sin = jnp.sin(angles)[:, :, None, :]  # (B, seq, 1, half_dim)
-            cos = jnp.broadcast_to(cos, (batch_size, seq_len, 1, self.dim // 2))
-            sin = jnp.broadcast_to(sin, (batch_size, seq_len, 1, self.dim // 2))
 
         # Match torch.view_as_complex(x.float().reshape(..., -1, 2)).
         half = self.dim // 2

@@ -264,7 +264,7 @@ class MegalodonModel(eqx.Module):
         # Split keys explicitly for each purpose (clearer allocation)
         # - k_embed: initial embedding weights
         # - k_embed_reinit: unconditional boundary-policy embedding reinitialization
-        # - k_layer_reinit: layer reinitialization (if init_mode != "none")
+        # - k_layer_reinit: layer reinitialization
         # - layer_keys: one key per MegalodonBlock
         k_embed, k_embed_reinit, k_layer_reinit, k_layers = jax.random.split(key, 4)
         layer_keys = jax.random.split(k_layers, config.num_layers)
@@ -293,15 +293,14 @@ class MegalodonModel(eqx.Module):
             MegalodonBlock(config, i, key=layer_keys[i]) for i in range(config.num_layers)
         )
 
-        # Apply init_mode to all Linear layers in blocks
-        if config.init_mode != "none":
-            layer_reinit_keys = jax.random.split(k_layer_reinit, len(layers))
-            # Match PyTorch: gaussian Linear init uses std=1.0 (dim=None).
-            linear_dim = None if config.init_mode == "gaussian" else config.model_dim
-            layers = tuple(
-                reinit_linear_weights(layer, config.init_mode, k, dim=linear_dim)
-                for layer, k in zip(layers, layer_reinit_keys)
-            )
+        # Apply init_mode to all Linear layers in blocks.
+        layer_reinit_keys = jax.random.split(k_layer_reinit, len(layers))
+        # Match PyTorch: gaussian Linear init uses std=1.0 (dim=None).
+        linear_dim = None if config.init_mode == "gaussian" else config.model_dim
+        layers = tuple(
+            reinit_linear_weights(layer, config.init_mode, k, dim=linear_dim)
+            for layer, k in zip(layers, layer_reinit_keys)
+        )
         self.layers = layers
 
         self.norm = TimestepNorm(
