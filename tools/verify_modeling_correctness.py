@@ -32,7 +32,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 # These must be set before importing JAX.
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -43,7 +43,8 @@ import numpy as np
 @dataclass
 class CheckResult:
     name: str
-    passed: bool
+    status: Literal["passed", "failed", "skipped"]
+    passed: bool | None
     severity: str
     summary: str
     details: dict[str, Any]
@@ -67,7 +68,21 @@ class Audit:
         self.results.append(
             CheckResult(
                 name=name,
+                status="passed" if passed else "failed",
                 passed=bool(passed),
+                severity=severity,
+                summary=summary,
+                details=_jsonable(details),
+            )
+        )
+
+    def skip(self, name: str, severity: str, summary: str, **details: Any) -> None:
+        """Record a check that was intentionally not executed."""
+        self.results.append(
+            CheckResult(
+                name=name,
+                status="skipped",
+                passed=None,
                 severity=severity,
                 summary=summary,
                 details=_jsonable(details),
@@ -529,39 +544,6 @@ def source_parameter_count(
     return embedding + num_layers * per_layer + final_norm + output
 
 
-def current_jax_formula_count(config: Any, *, assume_tied: bool) -> int:
-    """Count the current JAX architecture formula without allocating a 7B model."""
-
-    d = int(config.model_dim)
-    layers = int(config.num_layers)
-    h = int(config.num_heads)
-    z = int(config.z_dim)
-    v = int(config.value_dim)
-    f = int(config.ffn_hidden_dim)
-    n = int(config.cema_ndim)
-    vocab = int(config.vocab_size)
-    affine = bool(config.norm_affine)
-
-    timestep_norm = 2 * d if affine else 0
-    cema = 4 * d * n + 2 * d
-    rmsnorm = d if affine else 0
-    projections = (
-        (d * z + z) + (d * v + v) + (d * v + v) + (d * d + d) + (v * d + d)  # current JAX wh2 bias
-    )
-    qk_affine = 4 * z
-    # Current inv_freq is an inexact array leaf and is trainable under generic filters.
-    rope_leaf = (z // h) // 2
-    ffn_norm = 2 * d if affine else 0
-    ffn = (d * f + f) + (f * d + d) + ((d * f + f) if config.swiglu else 0)
-    per_layer = (
-        timestep_norm + cema + rmsnorm + projections + qk_affine + rope_leaf + ffn_norm + ffn
-    )
-    final_norm = 2 * d if affine else 0
-    embedding = vocab * d
-    output = 0 if assume_tied else vocab * d
-    return embedding + layers * per_layer + final_norm + output
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     default_repo = Path("/mnt/data/megalodon-jax-extract/megalodon-jax")
@@ -628,6 +610,7 @@ def main() -> int:
     import jax
     import jax.numpy as jnp
 
+    from megalodon_jax.checkpoint import model_state_dict
     from megalodon_jax.config import MegalodonConfig
     from megalodon_jax.layers import RotaryEmbedding, TimestepNorm
     from megalodon_jax.layers.attention import ChunkedAttention
@@ -865,6 +848,21 @@ def main() -> int:
         counts = {
             name: config.parameter_count_breakdown()["total"] for name, config in configs.items()
         }
+        source_counts = {
+            name: source_parameter_count(
+                model_dim=config.model_dim,
+                num_layers=config.num_layers,
+                num_heads=config.num_heads,
+                z_dim=config.z_dim,
+                value_dim=config.value_dim,
+                ffn_hidden_dim=config.ffn_hidden_dim,
+                cema_ndim=config.cema_ndim,
+                vocab_size=config.vocab_size,
+                swiglu=config.swiglu,
+                share_emb=config.share_emb,
+            )
+            for name, config in configs.items()
+        }
         try:
             MegalodonConfig.from_7b()
         except ValueError:
@@ -879,12 +877,18 @@ def main() -> int:
             "paper_chunk_and_base": configs["paper7B"].chunk_size == 4_096
             and configs["paper7B"].effective_rope_base == 100_000.0,
         }
-        passed = counts == expected_counts and ambiguous_rejected and all(identities.values())
+        passed = (
+            counts == expected_counts
+            and source_counts == counts
+            and ambiguous_rejected
+            and all(identities.values())
+        )
         return (
             passed,
             "Named source/paper presets and exact parameter counts are unambiguous",
             {
                 "actual_counts": counts,
+                "independent_source_formula_counts": source_counts,
                 "expected_counts": expected_counts,
                 "ambiguous_from_7b_rejected": ambiguous_rejected,
                 "identities": identities,
@@ -1166,6 +1170,13 @@ def main() -> int:
         )
 
     audit.run("cuda_timestep_mask_source_contract", "INFO", check_cuda_source_mask_contract)
+    audit.skip(
+        "cuda_timestep_mask_runtime_parity",
+        "INFO",
+        "Skipped by scope: the released fused CUDA extension is source reference only",
+        verification_mode="not_run",
+        reason="owner explicitly excluded building or installing the upstream extension",
+    )
 
     def check_source_biases() -> tuple[bool, str, dict[str, Any]]:
         cfg = MegalodonConfig(
@@ -1618,6 +1629,22 @@ def main() -> int:
 
         audit.run("sliding_cache_partition_invariance", "P1", check_sliding_cache)
 
+    else:
+        for name, severity in (
+            ("fp32_output_logits", "P1"),
+            ("source_torch_jax_forward_gradient_parity", "P0"),
+            ("source_torch_jax_three_step_adamw", "P0"),
+            ("deterministic_tiny_batch_overfit", "P0"),
+            ("faithful_cache_partition_invariance", "P1"),
+            ("sliding_cache_partition_invariance", "P1"),
+        ):
+            audit.skip(
+                name,
+                severity,
+                "Not run in fast mode; rerun with --include-slow",
+                required_flag="--include-slow",
+            )
+
     manifest_config = MegalodonConfig(
         vocab_size=32,
         model_dim=16,
@@ -1631,39 +1658,127 @@ def main() -> int:
         norm_num_groups=4,
     )
     manifest_model = MegalodonForCausalLM(manifest_config, key=jax.random.PRNGKey(2026))
-    parameter_inventory = []
-    total_parameters = 0
-    for path, leaf in jax.tree_util.tree_flatten_with_path(manifest_model)[0]:
-        if not eqx.is_array(leaf):
-            continue
+    parameter_inventory: list[dict[str, Any]] = []
+
+    def upstream_parameter_path(path: str) -> str:
+        """Map one canonical native parameter to its exact released-source key."""
+        if path == "model.embed.weight":
+            return "embed.weight"
+        if path == "lm_head.weight":
+            return "output.output.weight"
+        if path.startswith("model.norm."):
+            return f"output.final_norm.{path.removeprefix('model.norm.')}"
+        parts = path.split(".")
+        if len(parts) < 5 or parts[:2] != ["model", "layers"]:
+            raise ValueError(f"unmapped native parameter path: {path}")
+        index, family = parts[2], parts[3]
+        tail = ".".join(parts[4:])
+        if family == "ffn":
+            return f"layers.{index}.nffn.{tail}"
+        if family != "attn":
+            raise ValueError(f"unmapped native parameter family: {path}")
+        if tail == "rmsnorm.gamma":
+            tail = "rmsnorm.weight"
+        elif tail == "cema.gamma_real":
+            tail = "cema.gamma[...,0]"
+        elif tail == "cema.gamma_imag":
+            tail = "cema.gamma[...,1]"
+        return f"layers.{index}.mega.{tail}"
+
+    def initializer_contract(path: str) -> str:
+        """Describe the initializer for one canonical native parameter."""
+        if path in ("model.embed.weight", "lm_head.weight"):
+            return "truncated_normal(std=model_dim^-0.5,bounds=[-3sd,3sd])"
+        if ".cema.alpha" in path or ".cema.delta" in path:
+            return "normal(mean=0,std=0.2)"
+        if ".cema.theta" in path:
+            return "source_logit_frequency_permutation"
+        if ".cema.gamma_real" in path:
+            return "normal(mean=0,std=1)"
+        if ".cema.omega" in path:
+            return "truncated_normal(mean=0,std=0.25,bounds=[-1,1])"
+        if path.endswith(".ffn.alpha"):
+            return "constant(0.1*0.5^layer_index)"
+        if path.endswith(".weight") and any(
+            token in path
+            for token in (".attn.wz.", ".attn.wv.", ".attn.wr.", ".attn.wh", ".ffn.fc")
+        ):
+            return str(manifest_config.init_mode)
+        return "zeros"
+
+    parameters = model_state_dict(manifest_model)
+    for path, leaf in parameters.items():
         shape = tuple(int(size) for size in leaf.shape)
         count = int(np.prod(shape, dtype=np.int64))
-        total_parameters += count
-        path_text = jax.tree_util.keystr(path)
-        trainable = bool(jnp.issubdtype(leaf.dtype, jnp.inexact))
-        if ".embed.weight" in path_text or ".lm_head.weight" in path_text:
-            initializer = "boundary_truncated_normal"
-        elif any(token in path_text for token in ("weight", "wz", "wv", "wr", "wh", "fc")):
-            initializer = str(manifest_config.init_mode)
-        elif trainable:
-            initializer = "module_specific"
-        else:
-            initializer = "derived_or_state"
         parameter_inventory.append(
             {
-                "path": path_text,
+                "path": path,
                 "shape": shape,
                 "dtype": str(leaf.dtype),
                 "count": count,
-                "trainable": trainable,
-                "initializer": initializer,
-                "upstream_counterpart": path_text,
-                "classification": "parameter" if trainable else "derived_buffer",
+                "trainable": True,
+                "initializer": initializer_contract(path),
+                "upstream_counterpart": upstream_parameter_path(path),
+                "classification": "parameter",
             }
         )
+    total_parameters = sum(entry["count"] for entry in parameter_inventory)
+    derived_buffers = [
+        {
+            "path": "model.layers.*.attn.inner.rotary.frequency_schedule",
+            "shape_per_layer": (manifest_config.head_dim // 2,),
+            "dtype": "float32",
+            "count_in_parameter_tree": 0,
+            "trainable": False,
+            "initializer": "derived(base,head_dim)",
+            "upstream_counterpart": "rope.freqs",
+            "classification": "derived_buffer",
+        }
+    ]
+    upstream_config_fields = {
+        "vocab_size",
+        "model_dim",
+        "num_layers",
+        "num_heads",
+        "z_dim",
+        "value_dim",
+        "ffn_hidden_dim",
+        "cema_ndim",
+        "chunk_size",
+        "norm_num_groups",
+        "norm_eps",
+        "rope_base",
+        "swiglu",
+        "rescale_nffn",
+        "scale_emb",
+        "share_emb",
+        "norm_affine",
+        "dropout",
+        "attention_dropout",
+        "hidden_dropout",
+        "output_size",
+        "init_mode",
+    }
+    static_values = [
+        {
+            "path": f"config.{field.name}",
+            "value": _jsonable(getattr(manifest_config, field.name)),
+            "dtype": type(getattr(manifest_config, field.name)).__name__,
+            "trainable": False,
+            "initializer": None,
+            "upstream_counterpart": (
+                f"ModelConf.{field.name}"
+                if field.name in upstream_config_fields
+                else "none (JAX-specific static contract)"
+            ),
+            "classification": "static_value",
+        }
+        for field in dataclasses.fields(manifest_config)
+    ]
 
-    passed = sum(result.passed for result in audit.results)
-    failed = len(audit.results) - passed
+    passed = sum(result.status == "passed" for result in audit.results)
+    failed = sum(result.status == "failed" for result in audit.results)
+    skipped = sum(result.status == "skipped" for result in audit.results)
 
     print("\nMEGALODON JAX MODELING CORRECTNESS VERIFICATION")
     print(f"Repository: {repo}")
@@ -1672,9 +1787,9 @@ def main() -> int:
     print(f"JAX: {jax.__version__}; platform: {jax.default_backend()}")
     print("-" * 100)
     for result in audit.results:
-        mark = "PASS" if result.passed else "FAIL"
+        mark = {"passed": "PASS", "failed": "FAIL", "skipped": "SKIP"}[result.status]
         print(f"{mark:4s}  {result.severity:2s}  {result.name:42s}  {result.summary}")
-        if not result.passed:
+        if result.status == "failed":
             # Keep console concise; JSON retains complete tensors/details.
             compact = {
                 key: value
@@ -1683,7 +1798,12 @@ def main() -> int:
             }
             print(f"      details: {json.dumps(compact, sort_keys=True)}")
     print("-" * 100)
-    print(f"Summary: {passed} passed, {failed} failed, {len(audit.results)} total")
+    print(
+        f"Summary: {passed} passed, {failed} failed, {skipped} skipped, "
+        f"{len(audit.results)} declared"
+    )
+    if skipped:
+        print(f"{skipped} checks skipped; inspect SKIP rows and rerun with required flags")
 
     report = {
         "repository": str(repo),
@@ -1700,11 +1820,15 @@ def main() -> int:
         "torch": _torch_environment(),
         "parameter_manifest": {
             "config": _jsonable(dataclasses.asdict(manifest_config)),
-            "total_array_elements": total_parameters,
-            "leaves": parameter_inventory,
+            "total_trainable_elements": total_parameters,
+            "formula_total": manifest_config.parameter_count_breakdown()["total"],
+            "parameters": parameter_inventory,
+            "derived_buffers": derived_buffers,
+            "static_values": static_values,
         },
         "passed": passed,
         "failed": failed,
+        "skipped": skipped,
         "results": [result.as_dict() for result in audit.results],
     }
     if args.json is not None:
