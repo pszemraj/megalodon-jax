@@ -28,6 +28,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
+from megalodon_jax.layers.segments import valid_segment_mask
 from megalodon_jax.ops import matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_boundary_initializer, reinit_linear_weights
@@ -689,7 +690,7 @@ class MegalodonForCausalLM(eqx.Module):
             # boundary and anything in padding (segment id 0), so packed loss
             # matches running each document alone
             same_segment = segment_ids[:, :-1] == segment_ids[:, 1:]
-            valid_mask = valid_mask & same_segment & (segment_ids[:, 1:] > 0)
+            valid_mask = valid_mask & same_segment & valid_segment_mask(segment_ids[:, 1:])
 
         # Validate label bounds only on positions that will be used
         # Prevents silent wrong gradients from JAX index wrapping

@@ -18,7 +18,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from megalodon_jax.layers.segments import segment_boundaries
+from megalodon_jax.layers.segments import segment_boundaries, valid_segment_mask
 from megalodon_jax.types import NormState
 
 
@@ -184,7 +184,7 @@ class TimestepNorm(eqx.Module):
                 raise ValueError(
                     f"segment_ids must have shape {(batch_size, length)}, got {segment_ids.shape}"
                 )
-            valid = valid & (segment_ids > 0)
+            valid = valid & valid_segment_mask(segment_ids)
             boundaries = segment_boundaries(segment_ids)
 
         if length == 0:

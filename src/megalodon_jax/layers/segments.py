@@ -24,6 +24,11 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Int
 
 
+def valid_segment_mask(segment_ids: Int[Array, "batch seq"]) -> Bool[Array, "batch seq"]:
+    """Return the shared validity predicate for positive packed-sequence IDs."""
+    return segment_ids > 0
+
+
 def segment_boundaries(segment_ids: Int[Array, "batch seq"]) -> Bool[Array, "batch seq"]:
     """Mark positions where a new contiguous segment run starts.
 

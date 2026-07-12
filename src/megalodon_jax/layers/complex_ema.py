@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Complex, Float, Int, PRNGKeyArray
 
-from megalodon_jax.layers.segments import segment_boundaries
+from megalodon_jax.layers.segments import segment_boundaries, valid_segment_mask
 
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
@@ -221,7 +221,9 @@ class ComplexEMA(eqx.Module):
         # document's.
         B, L = segment_ids.shape
         positions = jnp.arange(L, dtype=jnp.int32)
-        last_valid = jnp.max(jnp.where(segment_ids > 0, positions[None, :], -1), axis=1)  # (B,)
+        last_valid = jnp.max(
+            jnp.where(valid_segment_mask(segment_ids), positions[None, :], -1), axis=1
+        )  # (B,)
         h_final = h_seq[jnp.maximum(last_valid, 0), jnp.arange(B)]  # (B, D, N)
         h_final = jnp.where(
             (last_valid >= 0)[:, None, None], h_final, jnp.zeros((), dtype=h_final.dtype)
@@ -353,7 +355,7 @@ class ComplexEMA(eqx.Module):
             h_final, y_seq = jax.lax.scan(step, h_init, x_transposed)
         else:
             reset_seq = jnp.moveaxis(segment_boundaries(segment_ids), -1, 0)  # (L, B)
-            valid_seq = jnp.moveaxis(segment_ids > 0, -1, 0)  # (L, B)
+            valid_seq = jnp.moveaxis(valid_segment_mask(segment_ids), -1, 0)  # (L, B)
 
             def step_with_reset(
                 carry: tuple[Complex[Array, "batch dim ndim"], Complex[Array, "batch dim ndim"]],
@@ -431,7 +433,7 @@ class ComplexEMA(eqx.Module):
 
         # Positions outside any real segment (padding, id 0) must not contribute
         if segment_ids is not None:
-            seg_valid = segment_ids > 0
+            seg_valid = valid_segment_mask(segment_ids)
             mask = seg_valid if mask is None else (mask & seg_valid)
 
         # Zero masked positions to prevent new information from padding entering state.

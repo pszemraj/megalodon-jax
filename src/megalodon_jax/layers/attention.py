@@ -36,7 +36,7 @@ from megalodon_jax.config import AttentionDropoutMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
 from megalodon_jax.layers.rotary import RotaryEmbedding
-from megalodon_jax.layers.segments import segment_runs_and_local_positions
+from megalodon_jax.layers.segments import segment_runs_and_local_positions, valid_segment_mask
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.ops import DOT_PRECISION, linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
@@ -245,10 +245,11 @@ def attention_multi_chunk(
             # Local chunks are all 0 here (L <= chunk_size), so run equality
             # alone gives the full same-run, same-local-chunk condition.
             seg_runs, _ = segment_runs_and_local_positions(segment_ids)
+            segment_valid = valid_segment_mask(segment_ids)
             qk_mask = (
                 (seg_runs[:, :, None] == seg_runs[:, None, :])
-                & (segment_ids[:, :, None] > 0)
-                & (segment_ids[:, None, :] > 0)
+                & segment_valid[:, :, None]
+                & segment_valid[:, None, :]
             )
         return attention_single_chunk(
             q_rot,
@@ -467,7 +468,8 @@ class ChunkedAttention(eqx.Module):
             run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
             positions = local_positions if position_ids is None else position_ids
             same_run = run_ids[:, :, None] == run_ids[:, None, :]
-            valid_segments = (segment_ids[:, :, None] > 0) & (segment_ids[:, None, :] > 0)
+            segment_valid = valid_segment_mask(segment_ids)
+            valid_segments = segment_valid[:, :, None] & segment_valid[:, None, :]
         else:
             positions = (
                 jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
