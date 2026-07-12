@@ -13,6 +13,7 @@
 # limitations under the License.
 """Megalodon configuration."""
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -80,6 +81,18 @@ class MegalodonConfig:
             raise ValueError(f"output_size must be -1 or positive, got {self.output_size}")
         if self.share_emb and self.effective_output_size != self.vocab_size:
             raise ValueError("share_emb requires output_size to resolve to vocab_size")
+        for name, value in (
+            ("model_dim", self.model_dim),
+            ("z_dim", self.z_dim),
+            ("value_dim", self.value_dim),
+            ("ffn_hidden_dim", self.ffn_hidden_dim),
+            ("cema_ndim", self.cema_ndim),
+            ("norm_num_groups", self.norm_num_groups),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.num_layers < 0:
+            raise ValueError(f"num_layers must be non-negative, got {self.num_layers}")
         if self.num_heads <= 0:
             raise ValueError(f"num_heads must be positive, got {self.num_heads}")
         if self.chunk_size <= 0:
@@ -92,13 +105,19 @@ class MegalodonConfig:
             raise ValueError(
                 f"value_dim ({self.value_dim}) must be divisible by num_heads ({self.num_heads})"
             )
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even for RoPE, got {self.head_dim}")
         if self.model_dim % self.norm_num_groups != 0:
             raise ValueError(
                 f"model_dim ({self.model_dim}) must be divisible by "
                 f"norm_num_groups ({self.norm_num_groups})"
             )
-        if self.norm_eps <= 0:
-            raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
+        if not math.isfinite(self.norm_eps) or self.norm_eps <= 0:
+            raise ValueError(f"norm_eps must be finite and positive, got {self.norm_eps}")
+        if self.rope_base is not None and (
+            not math.isfinite(self.rope_base) or self.rope_base <= 0
+        ):
+            raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
         if not 0.0 <= self.dropout < 1.0:
             raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
         if not 0.0 <= self.attention_dropout < 1.0:
@@ -112,10 +131,15 @@ class MegalodonConfig:
             )
         if self.init_mode not in ("gaussian", "xavier", "he", "bert"):
             raise ValueError(f"unsupported fresh-model init_mode: {self.init_mode!r}")
-        if self.pad_token_id is not None and not 0 <= self.pad_token_id < self.vocab_size:
-            raise ValueError(
-                f"pad_token_id must be in [0, {self.vocab_size}) or None, got {self.pad_token_id}"
-            )
+        for name, token_id in (
+            ("pad_token_id", self.pad_token_id),
+            ("bos_token_id", self.bos_token_id),
+            ("eos_token_id", self.eos_token_id),
+        ):
+            if token_id is not None and not 0 <= token_id < self.vocab_size:
+                raise ValueError(
+                    f"{name} must be in [0, {self.vocab_size}) or None, got {token_id}"
+                )
         if self.attention_window is not None and self.attention_window <= 0:
             raise ValueError("attention_window must be positive when provided")
         for name, dtype in (

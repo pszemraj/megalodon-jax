@@ -168,6 +168,33 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match="attention_window.*positive"):
             MegalodonConfig(chunk_size=8, attention_window=-1)
 
+    @pytest.mark.parametrize(
+        ("field", "value", "message"),
+        [
+            ("model_dim", 0, "model_dim must be positive"),
+            ("z_dim", 0, "z_dim must be positive"),
+            ("value_dim", 0, "value_dim must be positive"),
+            ("ffn_hidden_dim", 0, "ffn_hidden_dim must be positive"),
+            ("cema_ndim", 0, "cema_ndim must be positive"),
+            ("norm_num_groups", 0, "norm_num_groups must be positive"),
+            ("num_layers", -1, "num_layers must be non-negative"),
+            ("z_dim", 3, "head_dim must be even"),
+            ("norm_eps", float("nan"), "norm_eps must be finite and positive"),
+            ("norm_eps", float("inf"), "norm_eps must be finite and positive"),
+            ("rope_base", 0.0, "rope_base must be finite and positive"),
+            ("rope_base", float("nan"), "rope_base must be finite and positive"),
+            ("rope_base", float("inf"), "rope_base must be finite and positive"),
+            ("bos_token_id", 32_000, "bos_token_id must be"),
+            ("eos_token_id", -1, "eos_token_id must be"),
+        ],
+    )
+    def test_structural_and_finite_validation(
+        self, field: str, value: int | float, message: str
+    ) -> None:
+        """Invalid structures and non-finite numerics fail at the config boundary."""
+        with pytest.raises(ValueError, match=message):
+            MegalodonConfig(**{field: value})
+
     def test_dtype_validation(self) -> None:
         """Test dtype constraints reject float16.
 
