@@ -82,6 +82,17 @@ class TestAttentionPrimitives:
             err_msg="Causal masking failed: position 0 saw future position 3",
         )
 
+    def test_single_chunk_causal_masking_with_more_queries_than_keys(self) -> None:
+        """Causal masking remains defined when early queries precede all keys."""
+        q = jnp.zeros((1, 4, 1, 1), dtype=jnp.float32)
+        k = jnp.zeros((1, 2, 1, 1), dtype=jnp.float32)
+        v = jnp.asarray([[[[2.0]], [[6.0]]]], dtype=jnp.float32)
+
+        actual = attention_single_chunk(q, k, v, causal=True)
+
+        expected = jnp.asarray([[[[0.0]], [[0.0]], [[2.0]], [[4.0]]]], dtype=jnp.float32)
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=0.0, rtol=0.0)
+
     def test_single_chunk_no_temperature_scaling(self, random_seed: int) -> None:
         """Test that attention uses scale=1.0 (no temperature scaling).
 

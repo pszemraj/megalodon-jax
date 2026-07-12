@@ -114,16 +114,12 @@ def attention_single_chunk(
     # Build attention mask
     # Use -inf so softmax(all masked) = NaN, triggering the NaN guard below
     neg_inf = -jnp.inf
-    if causal and L_q == L_kv:
-        # Standard causal mask for self-attention
-        causal_mask = jnp.tril(jnp.ones((L_q, L_kv), dtype=jnp.bool_))
-        scores = jnp.where(causal_mask, scores, neg_inf)
-    elif causal and L_q < L_kv:
-        # Cross-attention with cache: each query attends to all prior keys
-        # Query at position i can attend to keys [0, L_kv - L_q + i + 1)
+    if causal:
+        # Align the last query with the last key. For cached attention this lets
+        # each query see all prior keys; negative offsets correctly represent
+        # queries that precede every available key when L_q > L_kv.
         q_pos = jnp.arange(L_q)[:, None]  # (L_q, 1)
         k_pos = jnp.arange(L_kv)[None, :]  # (1, L_kv)
-        # Key position must be <= query position + offset
         offset = L_kv - L_q
         causal_mask = k_pos <= (q_pos + offset)  # (L_q, L_kv)
         scores = jnp.where(causal_mask, scores, neg_inf)
