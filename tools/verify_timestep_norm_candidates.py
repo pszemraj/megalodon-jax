@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
@@ -105,17 +106,21 @@ class ErrorStats:
 
 def _git_revision(repo: Path) -> str:
     """Return the checkout revision without making archives unverifiable."""
+    fallback = os.environ.get("MEGALODON_JAX_SOURCE_REVISION", "unknown")
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", "rev-parse", "--show-toplevel", "HEAD"],
             cwd=repo,
             check=True,
             capture_output=True,
             text=True,
         )
     except (FileNotFoundError, subprocess.CalledProcessError):
-        return "unknown"
-    return result.stdout.strip()
+        return fallback
+    lines = result.stdout.splitlines()
+    if len(lines) != 2 or Path(lines[0]).resolve() != repo.resolve():
+        return fallback
+    return lines[1].strip()
 
 
 def _jsonable(value: Any) -> Any:

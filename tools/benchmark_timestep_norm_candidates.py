@@ -36,10 +36,12 @@ are labeled accordingly in both console and JSON output.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
 import statistics
+import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -83,6 +85,34 @@ class ModeInputs(NamedTuple):
     state: NormState | None
     mask: jax.Array | None
     segment_ids: jax.Array | None
+
+
+def _sha256(path: Path) -> str:
+    """Return the SHA-256 digest of one benchmark source file."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _git_revision(repo: Path) -> str:
+    """Return a revision only when ``repo`` is the actual checkout root."""
+    fallback = os.environ.get("MEGALODON_JAX_SOURCE_REVISION", "unknown")
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return fallback
+    lines = result.stdout.splitlines()
+    if len(lines) != 2 or Path(lines[0]).resolve() != repo.resolve():
+        return fallback
+    return lines[1].strip()
 
 
 def production_timestep_norm(
@@ -543,9 +573,20 @@ def main() -> int:
         )
 
     measurement_standard = args.warmups >= 3 and args.iterations >= 20
+    repo_root = Path(__file__).resolve().parents[1]
+    source_paths = {
+        "production": repo_root / "src/megalodon_jax/layers/timestep_norm.py",
+        "candidates": repo_root / "tools/timestep_norm_candidates.py",
+        "benchmark": Path(__file__).resolve(),
+    }
     payload: dict[str, Any] = {
         "schema_version": 1,
         "created_at": datetime.now(UTC).isoformat(),
+        "repository": {
+            "root": str(repo_root),
+            "revision": _git_revision(repo_root),
+            "source_sha256": {name: _sha256(path) for name, path in source_paths.items()},
+        },
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),
