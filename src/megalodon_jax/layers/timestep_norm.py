@@ -152,7 +152,7 @@ class TimestepNorm(eqx.Module):
         batch_size, length, dim = x.shape
         if dim != self.num_features:
             raise ValueError(f"TimestepNorm expected {self.num_features} features, got {dim}")
-        if x.dtype == jnp.float16:
+        if x.dtype not in (jnp.float32, jnp.bfloat16):
             raise TypeError("TimestepNorm supports only float32 and bfloat16")
         if segment_ids is not None and state is not None:
             raise ValueError("segment_ids cannot be combined with an incoming NormState")
@@ -199,6 +199,8 @@ class TimestepNorm(eqx.Module):
             return x, initial
 
         if state is None:
+            if self.prior_count > jnp.iinfo(jnp.int32).max - length:
+                raise ValueError("TimestepNorm int32 count would overflow")
             initial_count = initial.count
         else:
             max_increment = valid.astype(jnp.int32).sum(axis=1)
@@ -247,39 +249,71 @@ class TimestepNorm(eqx.Module):
                 jnp.where(nonempty, var, 0.0),
             )
 
-        if segment_ids is None:
-            # For the overwhelmingly common unsegmented path, evaluate the
-            # same Welford recurrence from vectorized prefix sums. This avoids
-            # materializing a log-depth scan tree while retaining the within-
-            # token variance term that the earlier implementation omitted.
-            initial_count_f = initial.count.astype(jnp.float32)
-            valid_f = valid.astype(jnp.float32)
-            count_f = initial_count_f[:, None] + jnp.cumsum(valid_f, axis=1)
-            count_denominator = jnp.maximum(count_f, 1.0)
-            running_sum = initial.mean * initial_count_f[:, None]
-            running_sum = running_sum[:, None, :] + jnp.cumsum(
-                block_mean * valid_f[..., None], axis=1
+        if segment_ids is None and state is None and self.prior_count == 0:
+            # The ordinary training path has an empty prior. Center cumulative
+            # sums on the first valid token mean so a large common offset never
+            # enters the prefix reduction. This preserves Welford's stable M2
+            # update without the compile-size cost of an unrolled scan tree.
+            first_valid_index = jnp.argmax(valid, axis=1)
+            first_valid_mean = jnp.take_along_axis(
+                token_mean,
+                first_valid_index[:, None, None],
+                axis=1,
+            )[:, 0]
+            has_valid = jnp.any(valid, axis=1)
+            anchor = jnp.where(has_valid[:, None], first_valid_mean, initial.mean)
+            centered_token_mean = jnp.where(
+                valid[..., None],
+                token_mean - anchor[:, None, :],
+                0.0,
+            )
+
+            cumulative_count = jnp.cumsum(token_count, axis=1)
+            count_f = cumulative_count.astype(jnp.float32)
+            denominator = jnp.maximum(count_f, 1.0)
+            cumulative_mean = (
+                anchor[:, None, :] + jnp.cumsum(centered_token_mean, axis=1) / denominator
             )
             cumulative_mean = jnp.where(
-                count_f[..., None] > 0.0,
-                running_sum / count_denominator[..., None],
+                cumulative_count > 0,
+                cumulative_mean,
                 initial.mean[:, None, :],
             )
 
             previous_mean = jnp.concatenate(
-                (initial.mean[:, None, :], cumulative_mean[:, :-1, :]), axis=1
+                (initial.mean[:, None, :], cumulative_mean[:, :-1]),
+                axis=1,
             )
-            delta = block_mean - previous_mean
-            delta_after = block_mean - cumulative_mean
-            m2_increment = (block_var + delta * delta_after) * valid_f[..., None]
-            initial_m2 = initial.var * initial_count_f[:, None]
-            cumulative_m2 = initial_m2[:, None, :] + jnp.cumsum(m2_increment, axis=1)
+            delta = token_mean - previous_mean
+            delta_after = token_mean - cumulative_mean
+            m2_increment = jnp.where(
+                valid[..., None],
+                token_var + delta * delta_after,
+                0.0,
+            )
+            cumulative_var = jnp.cumsum(m2_increment, axis=1) / denominator
             cumulative_var = jnp.where(
-                count_f[..., None] > 0.0,
-                cumulative_m2 / count_denominator[..., None],
+                cumulative_count > 0,
+                cumulative_var,
                 initial.var[:, None, :],
             )
-            cumulative_count = initial.count[:, None] + jnp.cumsum(valid.astype(jnp.int32), axis=1)
+        elif segment_ids is None:
+            prefix_count, prefix_mean, prefix_var = jax.lax.associative_scan(
+                merge_welford,
+                (token_count, token_mean, token_var),
+                axis=1,
+            )
+            initial_count = initial.count[:, None, None]
+            initial_mean = initial.mean[:, None, :]
+            initial_var = initial.var[:, None, :]
+            cumulative_count, cumulative_mean, cumulative_var = merge_welford(
+                (initial_count, initial_mean, initial_var),
+                (prefix_count, prefix_mean, prefix_var),
+            )
+            empty_prefix = prefix_count == 0
+            cumulative_count = jnp.where(empty_prefix, initial_count, cumulative_count)
+            cumulative_mean = jnp.where(empty_prefix, initial_mean, cumulative_mean)
+            cumulative_var = jnp.where(empty_prefix, initial_var, cumulative_var)
         else:
             elements = (token_count, token_mean, token_var)
 
@@ -327,7 +361,7 @@ class TimestepNorm(eqx.Module):
         outputs = jnp.where(valid[..., None, None], outputs, 0.0)
 
         if segment_ids is None:
-            final_count = cumulative_count[:, -1]
+            final_count = cumulative_count[:, -1, 0]
             final_mean = cumulative_mean[:, -1]
             final_var = cumulative_var[:, -1]
         else:

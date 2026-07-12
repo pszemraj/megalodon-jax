@@ -76,7 +76,7 @@ The associative path is ~5x slower than FFT (training-viable); the sequential fa
 
 State uses FP32 population mean/variance and a token-block count. A valid token contributes all features in each group, including within-token variance, using the same block-Welford algebra as the released CUDA implementation. The configured `norm_eps` is added only when normalizing; no artificial state variance floor or nonzero empty-state M2 is injected.
 
-The unsegmented training path evaluates the Welford recurrence from vectorized prefix sums, including each token block's within-group variance. Incoming continuation state is merged through the same sufficient statistics, while packed resets use a reset-aware associative Welford scan. This preserves masking, reset, and chunk-continuation semantics without serializing ordinary training over sequence length.
+The fresh unsegmented training path evaluates the Welford recurrence from vectorized prefix sums centered on the first valid token mean, so large common activation offsets never enter the reduction. Masked token summaries are replaced structurally rather than multiplied by zero, preventing masked NaN/Inf values from contaminating later state. Incoming continuation or learned-prior state uses an associative Welford prefix, and packed resets use the reset-aware form. This preserves masking, reset, numerical-stability, and chunk-continuation semantics without serializing ordinary training over sequence length.
 
 ### EMA Eigenvalue Stability
 

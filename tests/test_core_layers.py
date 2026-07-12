@@ -220,6 +220,61 @@ class TestTimestepNorm:
         np.testing.assert_allclose(np.array(state.mean), mean, rtol=1e-5, atol=1e-5)
         np.testing.assert_allclose(np.array(state.var), var, rtol=1e-5, atol=1e-5)
 
+    def test_large_offset_constant_has_zero_variance(self) -> None:
+        """Stable Welford prefixes must not invent variance from a large mean."""
+        norm = TimestepNorm(32, 4)
+        x = jnp.full((1, 512, 32), 1e7, dtype=jnp.float32)
+
+        output, state = norm(x)
+
+        np.testing.assert_array_equal(np.asarray(output), np.zeros(x.shape, dtype=np.float32))
+        np.testing.assert_array_equal(np.asarray(state.mean), np.full((1, 4), 1e7))
+        np.testing.assert_array_equal(np.asarray(state.var), np.zeros((1, 4)))
+
+    def test_masked_nonfinite_token_does_not_update_state(self) -> None:
+        """Masked NaN/Inf blocks cannot contaminate later valid prefixes."""
+        norm = TimestepNorm(4, 2, eps=0.0)
+        x = jnp.asarray(
+            [
+                [
+                    [1.0, 3.0, 2.0, 6.0],
+                    [jnp.nan, jnp.inf, -jnp.inf, jnp.nan],
+                    [5.0, 7.0, 10.0, 14.0],
+                ]
+            ],
+            dtype=jnp.float32,
+        )
+        mask = jnp.asarray([[True, False, True]])
+
+        output, state = norm(x, mask=mask)
+
+        expected = np.asarray(
+            [
+                [
+                    [-1.0, 1.0, -1.0, 1.0],
+                    [0.0, 0.0, 0.0, 0.0],
+                    [0.4472136, 1.3416408, 0.4472136, 1.3416408],
+                ]
+            ],
+            dtype=np.float32,
+        )
+        np.testing.assert_allclose(np.asarray(output), expected, rtol=2e-6, atol=2e-6)
+        np.testing.assert_array_equal(np.asarray(state.count), [2])
+        np.testing.assert_allclose(np.asarray(state.mean), [[4.0, 8.0]], atol=1e-6)
+        np.testing.assert_allclose(np.asarray(state.var), [[5.0, 20.0]], atol=1e-6)
+
+    def test_prior_count_overflow_is_rejected(self) -> None:
+        """A fresh learned-prior state cannot wrap its int32 count."""
+        norm = TimestepNorm(4, 2, prior_count=int(jnp.iinfo(jnp.int32).max))
+        with pytest.raises(ValueError, match="overflow"):
+            norm(jnp.ones((1, 1, 4), dtype=jnp.float32))
+
+    def test_nonfloating_input_is_rejected(self) -> None:
+        """The low-level layer honors the documented FP32/BF16 surface."""
+        norm = TimestepNorm(4, 2)
+        with pytest.raises(TypeError, match="float32 and bfloat16"):
+            norm(jnp.ones((1, 1, 4), dtype=jnp.int32))
+
     def test_divisibility_validation(self) -> None:
         """Test that num_features must be divisible by num_groups.
 
