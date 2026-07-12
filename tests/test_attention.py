@@ -404,6 +404,77 @@ class TestChunkedAttention:
                 key=jax.random.PRNGKey(random_seed),
             )
 
+    def test_sliding_window_matches_dense_oracle_after_wraparound(
+        self,
+        random_seed: int,
+    ) -> None:
+        """Streamed ring attention matches an independent absolute-position dense oracle."""
+        batch, length, heads, head_dim, value_dim = 2, 11, 2, 4, 3
+        window = 4
+        key = jax.random.PRNGKey(random_seed)
+        k_module, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=3,
+            attention_window=window,
+            key=k_module,
+        )
+        q = jax.random.normal(kq, (batch, length, heads, head_dim))
+        k = jax.random.normal(kk, (batch, length, heads, head_dim))
+        v = jax.random.normal(kv, (batch, length, heads, value_dim))
+
+        def absolute_rope(values: np.ndarray) -> np.ndarray:
+            """Apply source adjacent-pair RoPE without calling production rotation code."""
+            pairs = values.reshape(batch, length, heads, head_dim // 2, 2)
+            frequencies = 10_000.0 ** (-np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
+            angles = np.arange(length, dtype=np.float32)[:, None] * frequencies[None, :]
+            cosine = np.cos(angles)[None, :, None, :]
+            sine = np.sin(angles)[None, :, None, :]
+            rotated = np.empty_like(pairs)
+            rotated[..., 0] = pairs[..., 0] * cosine - pairs[..., 1] * sine
+            rotated[..., 1] = pairs[..., 0] * sine + pairs[..., 1] * cosine
+            return rotated.reshape(values.shape)
+
+        q_dense = absolute_rope(np.asarray(q))
+        k_dense = absolute_rope(np.asarray(k))
+        v_dense = np.asarray(v)
+        expected = np.empty((batch, length, heads, value_dim), dtype=np.float32)
+        for query_index in range(length):
+            key_start = max(0, query_index - window + 1)
+            valid_k = k_dense[:, key_start : query_index + 1]
+            scores = np.einsum(
+                "bhd,bshd->bhs",
+                q_dense[:, query_index],
+                valid_k,
+            )
+            scores -= np.max(scores, axis=-1, keepdims=True)
+            weights = np.exp(scores)
+            weights /= np.sum(weights, axis=-1, keepdims=True)
+            expected[:, query_index] = np.einsum(
+                "bhs,bshv->bhv",
+                weights,
+                v_dense[:, key_start : query_index + 1],
+            )
+
+        outputs = []
+        cache = None
+        offset = 0
+        for width in (3, 1, 5, 2):
+            part, cache, _ = module(
+                q[:, offset : offset + width],
+                k[:, offset : offset + width],
+                v[:, offset : offset + width],
+                cache=cache,
+                return_cache=True,
+            )
+            outputs.append(part)
+            offset += width
+        actual = jnp.concatenate(outputs, axis=1)
+        assert cache is not None and int(cache.count) == length
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=2e-6)
+
     @pytest.mark.parametrize("attention_window", [None, 3, 8])
     def test_arbitrary_call_partition_invariance(
         self,
