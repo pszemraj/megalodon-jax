@@ -20,6 +20,46 @@ from megalodon_jax.layers import (
 )
 from tools.verify_modeling_correctness import cache_partition_errors
 
+
+@pytest.mark.parametrize("probability", [-0.1, 1.0])
+@pytest.mark.parametrize(
+    ("module_kind", "field"),
+    [
+        ("chunked", "attention_dropout"),
+        ("ffn", "dropout"),
+        ("ffn", "hidden_dropout"),
+        ("attention", "dropout"),
+        ("attention", "attention_dropout"),
+        ("attention", "hidden_dropout"),
+    ],
+)
+def test_module_dropout_probability_validation(
+    module_kind: str,
+    field: str,
+    probability: float,
+    random_seed: int,
+) -> None:
+    """Every reusable module rejects invalid inverted-dropout probabilities."""
+    key = jax.random.PRNGKey(random_seed)
+    with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+        if module_kind == "chunked":
+            ChunkedAttention(1, 4, 4, 4, key=key, **{field: probability})
+        elif module_kind == "ffn":
+            NormalizedFFN(8, 16, key=key, **{field: probability})
+        else:
+            MegalodonAttention(
+                model_dim=8,
+                z_dim=8,
+                value_dim=8,
+                num_heads=2,
+                cema_ndim=2,
+                chunk_size=4,
+                norm_num_groups=2,
+                key=key,
+                **{field: probability},
+            )
+
+
 # -----------------------------------------------------------------------------
 # Attention Primitive Tests
 # -----------------------------------------------------------------------------
@@ -378,23 +418,6 @@ class TestAttentionPrimitives:
 class TestChunkedAttention:
     """Tests for ChunkedAttention module."""
 
-    @pytest.mark.parametrize("probability", [-0.1, 1.0])
-    def test_dropout_probability_validation(
-        self,
-        probability: float,
-        random_seed: int,
-    ) -> None:
-        """The reusable module rejects invalid attention dropout at construction."""
-        with pytest.raises(ValueError, match=r"attention_dropout must be in \[0, 1\)"):
-            ChunkedAttention(
-                num_heads=1,
-                head_dim=4,
-                value_head_dim=4,
-                chunk_size=4,
-                attention_dropout=probability,
-                key=jax.random.PRNGKey(random_seed),
-            )
-
     def test_sliding_window_matches_dense_oracle_after_wraparound(
         self,
         random_seed: int,
@@ -663,23 +686,6 @@ class TestChunkedAttention:
 class TestNormalizedFFN:
     """Tests for NormalizedFFN module."""
 
-    @pytest.mark.parametrize("field", ["dropout", "hidden_dropout"])
-    @pytest.mark.parametrize("probability", [-0.1, 1.0])
-    def test_dropout_probability_validation(
-        self,
-        field: str,
-        probability: float,
-        random_seed: int,
-    ) -> None:
-        """Direct FFN construction rejects invalid inverted-dropout probabilities."""
-        with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
-            NormalizedFFN(
-                model_dim=8,
-                ffn_hidden_dim=16,
-                key=jax.random.PRNGKey(random_seed),
-                **{field: probability},
-            )
-
     @pytest.mark.parametrize(
         ("dropout", "hidden_dropout"),
         [(0.2, 0.0), (0.0, 0.2)],
@@ -804,28 +810,6 @@ class TestNormalizedFFN:
 
 class TestMegalodonAttention:
     """Tests for MegalodonAttention block."""
-
-    @pytest.mark.parametrize("field", ["dropout", "attention_dropout", "hidden_dropout"])
-    @pytest.mark.parametrize("probability", [-0.1, 1.0])
-    def test_dropout_probability_validation(
-        self,
-        field: str,
-        probability: float,
-        random_seed: int,
-    ) -> None:
-        """Direct attention construction rejects invalid dropout probabilities."""
-        with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
-            MegalodonAttention(
-                model_dim=8,
-                z_dim=8,
-                value_dim=8,
-                num_heads=2,
-                cema_ndim=2,
-                chunk_size=4,
-                norm_num_groups=2,
-                key=jax.random.PRNGKey(random_seed),
-                **{field: probability},
-            )
 
     @pytest.mark.parametrize(
         ("dropout", "attention_dropout", "hidden_dropout"),
