@@ -109,62 +109,6 @@ def init_cache(
     return ModelCache(layer_caches=tuple(layer_caches), final_norm=final_norm)
 
 
-def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
-    """Trim KV cache entries to the most recent ``max_len`` tokens.
-
-    The cache is stored as a ring buffer; trimming preserves absolute positions
-    by reindexing into a smaller ring when needed.
-
-    :param ModelCache cache: Cache to trim.
-    :param int max_len: Maximum number of tokens to retain.
-    :return ModelCache: Trimmed cache.
-    """
-
-    def trim_layer(layer_cache: LayerCache | None) -> LayerCache | None:
-        """Trim a layer cache to the newest max_len entries.
-
-        :param LayerCache | None layer_cache: Layer cache to trim.
-        :return LayerCache | None: Trimmed layer cache.
-        """
-        if layer_cache is None or layer_cache.attn is None:
-            return layer_cache
-        attn = layer_cache.attn
-        cache_size = attn.k.shape[1]
-        if cache_size <= max_len:
-            return layer_cache
-        valid_len = jnp.minimum(attn.count, cache_size)
-        keep_len = jnp.minimum(valid_len, max_len)
-        idx = jnp.arange(max_len, dtype=jnp.int32)
-        keep_mask = idx < keep_len
-        start_pos = attn.count - keep_len
-        old_idx = jnp.mod(start_pos + idx, cache_size)
-        new_idx = jnp.mod(start_pos + idx, max_len)
-
-        k_keep = jnp.take(attn.k, old_idx, axis=1)
-        v_keep = jnp.take(attn.v, old_idx, axis=1)
-        mask = keep_mask[None, :, None, None]
-        k_keep = jnp.where(mask, k_keep, jnp.zeros((), dtype=attn.k.dtype))
-        v_keep = jnp.where(mask, v_keep, jnp.zeros((), dtype=attn.v.dtype))
-
-        B, _, H, Dh = attn.k.shape
-        _, _, _, Dv = attn.v.shape
-        new_k = jnp.zeros((B, max_len, H, Dh), dtype=attn.k.dtype)
-        new_v = jnp.zeros((B, max_len, H, Dv), dtype=attn.v.dtype)
-        new_k = new_k.at[:, new_idx].set(k_keep)
-        new_v = new_v.at[:, new_idx].set(v_keep)
-
-        trimmed = AttentionCache(k=new_k, v=new_v, count=attn.count)
-        return LayerCache(
-            attn=trimmed,
-            norm=layer_cache.norm,
-            ema=layer_cache.ema,
-            position=layer_cache.position,
-        )
-
-    trimmed_layers = tuple(trim_layer(lc) for lc in cache.layer_caches)
-    return ModelCache(layer_caches=trimmed_layers, final_norm=cache.final_norm)
-
-
 def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCache:
     """Select batch elements from a ModelCache.
 

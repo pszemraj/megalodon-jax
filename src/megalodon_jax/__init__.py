@@ -14,7 +14,6 @@ from megalodon_jax.inference import (
     index_cache,
     init_cache,
     sample_token,
-    trim_cache,
 )
 from megalodon_jax.model import MegalodonBlock, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
@@ -40,7 +39,6 @@ __all__ = [
     "load_inference_cache",
     # Inference utilities
     "init_cache",
-    "trim_cache",
     "index_cache",
     "greedy_token",
     "sample_token",

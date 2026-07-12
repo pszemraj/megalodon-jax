@@ -28,7 +28,7 @@ from megalodon_jax.convert import (
     load_upstream_state_dict,
     save_safetensors,
 )
-from megalodon_jax.inference import generate, index_cache, init_cache, sample_token, trim_cache
+from megalodon_jax.inference import generate, index_cache, init_cache, sample_token
 from megalodon_jax.types import AttentionCache, LayerCache, ModelCache
 from tests.factories import tiny_config
 
@@ -42,10 +42,10 @@ def small_config() -> MegalodonConfig:
 
 
 class TestCacheUtilities:
-    """Cache init/index/trim helpers."""
+    """Cache initialization and batch-indexing helpers."""
 
-    def test_init_and_trim_cache_shapes(self) -> None:
-        """Validate cache initialization and trimming shapes.
+    def test_init_cache_shapes(self) -> None:
+        """Validate fixed-capacity cache initialization shapes.
 
         :return None: None.
         """
@@ -60,30 +60,6 @@ class TestCacheUtilities:
             config.num_heads,
             config.head_dim,
         )
-
-        # Extend cache artificially then trim back
-        attn = layer0.attn
-        pad = 2
-        extended_attn = AttentionCache(
-            k=jnp.pad(attn.k, ((0, 0), (0, pad), (0, 0), (0, 0))),
-            v=jnp.pad(attn.v, ((0, 0), (0, pad), (0, 0), (0, 0))),
-            count=attn.count,
-        )
-        extended_layer = LayerCache(
-            attn=extended_attn,
-            norm=layer0.norm,
-            ema=layer0.ema,
-            position=layer0.position,
-        )
-        extended_cache = ModelCache(
-            layer_caches=(extended_layer,),
-            final_norm=cache.final_norm,
-        )
-
-        trimmed = trim_cache(extended_cache, config.cache_capacity)
-        trimmed_attn = trimmed.layer_caches[0].attn
-        assert trimmed_attn is not None
-        assert trimmed_attn.k.shape[1] == config.cache_capacity
 
     def test_index_cache_slices_batch(self) -> None:
         """Ensure index_cache slices the batch dimension correctly.
@@ -158,54 +134,6 @@ class TestCacheUtilities:
             strict=True,
         ):
             np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-
-    def test_trim_cache_preserves_ring_order(self) -> None:
-        """Ensure trim_cache preserves ring-buffer order.
-
-        :return None: None.
-        """
-        cache_size = 6
-        max_len = 4
-        batch = 1
-        heads = 1
-        head_dim = 1
-        value_dim = 1
-
-        k = jnp.zeros((batch, cache_size, heads, head_dim), dtype=jnp.float32)
-        v = jnp.zeros((batch, cache_size, heads, value_dim), dtype=jnp.float32)
-        for token in range(4, 10):
-            idx = token % cache_size
-            k = k.at[:, idx, 0, 0].set(float(token))
-            v = v.at[:, idx, 0, 0].set(float(token))
-
-        attn_cache = AttentionCache(
-            k=k,
-            v=v,
-            count=jnp.array(10, dtype=jnp.int32),
-        )
-        layer_cache = LayerCache(
-            attn=attn_cache,
-            norm=None,
-            ema=None,
-            position=jnp.array(0, dtype=jnp.int32),
-        )
-        cache = ModelCache(layer_caches=(layer_cache,), final_norm=None)
-
-        trimmed = trim_cache(cache, max_len)
-        trimmed_attn = trimmed.layer_caches[0].attn
-        assert trimmed_attn is not None
-        assert trimmed_attn.k.shape == (batch, max_len, heads, head_dim)
-        assert trimmed_attn.count == attn_cache.count
-
-        expected_k = jnp.zeros((batch, max_len, heads, head_dim), dtype=jnp.float32)
-        expected_v = jnp.zeros((batch, max_len, heads, value_dim), dtype=jnp.float32)
-        for token in range(6, 10):
-            idx = token % max_len
-            expected_k = expected_k.at[:, idx, 0, 0].set(float(token))
-            expected_v = expected_v.at[:, idx, 0, 0].set(float(token))
-
-        np.testing.assert_allclose(np.array(trimmed_attn.k), np.array(expected_k))
-        np.testing.assert_allclose(np.array(trimmed_attn.v), np.array(expected_v))
 
 
 class TestSamplingAndGeneration:
