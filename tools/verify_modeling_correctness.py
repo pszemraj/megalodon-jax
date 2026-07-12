@@ -252,13 +252,16 @@ def _sha256(path: Path) -> str:
 
 def _git_revision(repo: Path) -> str:
     """Return the repository commit without importing a Git library."""
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return os.environ.get("MEGALODON_JAX_SOURCE_REVISION", "unknown")
     return result.stdout.strip()
 
 
