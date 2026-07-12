@@ -47,6 +47,12 @@ from megalodon_jax.utils import reinit_linear_weights
 # -----------------------------------------------------------------------------
 
 
+def _validate_dropout_rate(name: str, value: float) -> None:
+    """Reject probabilities that make inverted dropout undefined."""
+    if not 0.0 <= value < 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {value}")
+
+
 def attention_single_chunk(
     q: Float[Array, "batch seq heads head_dim"],
     k: Float[Array, "batch kv_seq heads head_dim"],
@@ -89,8 +95,7 @@ def attention_single_chunk(
     # Handle empty sequence
     if L_q == 0 or L_kv == 0:
         return jnp.zeros((B, L_q, H, Dv), dtype=q.dtype)
-    if not 0.0 <= dropout_rate < 1.0:
-        raise ValueError(f"dropout_rate must be in [0, 1), got {dropout_rate}")
+    _validate_dropout_rate("dropout_rate", dropout_rate)
     if dropout_mode not in ("post_softmax", "dropkey"):
         raise ValueError(f"unsupported attention dropout mode: {dropout_mode!r}")
     if not deterministic and dropout_rate > 0.0 and key is None:
@@ -419,6 +424,12 @@ class ChunkedAttention(eqx.Module):
         if attention_window is not None and attention_window <= 0:
             raise ValueError(
                 f"attention_window must be positive when provided, got {attention_window}"
+            )
+        _validate_dropout_rate("attention_dropout", attention_dropout)
+        if attention_dropout_mode not in ("post_softmax", "dropkey"):
+            raise ValueError(
+                "attention_dropout_mode must be 'post_softmax' or 'dropkey', got "
+                f"{attention_dropout_mode!r}"
             )
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -765,6 +776,9 @@ class MegalodonAttention(eqx.Module):
             sequential low-memory fallback.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
+        _validate_dropout_rate("dropout", dropout)
+        _validate_dropout_rate("attention_dropout", attention_dropout)
+        _validate_dropout_rate("hidden_dropout", hidden_dropout)
         self.model_dim = model_dim
         self.z_dim = z_dim
         self.value_dim = value_dim
@@ -845,6 +859,15 @@ class MegalodonAttention(eqx.Module):
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :return tuple[jax.Array, LayerCache | None]: Output tensor and updated cache.
         """
+        if (
+            not deterministic
+            and key is None
+            and any(
+                rate > 0.0
+                for rate in (self.dropout, self.inner.attention_dropout, self.hidden_dropout)
+            )
+        ):
+            raise ValueError("PRNG key required when deterministic=False and dropout is enabled")
         B, L, D = x.shape
         H = self.num_heads
         Dh = self.head_dim
@@ -1125,6 +1148,8 @@ class NormalizedFFN(eqx.Module):
         :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
+        _validate_dropout_rate("dropout", dropout)
+        _validate_dropout_rate("hidden_dropout", hidden_dropout)
         self.model_dim = model_dim
         self.ffn_hidden_dim = ffn_hidden_dim
         self.swiglu = swiglu
@@ -1182,6 +1207,8 @@ class NormalizedFFN(eqx.Module):
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :return jax.Array: Output tensor of shape (batch, seq, dim).
         """
+        if not deterministic and key is None and (self.dropout > 0.0 or self.hidden_dropout > 0.0):
+            raise ValueError("PRNG key required when deterministic=False and dropout is enabled")
         x = x.astype(self.compute_dtype)
         residual = x if residual_base is None else residual_base.astype(self.compute_dtype)
 

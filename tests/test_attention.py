@@ -387,6 +387,23 @@ class TestAttentionPrimitives:
 class TestChunkedAttention:
     """Tests for ChunkedAttention module."""
 
+    @pytest.mark.parametrize("probability", [-0.1, 1.0])
+    def test_dropout_probability_validation(
+        self,
+        probability: float,
+        random_seed: int,
+    ) -> None:
+        """The reusable module rejects invalid attention dropout at construction."""
+        with pytest.raises(ValueError, match=r"attention_dropout must be in \[0, 1\)"):
+            ChunkedAttention(
+                num_heads=1,
+                head_dim=4,
+                value_head_dim=4,
+                chunk_size=4,
+                attention_dropout=probability,
+                key=jax.random.PRNGKey(random_seed),
+            )
+
     @pytest.mark.parametrize("attention_window", [None, 3, 8])
     def test_arbitrary_call_partition_invariance(
         self,
@@ -691,6 +708,44 @@ class TestChunkedAttention:
 class TestNormalizedFFN:
     """Tests for NormalizedFFN module."""
 
+    @pytest.mark.parametrize("field", ["dropout", "hidden_dropout"])
+    @pytest.mark.parametrize("probability", [-0.1, 1.0])
+    def test_dropout_probability_validation(
+        self,
+        field: str,
+        probability: float,
+        random_seed: int,
+    ) -> None:
+        """Direct FFN construction rejects invalid inverted-dropout probabilities."""
+        with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+            NormalizedFFN(
+                model_dim=8,
+                ffn_hidden_dim=16,
+                key=jax.random.PRNGKey(random_seed),
+                **{field: probability},
+            )
+
+    @pytest.mark.parametrize(
+        ("dropout", "hidden_dropout"),
+        [(0.2, 0.0), (0.0, 0.2)],
+    )
+    def test_active_dropout_requires_key(
+        self,
+        dropout: float,
+        hidden_dropout: float,
+        random_seed: int,
+    ) -> None:
+        """Direct FFN use must not silently skip an active stochastic path."""
+        ffn = NormalizedFFN(
+            model_dim=8,
+            ffn_hidden_dim=16,
+            dropout=dropout,
+            hidden_dropout=hidden_dropout,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        with pytest.raises(ValueError, match="PRNG key required"):
+            ffn(jnp.ones((1, 2, 8)), deterministic=False)
+
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test NormalizedFFN forward pass shapes.
 
@@ -794,6 +849,56 @@ class TestNormalizedFFN:
 
 class TestMegalodonAttention:
     """Tests for MegalodonAttention block."""
+
+    @pytest.mark.parametrize("field", ["dropout", "attention_dropout", "hidden_dropout"])
+    @pytest.mark.parametrize("probability", [-0.1, 1.0])
+    def test_dropout_probability_validation(
+        self,
+        field: str,
+        probability: float,
+        random_seed: int,
+    ) -> None:
+        """Direct attention construction rejects invalid dropout probabilities."""
+        with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+            MegalodonAttention(
+                model_dim=8,
+                z_dim=8,
+                value_dim=8,
+                num_heads=2,
+                cema_ndim=2,
+                chunk_size=4,
+                norm_num_groups=2,
+                key=jax.random.PRNGKey(random_seed),
+                **{field: probability},
+            )
+
+    @pytest.mark.parametrize(
+        ("dropout", "attention_dropout", "hidden_dropout"),
+        [(0.2, 0.0, 0.0), (0.0, 0.2, 0.0), (0.0, 0.0, 0.2)],
+    )
+    def test_active_dropout_requires_key(
+        self,
+        dropout: float,
+        attention_dropout: float,
+        hidden_dropout: float,
+        random_seed: int,
+    ) -> None:
+        """Direct attention use must not silently skip any active stochastic path."""
+        module = MegalodonAttention(
+            model_dim=8,
+            z_dim=8,
+            value_dim=8,
+            num_heads=2,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=2,
+            dropout=dropout,
+            attention_dropout=attention_dropout,
+            hidden_dropout=hidden_dropout,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        with pytest.raises(ValueError, match="PRNG key required"):
+            module(jnp.ones((1, 2, 8)), deterministic=False)
 
     def test_source_projection_bias_topology(self, random_seed: int) -> None:
         """Only released attention projections retain bias parameters."""
