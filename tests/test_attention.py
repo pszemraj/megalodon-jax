@@ -692,9 +692,38 @@ class TestChunkedAttention:
             )
             assert errors["output"] <= 2e-6
             assert errors["noncached_output"] <= 2e-6
-            assert errors["cache_k"] == 0.0
+            # Vectorized prefill and tokenwise decode may use different
+            # transcendental lowering for RoPE, so K agrees to fp32 precision
+            # rather than requiring backend-dependent bit identity.
+            assert errors["cache_k"] <= 2e-6
             assert errors["cache_v"] == 0.0
             assert errors["cache_count"] == 0.0
+
+    @pytest.mark.parametrize("attention_window", [None, 8])
+    def test_pristine_prefill_has_no_sequence_loop(
+        self,
+        random_seed: int,
+        attention_window: int | None,
+    ) -> None:
+        """Vectorized prompt prefill must not lower to a tokenwise while loop."""
+        key = jax.random.PRNGKey(random_seed)
+        module_key, q_key, k_key, v_key = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=2,
+            head_dim=8,
+            value_head_dim=6,
+            chunk_size=4,
+            attention_window=attention_window,
+            key=module_key,
+        )
+        q = jax.random.normal(q_key, (1, 12, 2, 8))
+        k = jax.random.normal(k_key, (1, 12, 2, 8))
+        v = jax.random.normal(v_key, (1, 12, 2, 6))
+
+        lowered = jax.jit(lambda q, k, v: module(q, k, v, return_cache=True)).lower(q, k, v)
+        stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
+
+        assert "stablehlo.while" not in stablehlo
 
 
 # -----------------------------------------------------------------------------

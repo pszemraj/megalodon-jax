@@ -394,6 +394,30 @@ class ComplexEMA(eqx.Module):
         # Return fp32 - caller handles dtype conversion
         return y, h_final
 
+    def _final_state_sequential(
+        self,
+        x: Float[Array, "batch dim seq"],
+        h_init: Complex[Array, "batch dim ndim"] | None = None,
+    ) -> Complex[Array, "batch dim ndim"]:
+        """Advance only the compact recurrent state without emitting outputs."""
+        batch, dim, _ = x.shape
+        p, q, _ = self._coeffs()
+        if h_init is None:
+            h_init = jnp.zeros((batch, dim, self.ndim), dtype=jnp.complex64)
+        p_b = p[None, :, :]
+        q_b = q[None, :, :]
+
+        def step(h: Array, x_t: Array) -> tuple[Array, None]:
+            x_t_c = x_t[:, :, None].astype(jnp.complex64)
+            return q_b * h + p_b * x_t_c, None
+
+        h_final, _ = jax.lax.scan(
+            step,
+            h_init,
+            jnp.moveaxis(x.astype(jnp.float32), -1, 0),
+        )
+        return h_final
+
     def __call__(
         self,
         x: Float[Array, "batch dim seq"],
@@ -461,10 +485,13 @@ class ComplexEMA(eqx.Module):
                 y, h_final = self._forward_sequential(x, None, segment_ids=segment_ids)
             return (y + residual).astype(input_dtype), h_final if return_state else None
 
-        use_fft = h_init is None and not return_state
-        if use_fft:
+        if h_init is None:
+            # Pristine prefill can evaluate every output with FFT convolution.
+            # Returning continuation state only needs the compact (B, D, N)
+            # recurrence; it must not force the output path into a token scan.
             y = self._forward_fft(x)  # already returns fp32 internally
-            return (y + residual).astype(input_dtype), None
+            h_final = self._final_state_sequential(x) if return_state else None
+            return (y + residual).astype(input_dtype), h_final
 
         y, h_final = self._forward_sequential(x, h_init)  # already returns fp32 internally
         return (y + residual).astype(input_dtype), h_final if return_state else None

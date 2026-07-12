@@ -703,8 +703,8 @@ class TestTimestepNormSegmentReset:
 class TestComplexEMA:
     """Recurrence and state-continuation tests for ComplexEMA."""
 
-    def test_fft_vs_sequential_equivalence(self, random_seed: int) -> None:
-        """Test that FFT and sequential paths produce equivalent outputs.
+    def test_pristine_prefill_matches_sequential_recurrence(self, random_seed: int) -> None:
+        """FFT outputs plus compact final state match the full recurrence.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -721,19 +721,24 @@ class TestComplexEMA:
         batch, seq = 2, 32
         x = jax.random.normal(k2, (batch, dim, seq))
 
-        # FFT path
-        y_fft, _ = jax_ema(x, return_state=False)
+        y_prefill, h_prefill = jax_ema(x, return_state=True)
+        y_recurrence, h_recurrence = jax_ema._forward_sequential(x, None)  # noqa: SLF001
+        residual = x.astype(jnp.float32) * jax_ema.omega[None, :, None]
+        y_recurrence = (y_recurrence + residual).astype(x.dtype)
 
-        # Sequential path
-        y_seq, _ = jax_ema(x, return_state=True)
-
-        # Should produce equivalent outputs
         np.testing.assert_allclose(
-            np.array(y_fft),
-            np.array(y_seq),
+            np.array(y_prefill),
+            np.array(y_recurrence),
             rtol=1e-4,
             atol=1e-5,
             err_msg="FFT and sequential paths should produce equivalent outputs",
+        )
+        np.testing.assert_allclose(
+            np.asarray(h_prefill),
+            np.asarray(h_recurrence),
+            rtol=2e-5,
+            atol=2e-6,
+            err_msg="State-only recurrence must match the full recurrence",
         )
 
     def test_state_continuity(self, random_seed: int) -> None:

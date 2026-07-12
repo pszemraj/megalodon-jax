@@ -530,6 +530,86 @@ class ChunkedAttention(eqx.Module):
             key=key,
         )
 
+    def _prefill(
+        self,
+        q: Float[Array, "batch seq heads head_dim"],
+        k: Float[Array, "batch seq heads head_dim"],
+        v: Float[Array, "batch seq heads value_dim"],
+        deterministic: bool,
+        key: PRNGKeyArray | None,
+    ) -> tuple[
+        Float[Array, "batch seq heads value_dim"],
+        AttentionCache,
+        Int[Array, ""],
+    ]:
+        """Evaluate a pristine prompt vectorially and materialize its ring tail."""
+        batch, length = q.shape[:2]
+        if self.attention_window is None:
+            out = attention_multi_chunk(
+                q,
+                k,
+                v,
+                chunk_size=self.chunk_size,
+                start_index=jnp.asarray(0, dtype=jnp.int32),
+                rotary=self.rotary,
+                accum_dtype=self.accum_dtype,
+                softmax_dtype=self.softmax_dtype,
+                dropout_rate=self.attention_dropout,
+                dropout_mode=self.attention_dropout_mode,
+                deterministic=deterministic,
+                key=key,
+            )
+        else:
+            out = self._full_sliding_attention(
+                q,
+                k,
+                v,
+                None,
+                None,
+                None,
+                deterministic,
+                key,
+            )
+
+        capacity = self.cache_capacity
+        keep = min(length, capacity)
+        tail_start = length - keep
+        absolute_times = jnp.arange(tail_start, length, dtype=jnp.int32)
+        rope_positions = (
+            absolute_times % self.chunk_size if self.attention_window is None else absolute_times
+        )
+
+        def rotate_key_at_position(q_t: Array, k_t: Array, position: Array) -> Array:
+            """Match the scalar-position rotation used by tokenwise decode."""
+            _, k_rot = self.rotary(q_t[:, None], k_t[:, None], position)
+            return k_rot[:, 0]
+
+        k_tail_rot = jax.vmap(
+            rotate_key_at_position,
+            in_axes=(1, 1, 0),
+            out_axes=1,
+        )
+        k_tail_rot = k_tail_rot(q[:, tail_start:], k[:, tail_start:], rope_positions)
+        slots = absolute_times % capacity
+        cache_k = (
+            jnp.zeros(
+                (batch, capacity, self.num_heads, self.head_dim),
+                dtype=k.dtype,
+            )
+            .at[:, slots]
+            .set(k_tail_rot)
+        )
+        cache_v = (
+            jnp.zeros(
+                (batch, capacity, self.num_heads, self.value_head_dim),
+                dtype=v.dtype,
+            )
+            .at[:, slots]
+            .set(v[:, tail_start:])
+        )
+        count = jnp.asarray(length, dtype=jnp.int32)
+        return out, AttentionCache(k=cache_k, v=cache_v, count=count), count
+
     def __call__(
         self,
         q: Float[Array, "batch seq heads head_dim"],
@@ -595,6 +675,12 @@ class ChunkedAttention(eqx.Module):
                 )
             return out, None, jnp.asarray(length, dtype=jnp.int32)
 
+        # Pristine deterministic prefill has no history-dependent input. Its
+        # outputs are the normal vectorized attention result; only the final
+        # fixed-capacity ring state needs to be materialized for continuation.
+        if cache is None and return_cache and deterministic and length > 0:
+            return self._prefill(q, k, v, deterministic, key)
+
         capacity = self.cache_capacity
         if cache is None:
             cache_k = jnp.zeros(
@@ -629,72 +715,82 @@ class ChunkedAttention(eqx.Module):
                 "attention cache count must be non-negative and must not overflow int32",
             )
 
-        use_rng = not deterministic and self.attention_dropout > 0.0
-        rng = key if key is not None else jax.random.PRNGKey(0)
-        slots = jnp.arange(capacity, dtype=jnp.int32)
+        def run_streaming(_: None) -> tuple[Array, AttentionCache | None, Array]:
+            use_rng = not deterministic and self.attention_dropout > 0.0
+            rng = key if key is not None else jax.random.PRNGKey(0)
+            slots = jnp.arange(capacity, dtype=jnp.int32)
 
-        def step(
-            carry: tuple[Array, Array, Array, Array],
-            inputs: tuple[Array, Array, Array],
-        ) -> tuple[tuple[Array, Array, Array, Array], Array]:
-            current_k, current_v, position, current_rng = carry
-            q_t, k_t, v_t = inputs
-            rope_position = (
-                position % self.chunk_size if self.attention_window is None else position
+            def step(
+                carry: tuple[Array, Array, Array, Array],
+                inputs: tuple[Array, Array, Array],
+            ) -> tuple[tuple[Array, Array, Array, Array], Array]:
+                current_k, current_v, position, current_rng = carry
+                q_t, k_t, v_t = inputs
+                rope_position = (
+                    position % self.chunk_size if self.attention_window is None else position
+                )
+                q_rot, k_rot = self.rotary(
+                    q_t[:, None],
+                    k_t[:, None],
+                    rope_position,
+                )
+                write_slot = position % capacity
+                current_k = current_k.at[:, write_slot].set(k_rot[:, 0])
+                current_v = current_v.at[:, write_slot].set(v_t)
+
+                slot_time = position - jnp.mod(position - slots, capacity)
+                valid = slot_time >= 0
+                if self.attention_window is None:
+                    valid = valid & (slot_time // self.chunk_size == position // self.chunk_size)
+                kv_mask = jnp.broadcast_to(valid, (batch, capacity))
+
+                if use_rng:
+                    current_rng, step_key = jax.random.split(current_rng)
+                else:
+                    step_key = None
+                output = attention_single_chunk(
+                    q_rot,
+                    current_k,
+                    current_v,
+                    kv_mask=kv_mask,
+                    accum_dtype=self.accum_dtype,
+                    softmax_dtype=self.softmax_dtype,
+                    causal=False,
+                    dropout_rate=self.attention_dropout,
+                    dropout_mode=self.attention_dropout_mode,
+                    deterministic=deterministic,
+                    key=step_key,
+                )
+                return (
+                    current_k,
+                    current_v,
+                    position + 1,
+                    current_rng,
+                ), output[:, 0]
+
+            (final_k, final_v, final_count, _), outputs = jax.lax.scan(
+                step,
+                (cache_k, cache_v, count, rng),
+                (
+                    jnp.swapaxes(q, 0, 1),
+                    jnp.swapaxes(k, 0, 1),
+                    jnp.swapaxes(v, 0, 1),
+                ),
             )
-            q_rot, k_rot = self.rotary(
-                q_t[:, None],
-                k_t[:, None],
-                rope_position,
+            out = jnp.swapaxes(outputs, 0, 1)
+            new_cache = (
+                AttentionCache(k=final_k, v=final_v, count=final_count) if return_cache else None
             )
-            write_slot = position % capacity
-            current_k = current_k.at[:, write_slot].set(k_rot[:, 0])
-            current_v = current_v.at[:, write_slot].set(v_t)
+            return out, new_cache, final_count
 
-            slot_time = position - jnp.mod(position - slots, capacity)
-            valid = slot_time >= 0
-            if self.attention_window is None:
-                valid = valid & (slot_time // self.chunk_size == position // self.chunk_size)
-            kv_mask = jnp.broadcast_to(valid, (batch, capacity))
-
-            if use_rng:
-                current_rng, step_key = jax.random.split(current_rng)
-            else:
-                step_key = None
-            output = attention_single_chunk(
-                q_rot,
-                current_k,
-                current_v,
-                kv_mask=kv_mask,
-                accum_dtype=self.accum_dtype,
-                softmax_dtype=self.softmax_dtype,
-                causal=False,
-                dropout_rate=self.attention_dropout,
-                dropout_mode=self.attention_dropout_mode,
-                deterministic=deterministic,
-                key=step_key,
+        if cache is not None and return_cache and deterministic:
+            return jax.lax.cond(
+                count == 0,
+                lambda _: self._prefill(q, k, v, deterministic, key),
+                run_streaming,
+                operand=None,
             )
-            return (
-                current_k,
-                current_v,
-                position + 1,
-                current_rng,
-            ), output[:, 0]
-
-        (final_k, final_v, final_count, _), outputs = jax.lax.scan(
-            step,
-            (cache_k, cache_v, count, rng),
-            (
-                jnp.swapaxes(q, 0, 1),
-                jnp.swapaxes(k, 0, 1),
-                jnp.swapaxes(v, 0, 1),
-            ),
-        )
-        out = jnp.swapaxes(outputs, 0, 1)
-        new_cache = (
-            AttentionCache(k=final_k, v=final_v, count=final_count) if return_cache else None
-        )
-        return out, new_cache, final_count
+        return run_streaming(None)
 
 
 # -----------------------------------------------------------------------------
@@ -923,6 +1019,11 @@ class MegalodonAttention(eqx.Module):
         norm_state = cache.norm if cache is not None else None
         ema_state = cache.ema.h if cache is not None and cache.ema is not None else None
         attn_cache = cache.attn if cache is not None else None
+        if cache is not None and ema_state is None:
+            # Canonicalize explicit lazy and preallocated zero-history caches
+            # onto one dynamic program. Model validation only permits missing
+            # components at position zero.
+            ema_state = jnp.zeros((B, D, self.cema.ndim), dtype=jnp.complex64)
 
         # TimestepNorm (segment_ids resets running stats at packed-doc boundaries)
         x_tn, new_norm_state = self.timenorm(
@@ -933,14 +1034,29 @@ class MegalodonAttention(eqx.Module):
         # Pass mask to prevent EMA state contamination from padded positions;
         # segment_ids resets the EMA state at packed-doc boundaries
         need_ema_state = return_cache or ema_state is not None
-        y_cema, h_last = self.cema(
-            x_tn.transpose(0, 2, 1),  # (B, D, L)
-            h_init=ema_state,
-            return_state=need_ema_state,
-            mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
-            segment_ids=segment_ids,
-            use_associative_segment_scan=self.use_associative_segment_scan,
-        )
+        cema_input = x_tn.transpose(0, 2, 1)  # (B, D, L)
+
+        def run_cema(h_init: Array | None) -> tuple[Array, Array | None]:
+            return self.cema(
+                cema_input,
+                h_init=h_init,
+                return_state=need_ema_state,
+                mask=mask,
+                segment_ids=segment_ids,
+                use_associative_segment_scan=self.use_associative_segment_scan,
+            )
+
+        if cache is not None and ema_state is not None:
+            # Preallocated zero-history state is semantically identical to the
+            # lazy None state and must use the same FFT prefill output path.
+            y_cema, h_last = jax.lax.cond(
+                cache.position == 0,
+                lambda _: run_cema(None),
+                lambda _: run_cema(ema_state),
+                operand=None,
+            )
+        else:
+            y_cema, h_last = run_cema(ema_state)
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
@@ -977,6 +1093,13 @@ class MegalodonAttention(eqx.Module):
         )  # (B, L, value_dim)
 
         # Inner attention
+        if cache is not None and attn_cache is None:
+            capacity = self.inner.cache_capacity
+            attn_cache = AttentionCache(
+                k=jnp.zeros((B, capacity, H, Dh), dtype=k.dtype),
+                v=jnp.zeros((B, capacity, H, Dv), dtype=v.dtype),
+                count=jnp.asarray(0, dtype=jnp.int32),
+            )
         out, new_attn_cache, new_position = self.inner(
             q,
             k,

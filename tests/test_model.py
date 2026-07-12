@@ -93,17 +93,30 @@ class TestMegalodonBlock:
         block = MegalodonBlock(config, layer_id=0, key=k1)
         x = jax.random.normal(k2, (batch, seq, config.model_dim))
 
-        # Process full sequence
-        out_full, _ = block(x, return_cache=True)
+        # Process full sequence and an uneven partition spanning chunk boundaries.
+        out_full, cache_full = block(x, return_cache=True)
+        out_noncached, _ = block(x, return_cache=False)
+        pieces = []
+        cache_streamed = None
+        start = 0
+        for width in (7, 10, 5, 10):
+            stop = start + width
+            out, cache_streamed = block(
+                x[:, start:stop],
+                cache=cache_streamed,
+                return_cache=True,
+            )
+            pieces.append(out)
+            start = stop
+        out_streamed = jnp.concatenate(pieces, axis=1)
 
-        # Process in two halves with cache
-        mid = seq // 2
-        out1, cache1 = block(x[:, :mid], return_cache=True)
-        out2, cache2 = block(x[:, mid:], cache=cache1, return_cache=True)
-        out_streamed = jnp.concatenate([out1, out2], axis=1)
-
-        # Outputs should match (within tolerance due to streaming norm differences)
-        # Streaming norms accumulate statistics slightly differently than batch
+        np.testing.assert_allclose(
+            np.asarray(out_full),
+            np.asarray(out_noncached),
+            rtol=2e-5,
+            atol=2e-6,
+            err_msg="Pristine cached prefill must match vectorized noncached output",
+        )
         np.testing.assert_allclose(
             np.array(out_full),
             np.array(out_streamed),
@@ -111,6 +124,21 @@ class TestMegalodonBlock:
             atol=2e-5,
             err_msg="Streaming output differs from batch output",
         )
+        assert cache_full is not None and cache_streamed is not None
+        for expected, actual in zip(
+            jax.tree.leaves(cache_full),
+            jax.tree.leaves(cache_streamed),
+            strict=True,
+        ):
+            if jnp.issubdtype(expected.dtype, jnp.integer):
+                np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+            else:
+                np.testing.assert_allclose(
+                    np.asarray(actual),
+                    np.asarray(expected),
+                    rtol=2e-4,
+                    atol=2e-5,
+                )
 
     def test_different_layer_ids(self, random_seed: int) -> None:
         """Test that different layer IDs produce different rescaling.
