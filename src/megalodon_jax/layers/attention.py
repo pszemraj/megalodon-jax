@@ -128,6 +128,7 @@ def attention_single_chunk(
     # Build attention mask
     # Use -inf so softmax(all masked) = NaN, triggering the NaN guard below
     neg_inf = -jnp.inf
+    valid_edges = None
     if causal:
         # Align the last query with the last key. For cached attention this lets
         # each query see all prior keys; negative offsets correctly represent
@@ -137,25 +138,50 @@ def attention_single_chunk(
         offset = L_kv - L_q
         causal_mask = k_pos <= (q_pos + offset)  # (L_q, L_kv)
         scores = jnp.where(causal_mask, scores, neg_inf)
+        if L_q > L_kv:
+            valid_edges = causal_mask[None, None, :, :]
 
     # Apply key/value padding mask if provided
     if kv_mask is not None:
         # kv_mask: (B, L_kv) with True for valid positions
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
         scores = jnp.where(kv_mask_expanded, scores, neg_inf)
+        if valid_edges is None:
+            valid_edges = (
+                causal_mask[None, None, :, :]
+                if causal
+                else jnp.ones((1, 1, L_q, L_kv), dtype=jnp.bool_)
+            )
+        valid_edges = valid_edges & kv_mask_expanded
     if qk_mask is not None:
-        scores = jnp.where(qk_mask[:, None, :, :], scores, neg_inf)
+        qk_mask_expanded = qk_mask[:, None, :, :]
+        scores = jnp.where(qk_mask_expanded, scores, neg_inf)
+        if valid_edges is None:
+            valid_edges = (
+                causal_mask[None, None, :, :]
+                if causal
+                else jnp.ones((1, 1, L_q, L_kv), dtype=jnp.bool_)
+            )
+        valid_edges = valid_edges & qk_mask_expanded
 
     scores = scores.astype(softmax_dtype)
     if not deterministic and dropout_rate > 0.0 and dropout_mode == "dropkey":
         keep_mask = jax.random.bernoulli(key, 1.0 - dropout_rate, scores.shape)
         scores = jnp.where(keep_mask, scores, jnp.asarray(-jnp.inf, dtype=scores.dtype))
+        if valid_edges is None:
+            valid_edges = (
+                causal_mask[None, None, :, :]
+                if causal
+                else jnp.ones((1, 1, L_q, L_kv), dtype=jnp.bool_)
+            )
+        valid_edges = valid_edges & keep_mask
 
-    # Softmax with NaN guard for fully-masked queries
-    # If all keys are masked for a query, softmax(all -inf) = NaN
-    # Detect and replace with zeros for safe behavior on padded batches
+    # Only structurally empty rows are zeroed. NaNs from valid scores remain
+    # observable rather than being silently converted into plausible output.
     attn_weights = jax.nn.softmax(scores, axis=-1)
-    attn_weights = jnp.where(jnp.isnan(attn_weights), 0.0, attn_weights)
+    if valid_edges is not None:
+        has_valid_edge = jnp.any(valid_edges, axis=-1, keepdims=True)
+        attn_weights = jnp.where(has_valid_edge, attn_weights, 0.0)
 
     # Dropout if not deterministic
     if not deterministic and dropout_rate > 0.0 and dropout_mode == "post_softmax":
@@ -595,6 +621,13 @@ class ChunkedAttention(eqx.Module):
         if length == 0:
             new_cache = AttentionCache(k=cache_k, v=cache_v, count=count) if return_cache else None
             return v, new_cache, count
+
+        if cache is not None:
+            count = eqx.error_if(
+                count,
+                (count < 0) | (count > jnp.iinfo(jnp.int32).max - length),
+                "attention cache count must be non-negative and must not overflow int32",
+            )
 
         use_rng = not deterministic and self.attention_dropout > 0.0
         rng = key if key is not None else jax.random.PRNGKey(0)

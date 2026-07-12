@@ -18,6 +18,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
+from megalodon_jax.types import AttentionCache
 from tools.verify_modeling_correctness import cache_partition_errors
 
 
@@ -133,6 +134,24 @@ class TestAttentionPrimitives:
 
         expected = jnp.asarray([[[[0.0]], [[0.0]], [[2.0]], [[4.0]]]], dtype=jnp.float32)
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=0.0, rtol=0.0)
+
+    def test_only_structurally_masked_rows_suppress_softmax_nan(self) -> None:
+        """Empty rows become zero while numerical NaNs on valid edges remain visible."""
+        q = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
+        k = jnp.zeros_like(q)
+        v = jnp.ones_like(q)
+
+        empty = attention_single_chunk(
+            q,
+            k,
+            v,
+            qk_mask=jnp.zeros((1, 1, 1), dtype=jnp.bool_),
+            causal=False,
+        )
+        np.testing.assert_array_equal(np.asarray(empty), np.zeros_like(np.asarray(empty)))
+
+        corrupted = attention_single_chunk(q.at[0, 0, 0, 0].set(jnp.nan), k, v)
+        assert bool(jnp.any(jnp.isnan(corrupted)))
 
     def test_single_chunk_preserves_bf16_dtype(self, random_seed: int) -> None:
         """Test that attention_single_chunk preserves bf16 dtype (no forced fp32).
@@ -1375,8 +1394,6 @@ class TestStreamingEquivalence:
             key=k1,
         )
 
-        from megalodon_jax.types import AttentionCache
-
         # Create a smaller-than-expected cache (2 entries, but chunk_size=4)
         # Simulates position 2 (has 2 cached entries from positions 0-1)
         fake_k = jax.random.normal(k2, (batch, 2, heads, head_dim))
@@ -1390,6 +1407,26 @@ class TestStreamingEquivalence:
 
         with pytest.raises(ValueError, match="cache shapes"):
             attn(q, k, v, cache=fake_cache, return_cache=True)
+
+    def test_streaming_count_rejects_negative_and_overflow(self) -> None:
+        """A malformed or exhausted int32 ring position must fail before updating."""
+        attn = ChunkedAttention(
+            num_heads=1,
+            head_dim=2,
+            value_head_dim=2,
+            chunk_size=4,
+            key=jax.random.PRNGKey(0),
+        )
+        q = k = v = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
+        cache_k = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
+        for count in (-1, np.iinfo(np.int32).max):
+            cache = AttentionCache(
+                k=cache_k,
+                v=cache_k,
+                count=jnp.asarray(count, dtype=jnp.int32),
+            )
+            with pytest.raises(Exception, match="non-negative.*overflow"):
+                attn(q, k, v, cache=cache, return_cache=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1482,8 +1519,6 @@ class TestParity:
 
         # Start at position 2, so tokens will span positions 2,3 | 4,5,6,7
         # chunk boundary at position 4
-        from megalodon_jax.types import AttentionCache
-
         # Pre-fill cache with 2 tokens at positions 0-1
         init_k = jax.random.normal(jax.random.fold_in(k1, 0), (batch, 2, heads, head_dim))
         init_v = jax.random.normal(jax.random.fold_in(k1, 1), (batch, 2, heads, value_dim))
