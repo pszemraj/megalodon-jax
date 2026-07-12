@@ -405,7 +405,9 @@ def _generate_core(
                 "prompt_ids is empty; provide bos_token_id or pass at least one token."
             )
         prompt_ids = jnp.full((B, 1), bos_token_id, dtype=prompt_ids.dtype)
-        attention_mask = jnp.ones((B, 1), dtype=jnp.bool_)
+        # The synthetic BOS is valid and unpadded. Cached calls represent the
+        # all-valid case with no mask metadata.
+        attention_mask = None
         prompt_len = 1
 
     needs_cache = return_cache or max_new_tokens > 1

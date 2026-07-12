@@ -389,24 +389,41 @@ class TestSamplingAndGeneration:
                 attention_mask=jnp.asarray([[False, False, True, True]]),
             )
 
-    def test_generate_empty_prompt_uses_bos(self) -> None:
-        """Ensure empty prompts use BOS token.
-
-        :return None: None.
-        """
+    @pytest.mark.parametrize("max_new_tokens", [1, 2])
+    @pytest.mark.parametrize("return_cache", [False, True])
+    def test_generate_empty_prompt_matches_explicit_bos(
+        self, max_new_tokens: int, return_cache: bool
+    ) -> None:
+        """Empty prompts behave exactly like an explicit, unpadded BOS prompt."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        prompt = jnp.empty((1, 0), dtype=jnp.int32)
+        empty_prompt = jnp.empty((1, 0), dtype=jnp.int32)
+        explicit_bos = jnp.asarray([[config.bos_token_id]], dtype=jnp.int32)
 
-        out, _, _ = generate(
+        expected, expected_cache, _ = generate(
             model,
-            prompt,
-            max_new_tokens=1,
+            explicit_bos,
+            max_new_tokens=max_new_tokens,
             temperature=0.0,
+            return_cache=return_cache,
+        )
+        actual, actual_cache, _ = generate(
+            model,
+            empty_prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=0.0,
+            return_cache=return_cache,
         )
 
-        assert out.shape == (1, 2)
-        assert int(out[0, 0]) == config.bos_token_id
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        assert (actual_cache is not None) is return_cache
+        assert (expected_cache is not None) is return_cache
+        if return_cache:
+            actual_layer = actual_cache.layer_caches[0]
+            expected_layer = expected_cache.layer_caches[0]
+            assert actual_layer is not None and expected_layer is not None
+            assert actual_layer.attn is not None and expected_layer.attn is not None
+            assert int(actual_layer.attn.count) == int(expected_layer.attn.count)
 
     def test_generate_sampling_requires_key(self) -> None:
         """Ensure sampling requires a PRNG key.
