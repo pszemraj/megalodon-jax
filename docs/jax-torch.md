@@ -46,7 +46,7 @@ model = load_upstream_checkpoint(
 
 Directories produced by the original consolidation workflow are also accepted when they contain `consolidate_config.json` and the declared `consolidated.pth` or `consolidated.NN.pth` shards. Raw FSDP directories and SafeTensors from unrelated schemas are refused.
 
-The loader validates the complete exact key set, source tensor shapes, model-parallel merge axes, CEMA real/complex representation, RoPE frequencies, plus-one normalization storage, projection bias topology, tied-output equality, and configuration compatibility.
+The loader validates the complete exact key set, source tensor shapes, model-parallel merge axes, CEMA real/complex representation, RoPE frequencies, plus-one normalization storage, projection bias topology, tied-output equality, and configuration compatibility. When `share_emb=True`, the separately serialized embedding and output tensors must be bit-identical because they represent one logical upstream parameter; approximate equality is deliberately rejected.
 
 For an already loaded original state dictionary:
 

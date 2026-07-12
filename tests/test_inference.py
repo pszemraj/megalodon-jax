@@ -729,16 +729,17 @@ class TestConversion:
 
     @pytest.mark.torch_ref
     def test_tied_output_contract(self) -> None:
-        """Tied upstream export emits an equal output tensor and validates it."""
-        pytest.importorskip("torch")
+        """Tied upstream copies must remain bit-identical, without tolerance."""
+        torch = pytest.importorskip("torch")
         config = replace(small_config(), share_emb=True)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state = export_upstream_state_dict(model)
         assert state["output.output.weight"].data_ptr() != state["embed.weight"].data_ptr()
         assert state["output.output.weight"].equal(state["embed.weight"])
 
-        state["output.output.weight"][0, 0] += 1.0
-        with pytest.raises(ValueError, match="does not equal embedding"):
+        value = state["output.output.weight"][0, 0]
+        state["output.output.weight"][0, 0] = torch.nextafter(value, value + 1.0)
+        with pytest.raises(ValueError, match="bit-identical"):
             load_upstream_state_dict(model, state)
 
     @pytest.mark.torch_ref

@@ -280,8 +280,11 @@ def load_upstream_state_dict(
     )
     output = _jax_float(state_dict["output.output.weight"], "output.output.weight")
     if model.tied:
+        # Released share_emb aliases one logical parameter. Although state_dict
+        # serialization emits two tensors, both originate from that exact value;
+        # accepting approximate equality would silently bless an untied artifact.
         if not np.array_equal(np.asarray(output), np.asarray(native["model.embed.weight"])):
-            raise ValueError("tied upstream output weight does not equal embedding weight")
+            raise ValueError("tied upstream output and embedding weights must be bit-identical")
     else:
         native["lm_head.weight"] = output
 
