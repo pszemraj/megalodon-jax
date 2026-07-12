@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
+from itertools import product
 from pathlib import Path
 
 import jax
@@ -12,6 +13,7 @@ import numpy as np
 import pytest
 
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, validate_model_cache_host
 from megalodon_jax.checkpoint import (
     load_checkpoint,
     load_inference_cache,
@@ -60,6 +62,19 @@ class TestCacheUtilities:
             config.num_heads,
             config.head_dim,
         )
+
+    def test_all_pristine_allocation_combinations_are_valid(self) -> None:
+        """Lazy and preallocated zero-history structures share one valid contract."""
+        config = small_config()
+        for allocate_kv, allocate_norm, allocate_ema in product((False, True), repeat=3):
+            cache = init_cache(
+                config,
+                batch_size=2,
+                allocate_kv=allocate_kv,
+                allocate_norm=allocate_norm,
+                allocate_ema=allocate_ema,
+            )
+            validate_model_cache_host(cache, config)
 
     def test_index_cache_slices_batch(self) -> None:
         """Ensure index_cache slices the batch dimension correctly.
@@ -752,6 +767,58 @@ class TestConversion:
         incompatible = replace(config, attention_window=4)
         with pytest.raises(ValueError, match="fingerprint"):
             load_inference_cache(path, incompatible)
+
+    def test_save_rejects_partial_nonzero_cache(self, tmp_path: Path) -> None:
+        """Persistence cannot legitimize a destructive partial continuation."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
+        assert cache is not None
+        first = cache.layer_caches[0]
+        assert first is not None and first.attn is not None
+        malformed = replace(
+            cache,
+            layer_caches=(replace(first, ema=None), *cache.layer_caches[1:]),
+        )
+
+        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
+            save_inference_cache(malformed, tmp_path / "partial.safetensors", config)
+
+        nonfinite_attn = replace(
+            first.attn,
+            k=first.attn.k.at[0, 0, 0, 0].set(jnp.nan),
+        )
+        nonfinite = replace(
+            cache,
+            layer_caches=(replace(first, attn=nonfinite_attn), *cache.layer_caches[1:]),
+        )
+        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
+            save_inference_cache(nonfinite, tmp_path / "nonfinite.safetensors", config)
+
+    def test_load_rejects_partial_nonzero_cache(self, tmp_path: Path) -> None:
+        """A schema-valid sparse cache cannot carry a nonzero logical timeline."""
+        from safetensors import safe_open
+        from safetensors.flax import load_file, save_file
+
+        config = small_config()
+        initialized = init_cache(config, batch_size=1, allocate_kv=True)
+        sparse = ModelCache(
+            layer_caches=(initialized.layer_caches[0], *([None] * (config.num_layers - 1))),
+            final_norm=None,
+        )
+        valid = tmp_path / "sparse-zero.safetensors"
+        save_inference_cache(sparse, valid, config)
+        tensors = load_file(str(valid))
+        with safe_open(str(valid), framework="flax") as handle:
+            metadata = dict(handle.metadata() or {})
+
+        tensors["layers.0.position"] = jnp.asarray(1, dtype=jnp.int32)
+        tensors["layers.0.attn.count"] = jnp.asarray(1, dtype=jnp.int32)
+        corrupted = tmp_path / "sparse-nonzero.safetensors"
+        save_file(tensors, str(corrupted), metadata=metadata)
+
+        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
+            load_inference_cache(corrupted, config)
 
     def test_cache_schema_and_position_invariants_fail_closed(self, tmp_path: Path) -> None:
         """Presence metadata and redundant attention positions must remain self-consistent."""

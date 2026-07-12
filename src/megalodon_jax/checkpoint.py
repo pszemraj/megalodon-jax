@@ -29,6 +29,7 @@ from jaxtyping import Array
 from safetensors import safe_open
 from safetensors.flax import load_file, save_file
 
+from megalodon_jax.cache import validate_model_cache_host
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
@@ -479,8 +480,7 @@ def save_inference_cache(
 ) -> None:
     """Save an inference cache bound to an exact model configuration."""
     destination = Path(path)
-    if len(cache.layer_caches) != config.num_layers:
-        raise ValueError("cache layer count does not match configuration")
+    validate_model_cache_host(cache, config)
     tensors, present = _cache_tensors(cache)
     metadata = {
         "format": CACHE_FORMAT,
@@ -675,4 +675,6 @@ def load_inference_cache(
                 jnp.float32,
             ),
         )
-    return ModelCache(layer_caches=tuple(layers), final_norm=final_norm)
+    cache = ModelCache(layer_caches=tuple(layers), final_norm=final_norm)
+    validate_model_cache_host(cache, config)
+    return cache

@@ -12,7 +12,10 @@ import numpy as np
 import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE
+from megalodon_jax.inference import init_cache
 from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
+from megalodon_jax.types import ModelCache
 from tests.factories import floating_to_bf16, tiny_config
 
 
@@ -661,6 +664,100 @@ class TestModelCache:
         ]
         assert gradient_leaves
         assert max(float(jnp.max(jnp.abs(leaf))) for leaf in gradient_leaves) == 0.0
+
+    def test_nonzero_cache_requires_complete_state(self, random_seed: int) -> None:
+        """Every component must continue together once the timeline advances."""
+        config = small_config()
+        model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
+        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        _, cache = model(tokens, return_cache=True)
+        assert cache is not None
+        first = cache.layer_caches[0]
+        assert first is not None
+
+        malformed: dict[str, ModelCache] = {
+            "layer": replace(cache, layer_caches=(None, *cache.layer_caches[1:])),
+            "attention": replace(
+                cache,
+                layer_caches=(replace(first, attn=None), *cache.layer_caches[1:]),
+            ),
+            "norm": replace(
+                cache,
+                layer_caches=(replace(first, norm=None), *cache.layer_caches[1:]),
+            ),
+            "ema": replace(
+                cache,
+                layer_caches=(replace(first, ema=None), *cache.layer_caches[1:]),
+            ),
+            "final_norm": replace(cache, final_norm=None),
+        }
+        next_token = jnp.asarray([[4]], dtype=jnp.int32)
+        for invalid in malformed.values():
+            with pytest.raises(Exception, match="pristine zero-history initializer"):
+                jax.block_until_ready(model(next_token, cache=invalid, return_cache=True))
+
+        compiled = eqx.filter_jit(
+            lambda values, state: model(values, cache=state, return_cache=True)
+        )
+        with pytest.raises(Exception, match="pristine zero-history initializer"):
+            jax.block_until_ready(compiled(next_token, malformed["attention"]))
+        with pytest.raises(ValueError, match="non-empty input_ids"):
+            jax.block_until_ready(
+                model(
+                    jnp.empty((1, 0), dtype=jnp.int32),
+                    cache=malformed["attention"],
+                    return_cache=True,
+                )
+            )
+
+    def test_nonzero_cache_requires_one_timeline(self, random_seed: int) -> None:
+        """Layer, component, and final-normalization counters cannot diverge."""
+        config = small_config()
+        model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
+        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        _, cache = model(tokens, return_cache=True)
+        assert cache is not None and cache.final_norm is not None
+        first, second = cache.layer_caches
+        assert first is not None and second is not None
+        assert second.attn is not None and first.norm is not None
+
+        advanced_attn = replace(second.attn, count=second.attn.count + 1)
+        second_advanced = replace(
+            second,
+            position=second.position + 1,
+            attn=advanced_attn,
+        )
+        norm_advanced = replace(first.norm, count=first.norm.count + 1)
+        malformed = (
+            replace(cache, layer_caches=(first, second_advanced)),
+            replace(cache, layer_caches=(replace(first, norm=norm_advanced), second)),
+            replace(
+                cache,
+                final_norm=replace(cache.final_norm, count=cache.final_norm.count + 1),
+            ),
+        )
+        for invalid in malformed:
+            with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+                jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
+
+    def test_pristine_partial_cache_rejects_hidden_state(self, random_seed: int) -> None:
+        """A zero-timeline partial initializer cannot hide active EMA history."""
+        config = small_config()
+        model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
+        cache = init_cache(config, batch_size=1, allocate_ema=True)
+        first = cache.layer_caches[0]
+        assert first is not None and first.ema is not None
+        active_ema = replace(
+            first.ema,
+            h=first.ema.h.at[0, 0, 0].set(jnp.asarray(1.0 + 0.0j, dtype=jnp.complex64)),
+        )
+        invalid = replace(
+            cache,
+            layer_caches=(replace(first, ema=active_ema), *cache.layer_caches[1:]),
+        )
+
+        with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+            jax.block_until_ready(model(jnp.asarray([[1]], dtype=jnp.int32), cache=invalid))
 
 
 # -----------------------------------------------------------------------------

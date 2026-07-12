@@ -26,6 +26,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, cache_invariant_violation
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
 from megalodon_jax.layers.segments import valid_segment_mask
@@ -349,7 +350,7 @@ class MegalodonModel(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
-        :raises ValueError: If cache layer count does not match the model.
+        :raises ValueError: If cache structure or timeline does not match the model.
         :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
         _require_dropout_key(self.config, deterministic, key)
@@ -358,6 +359,14 @@ class MegalodonModel(eqx.Module):
                 "cache input and return_cache are inference-only; use deterministic=True"
             )
         B, L = input_ids.shape
+        if cache is not None and (B == 0 or L == 0):
+            raise ValueError("cache input requires non-empty input_ids")
+        if cache is not None:
+            input_ids = eqx.error_if(
+                input_ids,
+                cache_invariant_violation(cache, self.config, batch_size=B),
+                CACHE_INVARIANT_MESSAGE,
+            )
         if key is not None:
             embedding_key, layers_key = jax.random.split(key)
         else:
@@ -368,12 +377,7 @@ class MegalodonModel(eqx.Module):
         if B == 0 or L == 0:
             empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.config.compute_dtype)
             if return_cache:
-                # Preserve any existing streaming state when input is empty.
-                empty_cache = (
-                    cache
-                    if cache is not None
-                    else ModelCache(tuple([None] * len(self.layers)), None)
-                )
+                empty_cache = ModelCache(tuple([None] * len(self.layers)), None)
             else:
                 empty_cache = None
             return empty_hidden, empty_cache
@@ -447,11 +451,6 @@ class MegalodonModel(eqx.Module):
 
         # Parse cache with validation
         if cache is not None:
-            if len(cache.layer_caches) != len(self.layers):
-                raise ValueError(
-                    f"Cache has {len(cache.layer_caches)} layer entries, "
-                    f"expected {len(self.layers)}"
-                )
             layer_caches = list(cache.layer_caches)
             final_norm_state = cache.final_norm
         else:
