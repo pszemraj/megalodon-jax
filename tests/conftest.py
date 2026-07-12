@@ -66,6 +66,7 @@ _FAST_TEST_PREFIXES = (
     "tests/test_inference.py::TestConversion::test_native_v2_roundtrip_is_exact",
     "tests/test_inference.py::TestConversion::test_cache_roundtrip_and_config_binding",
     "tests/test_inference.py::TestConversion::test_cache_schema_and_position_invariants_fail_closed",
+    "tests/test_model.py::TestMegalodonForCausalLM::test_bf16_cached_logits_stay_within_compute_envelope",
     "tests/test_upstream_parity.py::test_tiny_forward_matches_released_source_equations",
     "tests/test_upstream_parity.py::test_all_parameter_gradients_match_released_source_equations",
 )

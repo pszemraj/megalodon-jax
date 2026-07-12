@@ -298,6 +298,36 @@ class TestMegalodonModel:
 class TestMegalodonForCausalLM:
     """Tests for MegalodonForCausalLM."""
 
+    def test_bf16_cached_logits_stay_within_compute_envelope(self) -> None:
+        """Live cache outputs may change BF16 GEMM association, not semantics."""
+        config = small_config(compute_dtype=jnp.bfloat16)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(91))
+        tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
+        next_token = jnp.asarray([[8]], dtype=jnp.int32)
+        noncached = eqx.filter_jit(lambda candidate, values: candidate(values, return_cache=False))
+        cached = eqx.filter_jit(lambda candidate, values: candidate(values, return_cache=True))
+        continue_cached = eqx.filter_jit(
+            lambda candidate, values, state: candidate(values, cache=state, return_cache=True)
+        )
+
+        expected_prefill, _ = noncached(model, tokens)
+        actual_prefill, cache = cached(model, tokens)
+        expected_decode, _ = noncached(model, jnp.concatenate((tokens, next_token), axis=1))
+        actual_decode, _ = continue_cached(model, next_token, cache)
+
+        np.testing.assert_allclose(
+            np.asarray(actual_prefill),
+            np.asarray(expected_prefill),
+            rtol=2e-2,
+            atol=8e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_decode),
+            np.asarray(expected_decode[:, -1:]),
+            rtol=2e-2,
+            atol=8e-2,
+        )
+
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test that MegalodonForCausalLM produces correct logit shapes.
 
