@@ -20,9 +20,12 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Float
 
-# FP32 means full IEEE-style float32 products in this project, not TensorFloat-32.
-# Passing this per operation avoids mutating JAX's process-global precision config.
-DOT_PRECISION = jax.lax.Precision.HIGHEST
+
+def dot_precision(compute_dtype: jnp.dtype) -> jax.lax.Precision | None:
+    """Select full FP32 products without constraining native BF16 GEMMs."""
+    if jnp.dtype(compute_dtype) == jnp.dtype(jnp.float32):
+        return jax.lax.Precision.HIGHEST
+    return None
 
 
 def _matmul_3d(
@@ -37,7 +40,7 @@ def _matmul_3d(
     y = jnp.matmul(
         x.astype(compute_dtype),
         weight.astype(compute_dtype).T,
-        precision=DOT_PRECISION,
+        precision=dot_precision(compute_dtype),
         preferred_element_type=accum_dtype,
     )
     if bias is not None:

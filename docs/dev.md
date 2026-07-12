@@ -21,7 +21,7 @@ Pure JAX/Equinox reimplementation of Megalodon. No custom CUDA extension is requ
 | Component    | Upstream Reference (custom kernels) | This Implementation (JAX)                         |
 | ------------ | ----------------------------------- | ------------------------------------------------- |
 | EMA          | Fused CUDA kernels                  | FFT path (training) / sequential scan (inference) |
-| TimestepNorm | Fused CUDA block-Welford            | FP32 block-Welford scan                           |
+| TimestepNorm | Fused CUDA block-Welford            | FP32 vectorized block-Welford prefixes            |
 | Attention    | Fused/manual source paths           | Manual chunked/sliding attention                  |
 | Parallelism  | 4D chunk-parallel                   | Single-device only                                |
 
@@ -76,7 +76,7 @@ The associative path is ~5x slower than FFT (training-viable); the sequential fa
 
 State uses FP32 population mean/variance and a token-block count. A valid token contributes all features in each group, including within-token variance, using the same block-Welford algebra as the released CUDA implementation. The configured `norm_eps` is added only when normalizing; no artificial state variance floor or nonzero empty-state M2 is injected.
 
-The production training and continuation paths evaluate this causal recurrence with a sequential `jax.lax.scan`. This replaces the former vectorized cumulative-sum path to preserve exact block-Welford, masking, reset, and chunk-continuation semantics, with a throughput tradeoff that should be measured separately from correctness.
+The unsegmented training path evaluates the Welford recurrence from vectorized prefix sums, including each token block's within-group variance. Incoming continuation state is merged through the same sufficient statistics, while packed resets use a reset-aware associative Welford scan. This preserves masking, reset, and chunk-continuation semantics without serializing ordinary training over sequence length.
 
 ### EMA Eigenvalue Stability
 

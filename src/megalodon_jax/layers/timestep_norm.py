@@ -22,6 +22,13 @@ from megalodon_jax.layers.segments import segment_boundaries, valid_segment_mask
 from megalodon_jax.types import NormState
 
 
+def _block_moments(x: Array) -> tuple[Array, Array]:
+    """Return stable population moments over the final feature axis."""
+    mean = jnp.mean(x, axis=-1)
+    var = jnp.mean(jnp.square(x - mean[..., None]), axis=-1)
+    return mean, var
+
+
 class TimestepNorm(eqx.Module):
     """Normalize each group over all valid scalars observed up to a timestep.
 
@@ -191,12 +198,15 @@ class TimestepNorm(eqx.Module):
         if length == 0:
             return x, initial
 
-        max_increment = valid.astype(jnp.int32).sum(axis=1)
-        initial_count = eqx.error_if(
-            initial.count,
-            jnp.any(initial.count > jnp.iinfo(jnp.int32).max - max_increment),
-            "TimestepNorm int32 count would overflow",
-        )
+        if state is None:
+            initial_count = initial.count
+        else:
+            max_increment = valid.astype(jnp.int32).sum(axis=1)
+            initial_count = eqx.error_if(
+                initial.count,
+                jnp.any(initial.count > jnp.iinfo(jnp.int32).max - max_increment),
+                "TimestepNorm int32 count would overflow",
+            )
         initial = NormState(count=initial_count, mean=initial.mean, var=initial.var)
 
         groups = self.num_groups
@@ -206,71 +216,141 @@ class TimestepNorm(eqx.Module):
         prior_mean = prior.mean
         prior_var = prior.var
 
-        carry = (
-            initial.count,
-            initial.mean,
-            initial.var,
-            initial.count,
-            initial.mean,
-            initial.var,
-        )
+        block_mean, block_var = _block_moments(x_groups)
+        token_count = valid[..., None].astype(jnp.int32)
+        token_mean = jnp.where(valid[..., None], block_mean, 0.0)
+        token_var = jnp.where(valid[..., None], block_var, 0.0)
 
-        def step(
-            current: tuple[Array, Array, Array, Array, Array, Array],
-            inputs: tuple[Array, Array, Array],
-        ) -> tuple[tuple[Array, Array, Array, Array, Array, Array], Array]:
-            count, mean, var, last_count, last_mean, last_var = current
-            x_t, valid_t, boundary_t = inputs
-
-            count = jnp.where(boundary_t, prior_count, count)
-            mean = jnp.where(boundary_t[:, None], prior_mean, mean)
-            var = jnp.where(boundary_t[:, None], prior_var, var)
-
-            block_mean = jnp.mean(x_t, axis=-1)
-            block_var = jnp.mean(jnp.square(x_t - block_mean[..., None]), axis=-1)
+        def merge_welford(
+            lhs: tuple[Array, Array, Array],
+            rhs: tuple[Array, Array, Array],
+        ) -> tuple[Array, Array, Array]:
+            """Associatively merge population-variance Welford summaries."""
+            lhs_count, lhs_mean, lhs_var = lhs
+            rhs_count, rhs_mean, rhs_var = rhs
+            count = lhs_count + rhs_count
+            lhs_count_f = lhs_count.astype(jnp.float32)
+            rhs_count_f = rhs_count.astype(jnp.float32)
             count_f = count.astype(jnp.float32)
-            next_count_f = count_f + 1.0
-            delta = block_mean - mean
-            merged_mean = mean + delta / next_count_f[:, None]
-            merged_var = (
-                count_f[:, None] * var
-                + block_var
-                + jnp.square(delta) * count_f[:, None] / next_count_f[:, None]
-            ) / next_count_f[:, None]
-
-            next_count = jnp.where(valid_t, count + 1, count)
-            next_mean = jnp.where(valid_t[:, None], merged_mean, mean)
-            next_var = jnp.where(valid_t[:, None], merged_var, var)
-
-            centered = x_t - next_mean[..., None]
-            normalized = centered * jax.lax.rsqrt(next_var[..., None] + self.eps)
-            scale = (self.weight + 1.0).reshape(groups, group_size)
-            bias = self.bias.reshape(groups, group_size)
-            output = normalized * scale + bias
-            output = jnp.where(valid_t[:, None, None], output, 0.0)
-
-            last_count = jnp.where(valid_t, next_count, last_count)
-            last_mean = jnp.where(valid_t[:, None], next_mean, last_mean)
-            last_var = jnp.where(valid_t[:, None], next_var, last_var)
-            next_carry = (
-                next_count,
-                next_mean,
-                next_var,
-                last_count,
-                last_mean,
-                last_var,
+            denominator = jnp.maximum(count_f, 1.0)
+            delta = rhs_mean - lhs_mean
+            mean = lhs_mean + delta * (rhs_count_f / denominator)
+            var = (
+                lhs_count_f * lhs_var
+                + rhs_count_f * rhs_var
+                + jnp.square(delta) * lhs_count_f * rhs_count_f / denominator
+            ) / denominator
+            nonempty = count > 0
+            return (
+                count,
+                jnp.where(nonempty, mean, 0.0),
+                jnp.where(nonempty, var, 0.0),
             )
-            return next_carry, output
 
-        final_carry, outputs = jax.lax.scan(
-            step,
-            carry,
-            (
-                jnp.swapaxes(x_groups, 0, 1),
-                jnp.swapaxes(valid, 0, 1),
-                jnp.swapaxes(boundaries, 0, 1),
-            ),
-        )
-        _, _, _, final_count, final_mean, final_var = final_carry
-        y = jnp.swapaxes(outputs, 0, 1).reshape(batch_size, length, dim).astype(x.dtype)
+        if segment_ids is None:
+            # For the overwhelmingly common unsegmented path, evaluate the
+            # same Welford recurrence from vectorized prefix sums. This avoids
+            # materializing a log-depth scan tree while retaining the within-
+            # token variance term that the earlier implementation omitted.
+            initial_count_f = initial.count.astype(jnp.float32)
+            valid_f = valid.astype(jnp.float32)
+            count_f = initial_count_f[:, None] + jnp.cumsum(valid_f, axis=1)
+            count_denominator = jnp.maximum(count_f, 1.0)
+            running_sum = initial.mean * initial_count_f[:, None]
+            running_sum = running_sum[:, None, :] + jnp.cumsum(
+                block_mean * valid_f[..., None], axis=1
+            )
+            cumulative_mean = jnp.where(
+                count_f[..., None] > 0.0,
+                running_sum / count_denominator[..., None],
+                initial.mean[:, None, :],
+            )
+
+            previous_mean = jnp.concatenate(
+                (initial.mean[:, None, :], cumulative_mean[:, :-1, :]), axis=1
+            )
+            delta = block_mean - previous_mean
+            delta_after = block_mean - cumulative_mean
+            m2_increment = (block_var + delta * delta_after) * valid_f[..., None]
+            initial_m2 = initial.var * initial_count_f[:, None]
+            cumulative_m2 = initial_m2[:, None, :] + jnp.cumsum(m2_increment, axis=1)
+            cumulative_var = jnp.where(
+                count_f[..., None] > 0.0,
+                cumulative_m2 / count_denominator[..., None],
+                initial.var[:, None, :],
+            )
+            cumulative_count = initial.count[:, None] + jnp.cumsum(valid.astype(jnp.int32), axis=1)
+        else:
+            elements = (token_count, token_mean, token_var)
+
+            def merge_segmented(
+                lhs: tuple[Array, Array, Array, Array],
+                rhs: tuple[Array, Array, Array, Array],
+            ) -> tuple[Array, Array, Array, Array]:
+                """Merge Welford summaries, discarding history at right-hand resets."""
+                lhs_count, lhs_mean, lhs_var, lhs_reset = lhs
+                rhs_count, rhs_mean, rhs_var, rhs_reset = rhs
+                count, mean, var = merge_welford(
+                    (lhs_count, lhs_mean, lhs_var),
+                    (rhs_count, rhs_mean, rhs_var),
+                )
+                return (
+                    jnp.where(rhs_reset, rhs_count, count),
+                    jnp.where(rhs_reset, rhs_mean, mean),
+                    jnp.where(rhs_reset, rhs_var, var),
+                    lhs_reset | rhs_reset,
+                )
+
+            prefix_count, prefix_mean, prefix_var, _ = jax.lax.associative_scan(
+                merge_segmented,
+                (*elements, boundaries[..., None]),
+                axis=1,
+            )
+
+            initial_count = initial.count[:, None, None]
+            initial_mean = initial.mean[:, None, :]
+            initial_var = initial.var[:, None, :]
+            cumulative_count, cumulative_mean, cumulative_var = merge_welford(
+                (initial_count, initial_mean, initial_var),
+                (prefix_count, prefix_mean, prefix_var),
+            )
+            empty_prefix = prefix_count == 0
+            cumulative_count = jnp.where(empty_prefix, initial_count, cumulative_count)
+            cumulative_mean = jnp.where(empty_prefix, initial_mean, cumulative_mean)
+            cumulative_var = jnp.where(empty_prefix, initial_var, cumulative_var)
+
+        centered = x_groups - cumulative_mean[..., None]
+        normalized = centered * jax.lax.rsqrt(cumulative_var[..., None] + self.eps)
+        scale = (self.weight + 1.0).reshape(groups, group_size)
+        bias = self.bias.reshape(groups, group_size)
+        outputs = normalized * scale + bias
+        outputs = jnp.where(valid[..., None, None], outputs, 0.0)
+
+        if segment_ids is None:
+            final_count = cumulative_count[:, -1]
+            final_mean = cumulative_mean[:, -1]
+            final_var = cumulative_var[:, -1]
+        else:
+            positions = jnp.arange(length, dtype=jnp.int32)[None, :]
+            last_valid = jnp.max(jnp.where(valid, positions, -1), axis=1)
+            gather_index = jnp.maximum(last_valid, 0)
+            final_count = jnp.take_along_axis(
+                cumulative_count[..., 0], gather_index[:, None], axis=1
+            )[:, 0]
+            final_mean = jnp.take_along_axis(
+                cumulative_mean,
+                gather_index[:, None, None],
+                axis=1,
+            )[:, 0]
+            final_var = jnp.take_along_axis(
+                cumulative_var,
+                gather_index[:, None, None],
+                axis=1,
+            )[:, 0]
+            has_valid = last_valid >= 0
+            final_count = jnp.where(has_valid, final_count, prior_count)
+            final_mean = jnp.where(has_valid[:, None], final_mean, prior_mean)
+            final_var = jnp.where(has_valid[:, None], final_var, prior_var)
+
+        y = outputs.reshape(batch_size, length, dim).astype(x.dtype)
         return y, NormState(count=final_count, mean=final_mean, var=final_var)
