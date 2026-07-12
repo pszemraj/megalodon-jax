@@ -12,6 +12,13 @@ import pytest
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
 from megalodon_jax.layers.segments import segment_boundaries, segment_runs_and_local_positions
+from megalodon_jax.layers.timestep_norm import (
+    _block_moments,
+    _merge_m2,
+    _MomentSummary,
+    _shifted_cumsum_prefix,
+)
+from megalodon_jax.types import NormState
 from tests.factories import floating_to_bf16
 
 
@@ -58,6 +65,34 @@ class TestSegmentHelpers:
 
 class TestTimestepNorm:
     """Mathematical and state-continuation tests for TimestepNorm."""
+
+    def test_chan_m2_merge_and_zero_identities(self) -> None:
+        """Compact summaries use exact identities and unnormalized M2."""
+        left = _MomentSummary(
+            count=jnp.asarray([[[2]]], dtype=jnp.int32),
+            mean=jnp.asarray([[[3.0]]]),
+            m2=jnp.asarray([[[4.0]]]),
+        )
+        right = _MomentSummary(
+            count=jnp.asarray([[[3]]], dtype=jnp.int32),
+            mean=jnp.asarray([[[7.0]]]),
+            m2=jnp.asarray([[[6.0]]]),
+        )
+        identity = _MomentSummary(
+            count=jnp.zeros((1, 1, 1), dtype=jnp.int32),
+            mean=jnp.zeros((1, 1, 1)),
+            m2=jnp.zeros((1, 1, 1)),
+        )
+
+        merged = _merge_m2(left, right)
+
+        np.testing.assert_array_equal(np.asarray(merged.count), [[[5]]])
+        np.testing.assert_allclose(np.asarray(merged.mean), [[[5.4]]], atol=1e-6)
+        np.testing.assert_allclose(np.asarray(merged.m2), [[[29.2]]], atol=1e-6)
+        for expected, actual in zip(left, _merge_m2(identity, left), strict=True):
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        for expected, actual in zip(left, _merge_m2(left, identity), strict=True):
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
     def test_streaming_state_continuity(self, random_seed: int) -> None:
         """Test that processing in chunks matches full sequence.
@@ -163,6 +198,25 @@ class TestTimestepNorm:
         np.testing.assert_array_equal(np.array(state_masked.count), np.array([8, 8]))
         np.testing.assert_array_equal(np.asarray(y_masked[:, 8:]), np.zeros((batch, 8, dim)))
 
+    def test_fully_masked_row_preserves_incoming_state(self) -> None:
+        """A row containing only identity summaries returns its state exactly."""
+        norm = TimestepNorm(8, 2)
+        state = NormState(
+            count=jnp.asarray([7], dtype=jnp.int32),
+            mean=jnp.asarray([[2.0, -3.0]], dtype=jnp.float32),
+            var=jnp.asarray([[0.5, 4.0]], dtype=jnp.float32),
+        )
+        x = jnp.full((1, 5, 8), jnp.nan, dtype=jnp.float32)
+
+        output, result = norm(x, state=state, mask=jnp.zeros((1, 5), dtype=jnp.bool_))
+
+        np.testing.assert_array_equal(np.asarray(output), np.zeros((1, 5, 8)))
+        for name in ("count", "mean", "var"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(result, name)),
+                np.asarray(getattr(state, name)),
+            )
+
     def test_state_dtype_fp32(self, random_seed: int) -> None:
         """Ensure running stats stay in float32 for bf16 inputs."""
         dim = 64
@@ -231,6 +285,49 @@ class TestTimestepNorm:
         np.testing.assert_array_equal(np.asarray(state.mean), np.full((1, 4), 1e7))
         np.testing.assert_array_equal(np.asarray(state.var), np.zeros((1, 4)))
 
+    def test_shifted_hot_path_all_prefix_variances_are_nonnegative(self) -> None:
+        """Adversarial finite inputs retain finite nonnegative prefix variance."""
+        norm = TimestepNorm(32, 4)
+        key = jax.random.PRNGKey(31)
+        normal = jax.random.normal(key, (2, 257, 32), dtype=jnp.float32)
+        time = jnp.arange(257, dtype=jnp.float32)[None, :, None]
+        alternating = jnp.broadcast_to(
+            jnp.where(
+                (jnp.arange(257)[None, :, None] + jnp.arange(32)[None, None]) % 2,
+                -1.0,
+                1.0,
+            ),
+            normal.shape,
+        )
+        families = (
+            normal,
+            37.0 + 1.7 * normal,
+            jnp.full_like(normal, 7.25),
+            3.0 + 1e-4 * normal,
+            alternating,
+            0.075 * time + 0.02 * normal,
+            1e2 + 2e-4 * normal,
+            1e4 + 2e-2 * normal,
+            1e6 + 2.0 * normal,
+            (11.0 + 2.0 * normal).astype(jnp.bfloat16),
+        )
+        states = (
+            norm._prior_state(2),  # noqa: SLF001 - direct hot-path invariant test.
+            NormState(
+                count=jnp.asarray([7, 11], dtype=jnp.int32),
+                mean=jnp.asarray([[8.0] * 4, [-3.0] * 4], dtype=jnp.float32),
+                var=jnp.asarray([[0.25] * 4, [2.0] * 4], dtype=jnp.float32),
+            ),
+        )
+
+        for values in families:
+            grouped = values.astype(jnp.float32).reshape(2, 257, 4, 8)
+            block_mean, block_var = _block_moments(grouped)
+            for initial in states:
+                _, _, prefix_var = _shifted_cumsum_prefix(block_mean, block_var, initial)
+                assert bool(jnp.all(jnp.isfinite(prefix_var)))
+                assert float(jnp.min(prefix_var)) >= 0.0
+
     def test_masked_nonfinite_token_does_not_update_state(self) -> None:
         """Masked NaN/Inf blocks cannot contaminate later valid prefixes."""
         norm = TimestepNorm(4, 2, eps=0.0)
@@ -263,11 +360,82 @@ class TestTimestepNorm:
         np.testing.assert_allclose(np.asarray(state.mean), [[4.0, 8.0]], atol=1e-6)
         np.testing.assert_allclose(np.asarray(state.var), [[5.0, 20.0]], atol=1e-6)
 
+    def test_masked_nonfinite_tokens_have_zero_finite_gradients(self) -> None:
+        """Inactive NaN/Inf payloads cannot poison reverse-mode arithmetic."""
+        norm = TimestepNorm(8, 2)
+        valid = jnp.asarray(
+            [
+                [False, True, True, True],
+                [True, False, True, True],
+                [True, True, True, False],
+                [False, False, False, False],
+            ],
+            dtype=jnp.bool_,
+        )
+        finite = jax.random.normal(jax.random.PRNGKey(37), (4, 4, 8))
+        nonfinite = jnp.asarray(
+            [jnp.nan, jnp.inf, -jnp.inf, jnp.nan, jnp.inf, -jnp.inf, jnp.nan, jnp.inf]
+        )
+        x = jnp.where(valid[..., None], finite, nonfinite)
+
+        def objective(values: jax.Array) -> jax.Array:
+            output, state = norm(values, mask=valid)
+            return (
+                jnp.sum(jnp.square(output)) + 0.1 * jnp.sum(state.mean) + 0.03 * jnp.sum(state.var)
+            )
+
+        value, gradient = jax.value_and_grad(objective)(x)
+
+        assert bool(jnp.isfinite(value))
+        assert bool(jnp.all(jnp.isfinite(gradient)))
+        np.testing.assert_array_equal(
+            np.asarray(gradient)[~np.asarray(valid)],
+            np.zeros((7, 8), dtype=np.float32),
+        )
+
     def test_prior_count_overflow_is_rejected(self) -> None:
         """A fresh learned-prior state cannot wrap its int32 count."""
         norm = TimestepNorm(4, 2, prior_count=int(jnp.iinfo(jnp.int32).max))
         with pytest.raises(ValueError, match="overflow"):
             norm(jnp.ones((1, 1, 4), dtype=jnp.float32))
+
+    @pytest.mark.parametrize("count", [-1, int(jnp.iinfo(jnp.int32).max)])
+    def test_continuation_count_rejects_negative_and_overflow(self, count: int) -> None:
+        """Malformed or exhausted continuation counts fail before prefix work."""
+        norm = TimestepNorm(4, 2)
+        state = NormState(
+            count=jnp.asarray([count], dtype=jnp.int32),
+            mean=jnp.zeros((1, 2), dtype=jnp.float32),
+            var=jnp.ones((1, 2), dtype=jnp.float32),
+        )
+
+        with pytest.raises(Exception, match="non-negative.*overflow"):
+            norm(jnp.ones((1, 1, 4), dtype=jnp.float32), state=state)
+
+    def test_continuation_count_boundary_and_masked_identity(self) -> None:
+        """The last int32 count is reachable and a masked call cannot advance it."""
+        norm = TimestepNorm(4, 2)
+        maximum = int(jnp.iinfo(jnp.int32).max)
+        state = NormState(
+            count=jnp.asarray([maximum - 1], dtype=jnp.int32),
+            mean=jnp.zeros((1, 2), dtype=jnp.float32),
+            var=jnp.ones((1, 2), dtype=jnp.float32),
+        )
+
+        _, exhausted = norm(jnp.ones((1, 1, 4), dtype=jnp.float32), state=state)
+        np.testing.assert_array_equal(np.asarray(exhausted.count), [maximum])
+
+        output, unchanged = norm(
+            jnp.full((1, 1, 4), jnp.nan, dtype=jnp.float32),
+            state=exhausted,
+            mask=jnp.zeros((1, 1), dtype=jnp.bool_),
+        )
+        np.testing.assert_array_equal(np.asarray(output), np.zeros((1, 1, 4)))
+        for name in ("count", "mean", "var"):
+            np.testing.assert_array_equal(
+                np.asarray(getattr(unchanged, name)),
+                np.asarray(getattr(exhausted, name)),
+            )
 
     def test_nonfloating_input_is_rejected(self) -> None:
         """The low-level layer honors the documented FP32/BF16 surface."""
@@ -366,6 +534,50 @@ class TestTimestepNormSegmentReset:
             atol=1e-5,
             err_msg="Doc B slice should match doc B alone (no stat leak)",
         )
+
+    def test_contiguous_runs_cover_reused_ids_singletons_and_padding(
+        self, random_seed: int
+    ) -> None:
+        """Every positive contiguous run is independent regardless of raw ID reuse."""
+        norm = TimestepNorm(16, 4)
+        x = jax.random.normal(jax.random.PRNGKey(random_seed), (1, 9, 16))
+        segment_ids = jnp.asarray([[0, 1, 2, 2, 1, 1, 0, 3, 0]], dtype=jnp.int32)
+
+        packed, packed_state = norm(x, segment_ids=segment_ids)
+
+        runs = ((1, 2), (2, 4), (4, 6), (7, 8))
+        for start, stop in runs:
+            independent, _ = norm(x[:, start:stop])
+            np.testing.assert_allclose(
+                np.asarray(packed[:, start:stop]),
+                np.asarray(independent),
+                rtol=2e-5,
+                atol=2e-5,
+            )
+        np.testing.assert_array_equal(
+            np.asarray(packed[:, [0, 6, 8]]),
+            np.zeros((1, 3, 16)),
+        )
+        _, final_run_state = norm(x[:, 7:8])
+        for name in ("count", "mean", "var"):
+            np.testing.assert_allclose(
+                np.asarray(getattr(packed_state, name)),
+                np.asarray(getattr(final_run_state, name)),
+                rtol=2e-5,
+                atol=2e-5,
+            )
+
+    def test_fully_padded_packed_row_returns_prior(self) -> None:
+        """Segment ID zero is an identity and cannot leak nonfinite input."""
+        norm = TimestepNorm(8, 2)
+        x = jnp.full((1, 7, 8), jnp.nan, dtype=jnp.float32)
+
+        output, state = norm(x, segment_ids=jnp.zeros((1, 7), dtype=jnp.int32))
+
+        np.testing.assert_array_equal(np.asarray(output), np.zeros((1, 7, 8)))
+        np.testing.assert_array_equal(np.asarray(state.count), [0])
+        np.testing.assert_array_equal(np.asarray(state.mean), np.zeros((1, 2)))
+        np.testing.assert_array_equal(np.asarray(state.var), np.ones((1, 2)))
 
     def test_segment_reset_matches_explicit_numpy_welford(self, random_seed: int) -> None:
         """Compare segmented running stats to an explicit Welford loop with resets.
