@@ -10,8 +10,8 @@ import pytest
 
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.convert import export_upstream_state_dict
-from tools.verify_modeling_correctness import (
-    deterministic_tiny_overfit,
+from tests.reference.training import deterministic_tiny_overfit
+from tests.reference.upstream import (
     differentiable_state,
     source_forward,
     trainable_upstream_keys,

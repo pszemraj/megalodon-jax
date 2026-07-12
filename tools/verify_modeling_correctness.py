@@ -29,7 +29,7 @@ import platform
 import subprocess
 import sys
 import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -43,52 +43,6 @@ import numpy as np
 def _max_abs_error(actual: Any, expected: Any) -> float:
     """Return the maximum absolute difference between array-like values."""
     return float(np.max(np.abs(np.asarray(actual) - np.asarray(expected))))
-
-
-def deterministic_tiny_overfit(seed: int = 405) -> dict[str, float | bool]:
-    """Run the shared deterministic FP32 tiny-batch overfit gate."""
-    import equinox as eqx
-    import jax
-    import jax.numpy as jnp
-
-    from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
-
-    config = MegalodonConfig(
-        vocab_size=8,
-        model_dim=8,
-        num_layers=1,
-        num_heads=1,
-        z_dim=4,
-        value_dim=8,
-        ffn_hidden_dim=12,
-        cema_ndim=2,
-        chunk_size=8,
-        norm_num_groups=2,
-    )
-    model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(seed))
-    tokens = jnp.asarray([[1, 2, 3, 4, 5, 6, 7]], dtype=jnp.int32)
-    learning_rate = 2e-2
-
-    @eqx.filter_jit
-    def step(candidate: MegalodonForCausalLM) -> tuple[MegalodonForCausalLM, Any]:
-        def loss_fn(current: MegalodonForCausalLM) -> Any:
-            return current.compute_loss(tokens, tokens)
-
-        loss, grads = eqx.filter_value_and_grad(loss_fn)(candidate)
-        updates = jax.tree.map(lambda gradient: -learning_rate * gradient, grads)
-        return eqx.apply_updates(candidate, updates), loss
-
-    initial = float(model.compute_loss(tokens, tokens))
-    for _ in range(80):
-        model, _ = step(model)
-    final = float(model.compute_loss(tokens, tokens))
-    ratio = final / initial
-    return {
-        "passed": math.isfinite(final) and ratio < 0.35,
-        "initial_loss": initial,
-        "final_loss": final,
-        "ratio": ratio,
-    }
 
 
 def cache_partition_errors(
@@ -394,240 +348,6 @@ def adjacent_pair_rope(x: np.ndarray, positions: np.ndarray, base: float) -> np.
     return out.reshape(x.shape).astype(x.dtype)
 
 
-TorchStateDict = Mapping[str, Any]
-
-
-def trainable_upstream_keys(state: TorchStateDict) -> tuple[str, ...]:
-    """Return released-source parameters, excluding zero-prior and RoPE buffers."""
-    buffers = (".prior_count", ".prior_mean", ".prior_logv")
-    return tuple(
-        name
-        for name, value in state.items()
-        if value.is_floating_point() and name != "rope.freqs" and not name.endswith(buffers)
-    )
-
-
-def differentiable_state(state: TorchStateDict) -> dict[str, Any]:
-    """Clone a Torch checkpoint state with autograd enabled only for source parameters."""
-    trainable = set(trainable_upstream_keys(state))
-    return {
-        name: value.detach().clone().requires_grad_(name in trainable)
-        for name, value in state.items()
-    }
-
-
-def _torch_linear(x: Any, state: TorchStateDict, prefix: str) -> Any:
-    """Apply a released ``(out_features, in_features)`` projection."""
-    import torch.nn.functional as functional
-
-    return functional.linear(x, state[f"{prefix}.weight"], state.get(f"{prefix}.bias"))
-
-
-def _torch_timestep_norm(
-    x: Any,
-    state: TorchStateDict,
-    prefix: str,
-    groups: int,
-    eps: float,
-) -> Any:
-    """Evaluate group TimestepNorm with population block-Welford updates."""
-    import torch
-
-    batch, length, dim = x.shape
-    group_size = dim // groups
-    grouped = x.float().reshape(batch, length, groups, group_size)
-    mean = torch.zeros((batch, groups), dtype=torch.float32, device=x.device)
-    variance = torch.ones_like(mean)
-    outputs = []
-
-    for index in range(length):
-        block = grouped[:, index]
-        block_mean = block.mean(dim=-1)
-        block_var = torch.square(block - block_mean.unsqueeze(-1)).mean(dim=-1)
-        count = float(index)
-        next_count = count + 1.0
-        delta = block_mean - mean
-        mean = mean + delta / next_count
-        variance = (
-            count * variance + block_var + torch.square(delta) * count / next_count
-        ) / next_count
-        normalized = (block - mean.unsqueeze(-1)) * torch.rsqrt(variance.unsqueeze(-1) + eps)
-        outputs.append(normalized.reshape(batch, dim))
-
-    y = torch.stack(outputs, dim=1).to(x.dtype)
-    scale = (state[f"{prefix}.weight"] + 1.0).to(y.dtype)
-    bias = state[f"{prefix}.bias"].to(y.dtype)
-    return y * scale + bias
-
-
-def _torch_rms_norm(x: Any, weight: Any | None, eps: float) -> Any:
-    """Evaluate the released RMSNorm fallback in fp32."""
-    import torch
-
-    normalized = x.float() * torch.rsqrt(torch.square(x.float()).mean(dim=-1, keepdim=True) + eps)
-    normalized = normalized.to(x.dtype)
-    return normalized if weight is None else normalized * (weight + 1.0).to(x.dtype)
-
-
-def _torch_layer_norm(x: Any, weight: Any | None, bias: Any | None, eps: float) -> Any:
-    """Evaluate released plus-one LayerNorm storage semantics."""
-    import torch.nn.functional as functional
-
-    effective_weight = None if weight is None else weight + 1.0
-    return functional.layer_norm(x, (x.shape[-1],), effective_weight, bias, eps)
-
-
-def _torch_cema(x: Any, state: TorchStateDict, prefix: str, ndim: int) -> Any:
-    """Evaluate the exact source-compatible CEMA recurrence and residual."""
-    import torch
-
-    alpha = torch.sigmoid(state[f"{prefix}.alpha"].float()).squeeze(-1)
-    delta = torch.sigmoid(state[f"{prefix}.delta"].float()).squeeze(-1)
-    theta = torch.sigmoid(state[f"{prefix}.theta"].float()) * (2.0 * math.pi / ndim)
-    wavelets = torch.arange(1, ndim + 1, dtype=torch.float32, device=x.device).reshape(1, ndim)
-    phase = theta.squeeze(-1) * wavelets
-    q = torch.polar(1.0 - alpha * delta, phase)
-    gamma_parts = state[f"{prefix}.gamma"].float()
-    gamma = torch.view_as_complex(gamma_parts.contiguous()) / math.sqrt(ndim)
-
-    batch, dim, length = x.shape
-    hidden = torch.zeros((batch, dim, ndim), dtype=torch.complex64, device=x.device)
-    outputs = []
-    for index in range(length):
-        hidden = q.unsqueeze(0) * hidden + alpha.unsqueeze(0) * x[:, :, index, None].float()
-        outputs.append((hidden * gamma.unsqueeze(0)).real.sum(dim=-1))
-    recurrent = torch.stack(outputs, dim=-1)
-    omega = state[f"{prefix}.omega"].float().squeeze(-1)
-    return (recurrent + x.float() * omega[None, :, None]).to(x.dtype)
-
-
-def _torch_rope(q: Any, k: Any, frequencies: Any) -> tuple[Any, Any]:
-    """Apply the released adjacent-pair ``view_as_complex`` RoPE convention."""
-    import torch
-
-    length = q.shape[1]
-    positions = torch.arange(length, dtype=torch.float32, device=q.device)
-    angles = torch.outer(positions, frequencies.float())
-    rotation = torch.polar(torch.ones_like(angles), angles).unsqueeze(1)
-
-    def rotate(x: Any) -> Any:
-        complex_x = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        return torch.view_as_real(complex_x * rotation).flatten(-2).to(x.dtype)
-
-    return rotate(q), rotate(k)
-
-
-def _torch_attention(
-    q: Any,
-    k: Any,
-    v: Any,
-    frequencies: Any,
-    num_heads: int,
-) -> Any:
-    """Evaluate source attention with no Transformer ``1/sqrt(d)`` scale."""
-    import torch
-
-    batch, length, z_dim = q.shape
-    value_dim = v.shape[-1]
-    q = q.reshape(batch, length, num_heads, z_dim // num_heads)
-    k = k.reshape_as(q)
-    v = v.reshape(batch, length, num_heads, value_dim // num_heads)
-    q, k = _torch_rope(q, k, frequencies)
-    q = q.transpose(1, 2)
-    k = k.transpose(1, 2)
-    v = v.transpose(1, 2)
-    scores = torch.matmul(q, k.transpose(-2, -1))
-    causal = torch.triu(
-        torch.full((length, length), float("-inf"), dtype=scores.dtype, device=scores.device),
-        diagonal=1,
-    )
-    probabilities = torch.softmax(scores + causal, dim=-1, dtype=torch.float32).to(q.dtype)
-    return torch.matmul(probabilities, v).transpose(1, 2).reshape(batch, length, value_dim)
-
-
-def source_forward(tokens: Any, state: TorchStateDict, config: Any) -> Any:
-    """Run a tiny differentiable forward pass from the exact released equations.
-
-    Dropout must be disabled and the sequence must fit within one attention chunk.
-    These constraints avoid fused kernels while retaining every modeling equation
-    and trainable tensor used by the released architecture.
-    """
-    import torch.nn.functional as functional
-
-    if tokens.ndim != 2:
-        raise ValueError(f"tokens must have shape (batch, length), got {tuple(tokens.shape)}")
-    if tokens.shape[1] > config.chunk_size:
-        raise ValueError("source oracle supports at most one attention chunk")
-    if any((config.dropout, config.attention_dropout, config.hidden_dropout)):
-        raise ValueError("source oracle requires dropout probabilities to be zero")
-    if config.attention_window is not None:
-        raise ValueError("source oracle covers released chunk-local attention only")
-
-    x = functional.embedding(tokens, state["embed.weight"])
-    if config.scale_emb:
-        x = x * math.sqrt(config.model_dim)
-
-    for layer_index in range(config.num_layers):
-        residual_base = x
-        attention_prefix = f"layers.{layer_index}.mega"
-        normalized = _torch_timestep_norm(
-            x,
-            state,
-            f"{attention_prefix}.timenorm",
-            config.norm_num_groups,
-            config.norm_eps,
-        )
-        cema = _torch_cema(
-            normalized.transpose(1, 2),
-            state,
-            f"{attention_prefix}.cema",
-            config.cema_ndim,
-        ).transpose(1, 2)
-        rms_weight = state.get(f"{attention_prefix}.rmsnorm.weight")
-        memory = _torch_rms_norm(cema, rms_weight, config.norm_eps)
-
-        z = _torch_linear(memory, state, f"{attention_prefix}.wz")
-        z = z.reshape(*z.shape[:-1], config.num_heads, config.head_dim)
-        z = _torch_rms_norm(z, None, config.norm_eps).reshape(*z.shape[:-2], config.z_dim)
-        scale = (state[f"{attention_prefix}.gamma"] + 1.0) / math.sqrt(config.head_dim)
-        z = z.unsqueeze(2) * scale + state[f"{attention_prefix}.beta"]
-        q, k = z.unbind(dim=2)
-
-        v = functional.silu(_torch_linear(normalized, state, f"{attention_prefix}.wv"))
-        reset = functional.silu(_torch_linear(memory, state, f"{attention_prefix}.wr"))
-        attended = _torch_attention(q, k, v, state["rope.freqs"], config.num_heads)
-        attention_output = _torch_linear(memory, state, f"{attention_prefix}.wh1") + _torch_linear(
-            attended * reset, state, f"{attention_prefix}.wh2"
-        )
-        after_attention = residual_base + attention_output
-
-        ffn_prefix = f"layers.{layer_index}.nffn"
-        ffn_input = _torch_layer_norm(
-            after_attention,
-            state.get(f"{ffn_prefix}.norm.weight"),
-            state.get(f"{ffn_prefix}.norm.bias"),
-            config.norm_eps,
-        )
-        hidden = functional.silu(_torch_linear(ffn_input, state, f"{ffn_prefix}.fc1"))
-        if config.swiglu:
-            hidden = hidden * _torch_linear(ffn_input, state, f"{ffn_prefix}.fc3")
-        ffn_output = _torch_linear(hidden, state, f"{ffn_prefix}.fc2")
-        alpha = state.get(f"{ffn_prefix}.alpha")
-        if alpha is not None:
-            ffn_output = ffn_output * alpha
-        x = residual_base + ffn_output
-
-    x = _torch_timestep_norm(
-        x,
-        state,
-        "output.final_norm",
-        config.norm_num_groups,
-        config.norm_eps,
-    )
-    output_weight = state["embed.weight"] if config.share_emb else state["output.output.weight"]
-    return functional.linear(x, output_weight).float()
-
-
 def source_parameter_count(
     *,
     model_dim: int,
@@ -721,6 +441,8 @@ def main() -> int:
     if not paper.is_file():
         print(f"ERROR: local paper does not exist: {paper}", file=sys.stderr)
         return 2
+    repository_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repository_root))
     sys.path.insert(0, str(src))
 
     import equinox as eqx
@@ -733,6 +455,12 @@ def main() -> int:
     from megalodon_jax.layers.norms import BatchedLayerNorm
     from megalodon_jax.model import MegalodonForCausalLM
     from megalodon_jax.utils import get_initializer
+    from tests.reference.training import deterministic_tiny_overfit
+    from tests.reference.upstream import (
+        differentiable_state,
+        source_forward,
+        trainable_upstream_keys,
+    )
 
     def tiny_config(**overrides: Any) -> MegalodonConfig:
         """Return the canonical verifier config with explicit overrides."""
