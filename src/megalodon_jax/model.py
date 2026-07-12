@@ -654,13 +654,18 @@ class MegalodonForCausalLM(eqx.Module):
         computation, following HuggingFace Transformers convention. This allows
         padding tokens to be marked with -100 in the labels array.
 
+        ``attention_mask`` applies to the shifted target position only. A valid
+        target following a masked source still contributes; use ``ignore_index``
+        labels when a stricter loss exclusion contract is required.
+
         When segment_ids is provided, shifted pairs that cross a segment
         boundary and pairs targeting padding (segment id 0) are excluded
         automatically - callers do not need to pre-mask boundary labels.
 
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
-        :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Bool[Array, "batch seq"] | None attention_mask: Optional target-position
+            loss mask, also used by the forward pass for attention validity.
         :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
         :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
             When omitted with segment_ids given, document-local positions

@@ -76,8 +76,8 @@ class RMSNorm(eqx.Module):
         :param Float[Array, "... dim"] x: Input tensor with feature dimension last.
         :return Float[Array, "... dim"]: Normalized tensor.
         """
-        # Compute RMS in fp32 to avoid bf16 overflow on x**2
-        # (bf16 max ~65504, so values > ~256 would overflow when squared)
+        # Compute RMS in fp32 for reduction accuracy and stable squared sums.
+        # BF16 has FP32-like exponent range (~3.39e38), unlike FP16 (~65504).
         x_normed = _rms_normalize(x, self.eps).astype(x.dtype)
         # Apply scale if affine (cast gamma to input dtype to preserve bf16)
         if self.affine and self.gamma is not None:
