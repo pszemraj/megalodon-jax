@@ -33,6 +33,22 @@ from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_boundary_initializer, reinit_linear_weights
 
 
+def _require_dropout_key(
+    config: MegalodonConfig,
+    deterministic: bool,
+    key: PRNGKeyArray | None,
+) -> None:
+    """Reject training-time dropout without an explicit PRNG key."""
+    dropout_enabled = any(
+        rate > 0.0 for rate in (config.dropout, config.attention_dropout, config.hidden_dropout)
+    )
+    if not deterministic and key is None and dropout_enabled:
+        raise ValueError(
+            "PRNG key required when deterministic=False and dropout is enabled. "
+            "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+        )
+
+
 @eqx.filter_checkpoint
 def _checkpointed_layer(
     layer: "MegalodonBlock",
@@ -335,16 +351,7 @@ class MegalodonModel(eqx.Module):
         :raises ValueError: If cache layer count does not match the model.
         :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
+        _require_dropout_key(self.config, deterministic, key)
         B, L = input_ids.shape
         if key is not None:
             embedding_key, layers_key = jax.random.split(key)
@@ -576,16 +583,7 @@ class MegalodonForCausalLM(eqx.Module):
         :raises ValueError: If dropout is enabled without a PRNG key.
         :return tuple[Float[Array, "batch seq vocab"], ModelCache | None]: Logits and cache.
         """
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
+        _require_dropout_key(self.config, deterministic, key)
         hidden, cache = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -657,17 +655,7 @@ class MegalodonForCausalLM(eqx.Module):
         :raises ValueError: If dropout is enabled without a PRNG key.
         :return Float[Array, ""]: Scalar cross-entropy loss.
         """
-        # Validate PRNG key for dropout - prevent silent no-op when training
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
+        _require_dropout_key(self.config, deterministic, key)
 
         logits, _ = self(
             input_ids,

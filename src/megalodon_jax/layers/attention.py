@@ -34,7 +34,7 @@ from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import AttentionDropoutMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
-from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
+from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.segments import segment_runs_and_local_positions
 from megalodon_jax.layers.timestep_norm import TimestepNorm
@@ -50,6 +50,21 @@ def _validate_dropout_rate(name: str, value: float) -> None:
     """Reject probabilities that make inverted dropout undefined."""
     if not 0.0 <= value < 1.0:
         raise ValueError(f"{name} must be in [0, 1), got {value}")
+
+
+def _validate_dropout_mode(mode: AttentionDropoutMode) -> None:
+    """Validate the supported attention dropout placement."""
+    if mode not in ("post_softmax", "dropkey"):
+        raise ValueError(
+            f"attention dropout mode must be 'post_softmax' or 'dropkey', got {mode!r}"
+        )
+
+
+def _inverted_dropout(x: Array, rate: float, key: PRNGKeyArray) -> Array:
+    """Apply inverted dropout while preserving the input dtype."""
+    keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
+    inv_keep = jnp.asarray(1.0 / (1.0 - rate), dtype=x.dtype)
+    return jnp.where(keep, x * inv_keep, jnp.zeros((), dtype=x.dtype))
 
 
 def attention_single_chunk(
@@ -95,8 +110,7 @@ def attention_single_chunk(
     if L_q == 0 or L_kv == 0:
         return jnp.zeros((B, L_q, H, Dv), dtype=q.dtype)
     _validate_dropout_rate("dropout_rate", dropout_rate)
-    if dropout_mode not in ("post_softmax", "dropkey"):
-        raise ValueError(f"unsupported attention dropout mode: {dropout_mode!r}")
+    _validate_dropout_mode(dropout_mode)
     if not deterministic and dropout_rate > 0.0 and key is None:
         raise ValueError("PRNG key required for attention dropout")
 
@@ -145,9 +159,7 @@ def attention_single_chunk(
 
     # Dropout if not deterministic
     if not deterministic and dropout_rate > 0.0 and dropout_mode == "post_softmax":
-        keep_mask = jax.random.bernoulli(key, 1.0 - dropout_rate, attn_weights.shape)
-        inv_keep = jnp.asarray(1.0 / (1.0 - dropout_rate), dtype=attn_weights.dtype)
-        attn_weights = attn_weights * keep_mask.astype(attn_weights.dtype) * inv_keep
+        attn_weights = _inverted_dropout(attn_weights, dropout_rate, key)
 
     # Apply to values: (B, H, L_q, Dv) -> (B, L_q, H, Dv)
     out = jnp.einsum(
@@ -421,11 +433,7 @@ class ChunkedAttention(eqx.Module):
                 f"attention_window must be positive when provided, got {attention_window}"
             )
         _validate_dropout_rate("attention_dropout", attention_dropout)
-        if attention_dropout_mode not in ("post_softmax", "dropkey"):
-            raise ValueError(
-                "attention_dropout_mode must be 'post_softmax' or 'dropkey', got "
-                f"{attention_dropout_mode!r}"
-            )
+        _validate_dropout_mode(attention_dropout_mode)
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.value_head_dim = value_head_dim
@@ -902,18 +910,14 @@ class MegalodonAttention(eqx.Module):
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
         mx = self.rmsnorm(y_cema)
         if not deterministic and self.hidden_dropout > 0.0:
-            keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, mx.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=mx.dtype)
-            mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
+            mx = _inverted_dropout(mx, self.hidden_dropout, k2)
 
         # Shared Z projection for Q/K
         z = linear_3d(self.wz, mx, self.compute_dtype, self.accum_dtype)  # (B, L, z_dim)
         z = z.reshape(B, L, H, Dh)
 
         # Per-head RMS normalization (in fp32 for stability)
-        z_f32 = z.astype(jnp.float32)
-        rms = jnp.sqrt(jnp.mean(z_f32**2, axis=-1, keepdims=True) + self.norm_eps)
-        z_normed = z_f32 / rms
+        z_normed = _rms_normalize(z, self.norm_eps)
 
         # Affine transform to Q and K in fp32 for stability
         # gamma, beta: (2, z_dim) -> (2, H, Dh)
@@ -958,9 +962,7 @@ class MegalodonAttention(eqx.Module):
 
         # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
         if not deterministic and self.hidden_dropout > 0.0:
-            keep = jax.random.bernoulli(k3, 1.0 - self.hidden_dropout, gated.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=gated.dtype)
-            gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
+            gated = _inverted_dropout(gated, self.hidden_dropout, k3)
 
         # Output projections
         h = linear_3d(self.wh1, mx, self.compute_dtype, self.accum_dtype) + linear_3d(
@@ -969,9 +971,7 @@ class MegalodonAttention(eqx.Module):
 
         # Output dropout
         if not deterministic and self.dropout > 0.0:
-            keep = jax.random.bernoulli(k4, 1.0 - self.dropout, h.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=h.dtype)
-            h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
+            h = _inverted_dropout(h, self.dropout, k4)
 
         # Residual
         y = h + x
@@ -1136,9 +1136,7 @@ class NormalizedFFN(eqx.Module):
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
             k1, k2 = jax.random.split(key)
-            keep = jax.random.bernoulli(k1, 1.0 - self.hidden_dropout, h.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=h.dtype)
-            h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
+            h = _inverted_dropout(h, self.hidden_dropout, k1)
         else:
             k2 = key
 
@@ -1147,9 +1145,7 @@ class NormalizedFFN(eqx.Module):
 
         # Output dropout
         if not deterministic and self.dropout > 0.0:
-            keep = jax.random.bernoulli(k2, 1.0 - self.dropout, out.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=out.dtype)
-            out = jnp.where(keep, out * inv_keep, jnp.zeros((), dtype=out.dtype))
+            out = _inverted_dropout(out, self.dropout, k2)
 
         # Apply residual rescaling if enabled (cast to preserve bf16)
         if self.alpha is not None:

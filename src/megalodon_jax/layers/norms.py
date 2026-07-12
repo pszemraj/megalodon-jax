@@ -19,6 +19,13 @@ import jax.numpy as jnp
 from jaxtyping import Array, Float, PRNGKeyArray
 
 
+def _rms_normalize(x: Array, eps: float) -> Array:
+    """Return RMS-normalized values in fp32 for numerically sensitive callers."""
+    x_f32 = x.astype(jnp.float32)
+    rms = jnp.sqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + eps)
+    return x_f32 / rms
+
+
 class RMSNorm(eqx.Module):
     """Root Mean Square Layer Normalization.
 
@@ -71,9 +78,7 @@ class RMSNorm(eqx.Module):
         """
         # Compute RMS in fp32 to avoid bf16 overflow on x**2
         # (bf16 max ~65504, so values > ~256 would overflow when squared)
-        x_f32 = x.astype(jnp.float32)
-        rms = jnp.sqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
-        x_normed = (x_f32 / rms).astype(x.dtype)
+        x_normed = _rms_normalize(x, self.eps).astype(x.dtype)
         # Apply scale if affine (cast gamma to input dtype to preserve bf16)
         if self.affine and self.gamma is not None:
             scale = (self.gamma + 1.0).astype(x.dtype)
