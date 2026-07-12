@@ -15,13 +15,50 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import equinox as eqx
 import jax.numpy as jnp
 from jaxtyping import Array
 
 from megalodon_jax.model import MegalodonForCausalLM, MegalodonModel
+
+SensitivePath = tuple[str, Callable[[MegalodonModel], Array]]
+
+
+def _iter_sensitive_paths(core: MegalodonModel) -> Iterable[SensitivePath]:
+    """Yield the single authoritative set of fp32-sensitive model paths."""
+    for i, layer in enumerate(core.layers):
+        attn = layer.attn
+        prefix = f"layers.{i}.attn"
+
+        yield f"{prefix}.cema.alpha", lambda m, i=i: m.layers[i].attn.cema.alpha
+        yield f"{prefix}.cema.delta", lambda m, i=i: m.layers[i].attn.cema.delta
+        yield f"{prefix}.cema.theta", lambda m, i=i: m.layers[i].attn.cema.theta
+        yield f"{prefix}.cema.gamma_real", lambda m, i=i: m.layers[i].attn.cema.gamma_real
+        yield f"{prefix}.cema.gamma_imag", lambda m, i=i: m.layers[i].attn.cema.gamma_imag
+        yield f"{prefix}.cema.omega", lambda m, i=i: m.layers[i].attn.cema.omega
+        yield f"{prefix}.gamma", lambda m, i=i: m.layers[i].attn.gamma
+        yield f"{prefix}.beta", lambda m, i=i: m.layers[i].attn.beta
+
+        if attn.timenorm.weight is not None:
+            yield f"{prefix}.timenorm.weight", lambda m, i=i: m.layers[i].attn.timenorm.weight
+        if attn.timenorm.bias is not None:
+            yield f"{prefix}.timenorm.bias", lambda m, i=i: m.layers[i].attn.timenorm.bias
+        if attn.rmsnorm.gamma is not None:
+            yield f"{prefix}.rmsnorm.gamma", lambda m, i=i: m.layers[i].attn.rmsnorm.gamma
+
+        if layer.ffn.norm.weight is not None:
+            yield f"layers.{i}.ffn.norm.weight", lambda m, i=i: m.layers[i].ffn.norm.weight
+        if layer.ffn.norm.bias is not None:
+            yield f"layers.{i}.ffn.norm.bias", lambda m, i=i: m.layers[i].ffn.norm.bias
+        if layer.ffn.alpha is not None:
+            yield f"layers.{i}.ffn.alpha", lambda m, i=i: m.layers[i].ffn.alpha
+
+    if core.norm.weight is not None:
+        yield "norm.weight", lambda m: m.norm.weight
+    if core.norm.bias is not None:
+        yield "norm.bias", lambda m: m.norm.bias
 
 
 def _iter_sensitive_params(
@@ -34,37 +71,8 @@ def _iter_sensitive_params(
     """
     core = model.model if isinstance(model, MegalodonForCausalLM) else model
 
-    for i, layer in enumerate(core.layers):
-        attn = layer.attn
-        prefix = f"layers.{i}.attn"
-
-        yield f"{prefix}.cema.alpha", attn.cema.alpha
-        yield f"{prefix}.cema.delta", attn.cema.delta
-        yield f"{prefix}.cema.theta", attn.cema.theta
-        yield f"{prefix}.cema.gamma_real", attn.cema.gamma_real
-        yield f"{prefix}.cema.gamma_imag", attn.cema.gamma_imag
-        yield f"{prefix}.cema.omega", attn.cema.omega
-        yield f"{prefix}.gamma", attn.gamma
-        yield f"{prefix}.beta", attn.beta
-
-        if attn.timenorm.weight is not None:
-            yield f"{prefix}.timenorm.weight", attn.timenorm.weight
-        if attn.timenorm.bias is not None:
-            yield f"{prefix}.timenorm.bias", attn.timenorm.bias
-        if attn.rmsnorm.gamma is not None:
-            yield f"{prefix}.rmsnorm.gamma", attn.rmsnorm.gamma
-
-        if layer.ffn.norm.weight is not None:
-            yield f"layers.{i}.ffn.norm.weight", layer.ffn.norm.weight
-        if layer.ffn.norm.bias is not None:
-            yield f"layers.{i}.ffn.norm.bias", layer.ffn.norm.bias
-        if layer.ffn.alpha is not None:
-            yield f"layers.{i}.ffn.alpha", layer.ffn.alpha
-
-    if core.norm.weight is not None:
-        yield "norm.weight", core.norm.weight
-    if core.norm.bias is not None:
-        yield "norm.bias", core.norm.bias
+    for name, select in _iter_sensitive_paths(core):
+        yield name, select(core)
 
 
 def audit_sensitive_param_dtypes(
@@ -99,90 +107,14 @@ def ensure_sensitive_param_dtype(
     :return MegalodonForCausalLM | MegalodonModel: Updated model.
     """
 
-    def cast_if_present(arr: Array | None) -> Array | None:
-        """Cast array to dtype when present.
-
-        :param Array | None arr: Array to cast (optional).
-        :return Array | None: Casted array or None.
-        """
-        return arr.astype(dtype) if arr is not None else None
-
     def update_core(core: MegalodonModel) -> MegalodonModel:
         """Cast precision-sensitive parameters for a core MegalodonModel.
 
         :param MegalodonModel core: Model to update.
         :return MegalodonModel: Updated model.
         """
-        for i, layer in enumerate(core.layers):
-            attn = layer.attn
-            core = eqx.tree_at(
-                lambda m: m.layers[i].attn.cema.alpha, core, attn.cema.alpha.astype(dtype)
-            )
-            core = eqx.tree_at(
-                lambda m: m.layers[i].attn.cema.delta, core, attn.cema.delta.astype(dtype)
-            )
-            core = eqx.tree_at(
-                lambda m: m.layers[i].attn.cema.theta, core, attn.cema.theta.astype(dtype)
-            )
-            core = eqx.tree_at(
-                lambda m: m.layers[i].attn.cema.gamma_real,
-                core,
-                attn.cema.gamma_real.astype(dtype),
-            )
-            core = eqx.tree_at(
-                lambda m: m.layers[i].attn.cema.gamma_imag,
-                core,
-                attn.cema.gamma_imag.astype(dtype),
-            )
-            core = eqx.tree_at(
-                lambda m: m.layers[i].attn.cema.omega, core, attn.cema.omega.astype(dtype)
-            )
-            core = eqx.tree_at(lambda m: m.layers[i].attn.gamma, core, attn.gamma.astype(dtype))
-            core = eqx.tree_at(lambda m: m.layers[i].attn.beta, core, attn.beta.astype(dtype))
-
-            if attn.timenorm.weight is not None:
-                core = eqx.tree_at(
-                    lambda m: m.layers[i].attn.timenorm.weight,
-                    core,
-                    cast_if_present(attn.timenorm.weight),
-                )
-            if attn.timenorm.bias is not None:
-                core = eqx.tree_at(
-                    lambda m: m.layers[i].attn.timenorm.bias,
-                    core,
-                    cast_if_present(attn.timenorm.bias),
-                )
-            if attn.rmsnorm.gamma is not None:
-                core = eqx.tree_at(
-                    lambda m: m.layers[i].attn.rmsnorm.gamma,
-                    core,
-                    cast_if_present(attn.rmsnorm.gamma),
-                )
-
-            if layer.ffn.norm.weight is not None:
-                core = eqx.tree_at(
-                    lambda m: m.layers[i].ffn.norm.weight,
-                    core,
-                    cast_if_present(layer.ffn.norm.weight),
-                )
-            if layer.ffn.norm.bias is not None:
-                core = eqx.tree_at(
-                    lambda m: m.layers[i].ffn.norm.bias,
-                    core,
-                    cast_if_present(layer.ffn.norm.bias),
-                )
-            if layer.ffn.alpha is not None:
-                core = eqx.tree_at(
-                    lambda m: m.layers[i].ffn.alpha,
-                    core,
-                    cast_if_present(layer.ffn.alpha),
-                )
-
-        if core.norm.weight is not None:
-            core = eqx.tree_at(lambda m: m.norm.weight, core, cast_if_present(core.norm.weight))
-        if core.norm.bias is not None:
-            core = eqx.tree_at(lambda m: m.norm.bias, core, cast_if_present(core.norm.bias))
-
+        for _, select in _iter_sensitive_paths(core):
+            core = eqx.tree_at(select, core, select(core).astype(dtype))
         return core
 
     if isinstance(model, MegalodonForCausalLM):
