@@ -428,6 +428,52 @@ class TestAttentionPrimitives:
         np.testing.assert_allclose(np.array(out_default), np.array(out_mono), rtol=1e-5, atol=1e-5)
         assert not np.allclose(np.array(out_default), np.array(out_shifted))
 
+    def test_masked_multi_chunk_is_invariant_to_aligned_calls(self, random_seed: int) -> None:
+        """Masks preserve results when calls split only at source chunk boundaries."""
+        batch, length, heads, head_dim, value_dim = 2, 12, 2, 4, 3
+        chunk_size = 4
+        key = jax.random.PRNGKey(random_seed)
+        kq, kk, kv = jax.random.split(key, 3)
+        q = jax.random.normal(kq, (batch, length, heads, head_dim))
+        k = jax.random.normal(kk, (batch, length, heads, head_dim))
+        v = jax.random.normal(kv, (batch, length, heads, value_dim))
+        mask = jnp.asarray(
+            [
+                [True, False, True, True, True, True, False, True, True, False, True, True],
+                [True, True, False, True, False, True, True, True, True, True, False, True],
+            ]
+        )
+        rotary = RotaryEmbedding(dim=head_dim)
+
+        full = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=jnp.asarray(0, dtype=jnp.int32),
+            rotary=rotary,
+            mask=mask,
+        )
+        for partition in ((4, 8), (8, 4), (4, 4, 4)):
+            pieces = []
+            start = 0
+            for width in partition:
+                stop = start + width
+                pieces.append(
+                    attention_multi_chunk(
+                        q[:, start:stop],
+                        k[:, start:stop],
+                        v[:, start:stop],
+                        chunk_size=chunk_size,
+                        start_index=jnp.asarray(start, dtype=jnp.int32),
+                        rotary=rotary,
+                        mask=mask[:, start:stop],
+                    )
+                )
+                start = stop
+            actual = jnp.concatenate(pieces, axis=1)
+            np.testing.assert_allclose(np.asarray(actual), np.asarray(full), atol=2e-6, rtol=2e-6)
+
 
 # -----------------------------------------------------------------------------
 # ChunkedAttention Tests
@@ -436,6 +482,74 @@ class TestAttentionPrimitives:
 
 class TestChunkedAttention:
     """Tests for ChunkedAttention module."""
+
+    def test_chunk_local_matches_dense_oracle_across_restarts(
+        self,
+        random_seed: int,
+    ) -> None:
+        """Cached chunk-local attention matches an independent restart-aware oracle."""
+        batch, length, heads, head_dim, value_dim = 2, 11, 2, 4, 3
+        chunk_size = 4
+        key = jax.random.PRNGKey(random_seed)
+        k_module, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+            key=k_module,
+        )
+        q = jax.random.normal(kq, (batch, length, heads, head_dim))
+        k = jax.random.normal(kk, (batch, length, heads, head_dim))
+        v = jax.random.normal(kv, (batch, length, heads, value_dim))
+
+        def chunk_local_rope(values: np.ndarray) -> np.ndarray:
+            """Apply adjacent-pair RoPE with source-chunk position restarts."""
+            pairs = values.reshape(batch, length, heads, head_dim // 2, 2)
+            frequencies = 10_000.0 ** (-np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
+            positions = np.arange(length, dtype=np.float32) % chunk_size
+            angles = positions[:, None] * frequencies[None, :]
+            cosine = np.cos(angles)[None, :, None, :]
+            sine = np.sin(angles)[None, :, None, :]
+            rotated = np.empty_like(pairs)
+            rotated[..., 0] = pairs[..., 0] * cosine - pairs[..., 1] * sine
+            rotated[..., 1] = pairs[..., 0] * sine + pairs[..., 1] * cosine
+            return rotated.reshape(values.shape)
+
+        q_dense = chunk_local_rope(np.asarray(q))
+        k_dense = chunk_local_rope(np.asarray(k))
+        v_dense = np.asarray(v)
+        expected = np.empty((batch, length, heads, value_dim), dtype=np.float32)
+        for query_index in range(length):
+            key_start = query_index - query_index % chunk_size
+            valid_k = k_dense[:, key_start : query_index + 1]
+            scores = np.einsum("bhd,bshd->bhs", q_dense[:, query_index], valid_k)
+            scores -= np.max(scores, axis=-1, keepdims=True)
+            weights = np.exp(scores)
+            weights /= np.sum(weights, axis=-1, keepdims=True)
+            expected[:, query_index] = np.einsum(
+                "bhs,bshv->bhv",
+                weights,
+                v_dense[:, key_start : query_index + 1],
+            )
+
+        outputs = []
+        cache = None
+        offset = 0
+        for width in (3, 1, 5, 2):
+            part, cache, _ = module(
+                q[:, offset : offset + width],
+                k[:, offset : offset + width],
+                v[:, offset : offset + width],
+                cache=cache,
+                return_cache=True,
+            )
+            outputs.append(part)
+            offset += width
+        actual = jnp.concatenate(outputs, axis=1)
+
+        assert cache is not None and int(cache.count) == length
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=2e-6)
 
     def test_sliding_window_matches_dense_oracle_after_wraparound(
         self,
@@ -711,13 +825,15 @@ class TestChunkedAttention:
             assert max(errors.values()) <= 2e-6
 
     @pytest.mark.parametrize("attention_window", [None, 8])
+    @pytest.mark.parametrize("deterministic", [True, False])
     @pytest.mark.fast
     def test_pristine_prefill_has_no_sequence_loop(
         self,
         random_seed: int,
         attention_window: int | None,
+        deterministic: bool,
     ) -> None:
-        """Vectorized prompt prefill must not lower to a tokenwise while loop."""
+        """Zero-dropout prompt prefill stays vectorized in either execution mode."""
         key = jax.random.PRNGKey(random_seed)
         module_key, q_key, k_key, v_key = jax.random.split(key, 4)
         module = ChunkedAttention(
@@ -732,7 +848,26 @@ class TestChunkedAttention:
         k = jax.random.normal(k_key, (1, 12, 2, 8))
         v = jax.random.normal(v_key, (1, 12, 2, 6))
 
-        lowered = jax.jit(lambda q, k, v: module(q, k, v, return_cache=True)).lower(q, k, v)
+        expected, _, _ = module(q, k, v, deterministic=deterministic)
+        actual, cache, _ = module(
+            q,
+            k,
+            v,
+            return_cache=True,
+            deterministic=deterministic,
+        )
+        assert cache is not None and int(cache.count) == q.shape[1]
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=2e-6)
+
+        lowered = jax.jit(
+            lambda q, k, v: module(
+                q,
+                k,
+                v,
+                return_cache=True,
+                deterministic=deterministic,
+            )
+        ).lower(q, k, v)
         stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
 
         assert "stablehlo.while" not in stablehlo

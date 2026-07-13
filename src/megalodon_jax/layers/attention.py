@@ -717,10 +717,11 @@ class ChunkedAttention(eqx.Module):
                 )
             return out, None, jnp.asarray(length, dtype=jnp.int32)
 
-        # Pristine deterministic prefill has no history-dependent input. Its
-        # outputs are the normal vectorized attention result; only the final
-        # fixed-capacity ring state needs to be materialized for continuation.
-        if cache is None and return_cache and deterministic and length > 0:
+        # Pristine prefill has no history-dependent input. When attention
+        # dropout is inactive, its outputs are the normal vectorized result;
+        # only the fixed-capacity ring state needs to be materialized.
+        attention_dropout_active = not deterministic and self.attention_dropout > 0.0
+        if cache is None and return_cache and not attention_dropout_active and length > 0:
             return self._prefill(q, k, v, deterministic, key)
 
         capacity = self.cache_capacity

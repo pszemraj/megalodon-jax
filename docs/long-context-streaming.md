@@ -73,11 +73,12 @@ sequenceDiagram
 
 - `attention_window=None` is the released chunk-local behavior. The fixed ring capacity is `chunk_size`, and attention/RoPE restart at each source chunk boundary.
 - `attention_window=W` enables the intentional fixed-width sliding-window extension with ring capacity `W` and a per-query age mask.
+- Uncached sliding-window attention materializes dense sequence-by-sequence scores and masks before applying the window, so training and prompt prefill remain O(L^2) in sequence length. Cached continuation uses the fixed-width ring. TODO: replace the uncached extension with banded or blocked attention before treating it as a long-sequence training path.
 - Both modes are invariant to call partitioning: full calls, arbitrary chunks, token-by-token calls, and save/reload continuation produce the same outputs for identical semantics.
 
 ## Cache integrity and indexing
 
-Direct `MegalodonBlock` calls accept either a sparse zero-history `LayerCache` or complete attention, TimestepNorm, and CEMA state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, non-finite means or variances, and negative variances. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V and EMA payload as described in [Inference cache persistence](jax-torch.md#inference-cache-persistence).
+Direct `MegalodonBlock` calls accept either a sparse zero-history `LayerCache` or complete attention, TimestepNorm, and CEMA state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, non-finite normalization or EMA state, and negative variances. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V payload as described in [Inference cache persistence](jax-torch.md#inference-cache-persistence).
 
 `index_cache(cache, indices)` reorders or duplicates allocated batch state for beam search. Indices must be a rank-one integer array within the allocated batch range; repeated, reordered, and empty selections are supported. A sparse cache without allocated batch state accepts only an empty selection.
 

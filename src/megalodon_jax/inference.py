@@ -399,9 +399,9 @@ def _generate_core(
 ) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
     """Autoregressive generation using a fixed-shape scan.
 
-    If return_cache is True and max_new_tokens == 1, the cache is advanced to
-    include the generated token. If sampling is enabled (temperature > 0),
-    the returned key is the next key to use for subsequent sampling calls.
+    If return_cache is True, the returned cache includes the prompt and every
+    generated token. If sampling is enabled (temperature > 0), the returned
+    key is the next key to use for subsequent sampling calls.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
@@ -488,7 +488,6 @@ def _generate_core(
     finished = jnp.zeros((B,), dtype=jnp.bool_)
     if eos_token_id is not None:
         finished = first_token == eos_token_id
-        first_token = jnp.where(finished, eos_token_id, first_token)
 
     if needs_rng:
 
