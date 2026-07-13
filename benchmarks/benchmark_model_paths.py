@@ -34,8 +34,7 @@ Examples::
         --repo current=. \
         --output local-scratch/model-paths-current.json
 
-    # Compare clean current/main worktrees with the same XLA configuration.
-    XLA_FLAGS=--xla_gpu_enable_triton_gemm=false \
+    # Compare clean current/main worktrees with the default XLA configuration.
     conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
         --repo current=. --repo main=/tmp/megalodon-jax-main \
         --suite inference --inference-lengths 64,512,2048,4096 \
