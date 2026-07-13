@@ -21,11 +21,13 @@ or OOM from destroying the rest of a long benchmark. Workers import
 the current branch and historical ``main`` can be measured with the exact same
 driver and environment.
 
-The canonical model is the untied-output, roughly 188M-parameter configuration
-used by the modeling-remediation performance comparisons. Configuration fields
-are selected by dataclass introspection, allowing the same request to target
-both the current API and older checkouts whose precision or cache field names
-differ.
+The canonical cross-revision model uses tied embedding/output weights so its
+parameter topology remains comparable with historical revisions that inferred
+tying from output shape. Pass ``--config-json '{"share_emb": false}'`` to
+measure the current untied production topology separately. Configuration
+fields are selected by dataclass introspection, allowing the same request to
+target both the current API and older checkouts whose precision or cache field
+names differ.
 
 Examples::
 
@@ -76,7 +78,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
-Status = Literal["passed", "oom", "timeout", "failed"]
+Status = Literal["passed", "completed_noncomparable", "oom", "timeout", "failed"]
 
 CANONICAL_CONFIG: dict[str, Any] = {
     "vocab_size": 16_000,
@@ -95,7 +97,7 @@ CANONICAL_CONFIG: dict[str, Any] = {
     "swiglu": False,
     "rescale_nffn": False,
     "scale_emb": False,
-    "share_emb": False,
+    "share_emb": True,
     "norm_affine": True,
     "dropout": 0.0,
     "attention_dropout": 0.0,
@@ -124,6 +126,15 @@ SOURCE_PATHS = (
     "src/megalodon_jax/layers/complex_ema.py",
     "src/megalodon_jax/layers/timestep_norm.py",
 )
+
+CUDA_PACKAGE_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "jax_cuda13_plugin": ("jax-cuda13-plugin",),
+    "jax_cuda13_pjrt": ("jax-cuda13-pjrt",),
+    "cublas": ("nvidia-cublas-cu13", "nvidia-cublas"),
+    "cuda_runtime": ("nvidia-cuda-runtime-cu13", "nvidia-cuda-runtime"),
+    "cudnn": ("nvidia-cudnn-cu13", "nvidia-cudnn"),
+    "cufft": ("nvidia-cufft-cu13", "nvidia-cufft"),
+}
 
 INFERENCE_OPERATIONS = (
     "noncached",
@@ -315,6 +326,14 @@ def _case_id(case: Mapping[str, Any]) -> str:
     return "--".join(str(field).replace("_", "-") for field in fields)
 
 
+def _case_profile_dir(case: Mapping[str, Any]) -> Path | None:
+    """Return the isolated XProf output directory requested for one case."""
+    root = case.get("profile_root")
+    if root is None:
+        return None
+    return Path(str(root)) / str(case["case_id"])
+
+
 def _build_cases(
     args: argparse.Namespace, repos: Sequence[tuple[str, Path]]
 ) -> list[dict[str, Any]]:
@@ -350,6 +369,9 @@ def _build_cases(
         if args.atol is None and args.rtol is None
         else "explicit",
         "config_overrides": config_overrides,
+        "profile_root": str(args.profile_dir.expanduser().resolve())
+        if args.profile_dir is not None
+        else None,
     }
     cases: list[dict[str, Any]] = []
     for repo_name, repo_root in repos:
@@ -440,11 +462,17 @@ def _supervisor(args: argparse.Namespace) -> int:
             "timeout_seconds": args.timeout_seconds,
             "warmups": args.warmups,
             "iterations": args.iterations,
+            "profile_directory": str(args.profile_dir.expanduser().resolve())
+            if args.profile_dir is not None
+            else None,
         },
         "repositories": provenances,
         "planned_cases": len(cases),
         "completed_cases": 0,
-        "summary": {status: 0 for status in ("passed", "oom", "timeout", "failed")},
+        "summary": {
+            status: 0
+            for status in ("passed", "completed_noncomparable", "oom", "timeout", "failed")
+        },
         "cases": [],
         "case_plan": cases if args.dry_run else None,
     }
@@ -544,6 +572,8 @@ def _supervisor(args: argparse.Namespace) -> int:
             run["status"] = "interrupted"
         elif run["summary"]["failed"] or run["summary"]["oom"] or run["summary"]["timeout"]:
             run["status"] = "completed_with_failures"
+        elif run["summary"]["completed_noncomparable"]:
+            run["status"] = "completed_with_noncomparable"
         else:
             run["status"] = "passed"
         _atomic_json(output, run)
@@ -586,7 +616,12 @@ def _worker_numpy() -> Any:
 
 
 def _measure(
-    jax: Any, compiled: Any, arguments: tuple[Any, ...], warmups: int, iterations: int
+    jax: Any,
+    compiled: Any,
+    arguments: tuple[Any, ...],
+    warmups: int,
+    iterations: int,
+    profile_dir: Path | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Measure one compiled executable with explicit synchronization."""
     for _ in range(warmups):
@@ -598,7 +633,18 @@ def _measure(
         result = compiled(*arguments)
         _block_tree(jax, result)
         samples.append((time.perf_counter_ns() - started) / 1e6)
-    return _timing_summary(samples), result
+    summary = _timing_summary(samples)
+    if profile_dir is not None:
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        with jax.profiler.trace(profile_dir, create_perfetto_link=False):
+            profile_result = compiled(*arguments)
+            _block_tree(jax, profile_result)
+        summary["xprof_trace"] = {
+            "directory": str(profile_dir),
+            "timing_excluded": True,
+            "profiled_iterations": 1,
+        }
+    return summary, result
 
 
 def _public_attributes(value: Any) -> dict[str, Any]:
@@ -668,6 +714,59 @@ def _compiler_metadata(lowered: Any, compiled: Any) -> dict[str, Any]:
     return {"stablehlo": stablehlo_record, "cost_analysis": cost, "memory_analysis": memory}
 
 
+def _installed_package_versions(
+    candidates: Mapping[str, Sequence[str]] = CUDA_PACKAGE_CANDIDATES,
+) -> dict[str, Any]:
+    """Resolve CUDA packages across suffixed and unsuffixed wheel names."""
+    records: dict[str, Any] = {}
+    for component, distributions in candidates.items():
+        installed = []
+        for distribution in distributions:
+            try:
+                version = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+            installed.append({"distribution": distribution, "version": version})
+        records[component] = {
+            "installed": installed,
+            "searched_distributions": list(distributions),
+        }
+    return records
+
+
+def _command_provenance(command: Sequence[str]) -> dict[str, Any]:
+    """Run a read-only environment probe without making benchmarks depend on it."""
+    try:
+        result = subprocess.run(
+            list(command),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        return {
+            "available": False,
+            "command": list(command),
+            "error": f"{type(error).__name__}: {error}",
+        }
+    return {
+        "available": result.returncode == 0,
+        "command": list(command),
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+def _nvidia_driver_version(nvidia_smi: Mapping[str, Any]) -> str | None:
+    """Extract the NVIDIA driver version from full ``nvidia-smi`` output."""
+    if not nvidia_smi.get("available"):
+        return None
+    match = re.search(r"Driver Version:\s*([^\s|]+)", str(nvidia_smi.get("stdout", "")))
+    return match.group(1) if match is not None else None
+
+
 def _environment(jax: Any, eqx: Any, np: Any) -> dict[str, Any]:
     """Capture runtime, device, and compiler-affecting environment details."""
     devices = []
@@ -684,14 +783,26 @@ def _environment(jax: Any, eqx: Any, np: Any) -> dict[str, Any]:
         except Exception:
             record["memory_stats"] = None
         devices.append(record)
-    relevant_environment = {
-        key: value
-        for key, value in sorted(os.environ.items())
-        if key == "CUDA_VISIBLE_DEVICES"
-        or key == "NVIDIA_TF32_OVERRIDE"
-        or key == "XLA_FLAGS"
-        or key.startswith("JAX_")
-    }
+    fixed_environment = (
+        "CUDA_VISIBLE_DEVICES",
+        "LD_LIBRARY_PATH",
+        "NVIDIA_TF32_OVERRIDE",
+        "PATH",
+        "XLA_FLAGS",
+    )
+    relevant_environment = {key: os.environ.get(key) for key in fixed_environment}
+    relevant_environment.update(
+        {
+            key: value
+            for key, value in sorted(os.environ.items())
+            if key.startswith("JAX_") and key not in relevant_environment
+        }
+    )
+    nvidia_smi = _command_provenance(("nvidia-smi",))
+    try:
+        jax_environment_info = jax.print_environment_info(return_string=True)
+    except Exception as error:
+        jax_environment_info = f"unavailable: {type(error).__name__}: {error}"
     try:
         x64_enabled = bool(jax.config.read("jax_enable_x64"))
     except Exception:
@@ -707,6 +818,10 @@ def _environment(jax: Any, eqx: Any, np: Any) -> dict[str, Any]:
         "x64_enabled": x64_enabled,
         "devices": devices,
         "environment": relevant_environment,
+        "cuda_packages": _installed_package_versions(),
+        "nvidia_driver_version": _nvidia_driver_version(nvidia_smi),
+        "nvidia_smi": nvidia_smi,
+        "jax_environment_info": jax_environment_info,
     }
 
 
@@ -751,7 +866,7 @@ def _make_config(
             value = str(jnp.dtype(value))
         resolved[field.name] = _jsonable(value)
     manifest = {
-        "profile": "canonical_188m",
+        "profile": "canonical_cross_revision_tied",
         "requested": requested,
         "applied_fields": sorted(applied),
         "omitted_unsupported_fields": sorted(set(requested) - fields),
@@ -827,8 +942,21 @@ def _comparability_manifest(
         "training_topology_comparable": topology_matches,
         "this_case_topology_sensitive": topology_sensitive,
         "this_case_topology_comparable": not topology_sensitive or topology_matches,
+        "eligible_for_cross_revision_ratio": not topology_sensitive or topology_matches,
         "note": note,
     }
+
+
+def _completed_case_status(
+    correctness_passed: bool,
+    comparability: Mapping[str, Any],
+) -> Status:
+    """Classify a completed case without presenting incomparable timing as passed."""
+    if not correctness_passed:
+        return "failed"
+    if not comparability["this_case_topology_comparable"]:
+        return "completed_noncomparable"
+    return "passed"
 
 
 def _device_inputs(
@@ -896,6 +1024,7 @@ def _lower_compile_measure(
     arguments: tuple[Any, ...],
     warmups: int,
     iterations: int,
+    profile_dir: Path | None = None,
 ) -> tuple[dict[str, Any], Any]:
     """Lower, compile, analyze, and measure an Equinox-filtered callable."""
     started = time.perf_counter_ns()
@@ -903,7 +1032,14 @@ def _lower_compile_measure(
     lower_ms = (time.perf_counter_ns() - started) / 1e6
     compiled, compile_ms = _compile(jax, lowered)
     compiler = _compiler_metadata(lowered, compiled)
-    timing, result = _measure(jax, compiled, arguments, warmups, iterations)
+    timing, result = _measure(
+        jax,
+        compiled,
+        arguments,
+        warmups,
+        iterations,
+        profile_dir,
+    )
     return {
         "lower_ms": lower_ms,
         "compile_ms": compile_ms,
@@ -1093,6 +1229,7 @@ def _inference_case(
         arguments,
         int(case["warmups"]),
         int(case["iterations"]),
+        _case_profile_dir(case),
     )
     if operation == "lm_ttft":
         actual_logits, actual_token, result_cache = result
@@ -1191,6 +1328,7 @@ def _training_case(
         arguments,
         int(case["warmups"]),
         int(case["iterations"]),
+        _case_profile_dir(case),
     )
     if case["operation"] == "forward_backward":
         loss, gradients = result
@@ -1336,7 +1474,7 @@ def _worker(spec_path: Path, result_path: Path) -> int:
         metrics["runtime_device_memory"] = _device_memory_stats(jax)
         base["metrics"] = metrics
         base["correctness"] = correctness
-        base["status"] = "passed" if correctness["passed"] else "failed"
+        base["status"] = _completed_case_status(correctness["passed"], base["comparability"])
         if not correctness["passed"]:
             base["error"] = {
                 "type": "CorrectnessFailure",
@@ -1355,7 +1493,7 @@ def _worker(spec_path: Path, result_path: Path) -> int:
         base["worker_wall_seconds"] = time.perf_counter() - worker_started
         _atomic_json(result_path, base)
     print(f"{case['case_id']}: {base['status']}")
-    return 0 if base["status"] == "passed" else 1
+    return 0 if base["status"] in {"passed", "completed_noncomparable"} else 1
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -1416,6 +1554,14 @@ def _parser() -> argparse.ArgumentParser:
         "--output",
         type=Path,
         default=Path("local-scratch/model-path-benchmark.json"),
+    )
+    parser.add_argument(
+        "--profile-dir",
+        type=Path,
+        help=(
+            "Optional XProf output root; each worker records one extra synchronized "
+            "iteration outside timing in its own case directory"
+        ),
     )
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument("--allow-unknown-revision", action="store_true")

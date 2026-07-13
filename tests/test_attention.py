@@ -19,7 +19,7 @@ from megalodon_jax.layers import (
     attention_single_chunk,
 )
 from megalodon_jax.types import AttentionCache
-from tools.verify_modeling_correctness import cache_partition_errors
+from tests.reference.cache import cache_partition_errors
 
 
 @pytest.mark.parametrize("probability", [-0.1, 1.0])
@@ -699,6 +699,7 @@ class TestChunkedAttention:
             assert errors["cache_v"] == 0.0
             assert errors["cache_count"] == 0.0
 
+    @pytest.mark.fast
     def test_pristine_prefill_partition_smoke(self, random_seed: int) -> None:
         """Routine gate covers faithful and sliding prefill with one uneven split."""
         for attention_window in (None, 8):
@@ -710,6 +711,7 @@ class TestChunkedAttention:
             assert max(errors.values()) <= 2e-6
 
     @pytest.mark.parametrize("attention_window", [None, 8])
+    @pytest.mark.fast
     def test_pristine_prefill_has_no_sequence_loop(
         self,
         random_seed: int,

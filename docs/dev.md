@@ -17,6 +17,8 @@ The routine CPU gate covers the highest-value model, cache, conversion, and sour
 JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= conda run --name mega-jax pytest -m fast
 ```
 
+Tests join this gate through an explicit `@pytest.mark.fast` declaration at the test site. CPU runs do not force garbage collection around every test; set `MEGALODON_TEST_AGGRESSIVE_CLEANUP=1` only when running in a constrained environment that benefits from it. Accelerator runs retain per-test cleanup to reduce cross-test device-memory pressure.
+
 Run the complete suite on the selected JAX backend before merging modeling changes:
 
 ```bash
@@ -51,6 +53,8 @@ The verifier writes explicit skipped results and exits nonzero when an executed 
 
 `benchmarks/benchmark_model_paths.py` measures synchronized production inference and training paths in isolated worker processes. Compilation is reported separately from runtime, and the output records repository revisions, configuration, environment, correctness checks, median, p90, and memory data.
 
+The cross-revision default uses tied embedding/output weights because historical `main` inferred tying for vocabulary-sized outputs. Measure the current untied production topology separately with `--config-json '{"share_emb": false}'`. Topology-sensitive cases that cannot match the requested topology are recorded as `completed_noncomparable` and excluded from cross-revision timing ratios.
+
 Run the benchmark with the default compiler configuration. Do not mix results produced with different `XLA_FLAGS` or CUDA library search paths.
 
 ```bash
@@ -74,3 +78,5 @@ conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
 ```
 
 Use `benchmarks/benchmark_cema_reset.py` for the isolated FFT, associative packed, and sequential CEMA paths. Benchmark representative sequence shapes and masks: an all-valid `attention_mask` intentionally exercises the general masked path, while `attention_mask=None` selects the unmasked path described in [Long-context streaming](long-context-streaming.md#padding-and-generation).
+
+Benchmark JSON records the installed JAX CUDA plugin/PJRT and CUDA library wheels, NVIDIA driver and `nvidia-smi` output, compiler-affecting paths and environment variables, and `jax.print_environment_info()`. Add `--profile-dir PATH` to capture one extra synchronized iteration per case as an XProf trace without contaminating timing samples; select a narrow operation and shape matrix when profiling.
