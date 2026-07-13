@@ -211,8 +211,13 @@ class MegalodonBlock(eqx.Module):
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
         :param bool _cache_validated: Internal signal that model cache counts were checked.
+        :raises ValueError: If cache state is requested during nondeterministic execution.
         :return tuple[Float[Array, "batch seq dim"], LayerCache | None]: Output and cache.
         """
+        if not deterministic and (cache is not None or return_cache):
+            raise ValueError(
+                "cache input and return_cache are inference-only; use deterministic=True"
+            )
         # CRITICAL: Two-hop residual - save BEFORE attention
         residual_base = x
 

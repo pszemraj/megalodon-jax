@@ -32,6 +32,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, layer_cache_invariant_violation
 from megalodon_jax.config import AttentionDropoutMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
@@ -609,6 +610,9 @@ class ChunkedAttention(eqx.Module):
             absolute_times % self.chunk_size if self.attention_window is None else absolute_times
         )
 
+        # Recompute only the retained tail instead of widening every vectorized
+        # attention helper to retain rotated keys. XLA removes the unused query
+        # rotation below, and the bounded tail work is negligible beside prefill.
         def rotate_key_at_position(q_t: Array, k_t: Array, position: Array) -> Array:
             """Match the scalar-position rotation used by tokenwise decode.
 
@@ -1052,6 +1056,21 @@ class MegalodonAttention(eqx.Module):
         Dh = self.head_dim
         Dv = self.value_head_dim
 
+        if cache is not None and not _cache_validated:
+            x = eqx.error_if(
+                x,
+                layer_cache_invariant_violation(
+                    cache,
+                    batch_size=B,
+                    increment=L,
+                ),
+                CACHE_INVARIANT_MESSAGE,
+            )
+            if cache.attn is None and cache.norm is None and cache.ema is None:
+                # Canonicalize the sparse zero-history public representation.
+                cache = None
+            _cache_validated = True
+
         x = x.astype(self.compute_dtype)
 
         # Split keys for dropout (4 keys: attention, mx_dropout, gated_dropout, output_dropout)
@@ -1133,12 +1152,7 @@ class MegalodonAttention(eqx.Module):
 
         # Inner attention
         if cache is not None and attn_cache is None:
-            capacity = self.inner.cache_capacity
-            attn_cache = AttentionCache(
-                k=jnp.zeros((B, capacity, H, Dh), dtype=k.dtype),
-                v=jnp.zeros((B, capacity, H, Dv), dtype=v.dtype),
-                count=jnp.asarray(0, dtype=jnp.int32),
-            )
+            raise ValueError(CACHE_INVARIANT_MESSAGE)
         out, new_attn_cache, new_position = self.inner(
             q,
             k,

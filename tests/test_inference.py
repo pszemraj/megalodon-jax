@@ -42,6 +42,7 @@ def small_config() -> MegalodonConfig:
     return tiny_config()
 
 
+@pytest.mark.fast
 class TestCacheUtilities:
     """Cache initialization and batch-indexing helpers."""
 
@@ -103,6 +104,50 @@ class TestCacheUtilities:
             np.array(k_mod[1]),
         )
 
+        reordered = index_cache(cache_mod, jnp.asarray([1, 0, 1], dtype=jnp.int32))
+        assert reordered.layer_caches[0] is not None
+        assert reordered.layer_caches[0].attn is not None
+        np.testing.assert_allclose(
+            np.asarray(reordered.layer_caches[0].attn.k[:, 0, 0, 0]),
+            np.asarray([2.0, 1.0, 2.0]),
+        )
+
+        empty = index_cache(cache_mod, jnp.asarray([], dtype=jnp.int32))
+        assert empty.layer_caches[0] is not None
+        assert empty.layer_caches[0].attn is not None
+        assert empty.layer_caches[0].attn.k.shape[0] == 0
+
+    def test_index_cache_rejects_invalid_indices(self) -> None:
+        """Beam-parent selection rejects ambiguous or out-of-range indices."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        _, cache = model(
+            jnp.asarray([[1, 2], [3, 4]], dtype=jnp.int32),
+            return_cache=True,
+        )
+        assert cache is not None
+
+        with pytest.raises(ValueError, match="rank one"):
+            index_cache(cache, jnp.asarray([[0]], dtype=jnp.int32))
+        for invalid_dtype in (
+            jnp.asarray([0.0], dtype=jnp.float32),
+            jnp.asarray([True], dtype=jnp.bool_),
+        ):
+            with pytest.raises(TypeError, match="integer dtype"):
+                index_cache(cache, invalid_dtype)
+
+        for invalid in (
+            jnp.asarray([-1], dtype=jnp.int32),
+            jnp.asarray([2], dtype=jnp.int32),
+        ):
+            with pytest.raises(Exception, match="cache indices must be in"):
+                jax.block_until_ready(index_cache(cache, invalid))
+
+        with pytest.raises(ValueError, match="without allocated batch state"):
+            index_cache(init_cache(config), jnp.asarray([0], dtype=jnp.int32))
+        empty_sparse = index_cache(init_cache(config), jnp.asarray([], dtype=jnp.int32))
+        assert empty_sparse == init_cache(config)
+
     def test_explicit_pristine_and_none_cache_match(self) -> None:
         """The public sparse initializer is equivalent to an omitted cache."""
         config = small_config()
@@ -127,6 +172,7 @@ class TestCacheUtilities:
             np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
+@pytest.mark.fast
 class TestSamplingAndGeneration:
     """Sampling primitives and generation loop."""
 
@@ -301,23 +347,55 @@ class TestSamplingAndGeneration:
                 temperature=0.0,
             )
 
-    def test_generate_zero_new_tokens_raises(self) -> None:
-        """Ensure generate rejects zero-length outputs.
-
-        :return None: None.
-        """
+    @pytest.mark.parametrize("max_new_tokens", [-1, 0, 1.5, True])
+    def test_generate_rejects_invalid_max_new_tokens(self, max_new_tokens: object) -> None:
+        """Generation lengths must be positive integer values, excluding booleans."""
         config = small_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
-        with pytest.raises(ValueError, match="max_new_tokens"):
+        with pytest.raises(ValueError, match="positive integer"):
             generate(
                 model,
                 prompt,
-                max_new_tokens=0,
+                max_new_tokens=max_new_tokens,
                 key=jax.random.PRNGKey(0),
                 temperature=0.0,
             )
+
+    @pytest.mark.parametrize("name", ["bos_token_id", "eos_token_id"])
+    @pytest.mark.parametrize("token_id", [-1, 1.5, True, 64])
+    def test_generate_rejects_invalid_special_token_override(
+        self, name: str, token_id: object
+    ) -> None:
+        """Explicit special-token overrides must be integer vocabulary IDs."""
+        config = small_config()
+        assert config.vocab_size == 64
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match=name):
+            generate(
+                model,
+                prompt,
+                max_new_tokens=1,
+                temperature=0.0,
+                **{name: token_id},
+            )
+
+    def test_generate_accepts_integer_protocol_values(self) -> None:
+        """NumPy integer scalars are accepted through the integer protocol."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        output, _, _ = generate(
+            model,
+            jnp.asarray([[1, 2, 3]], dtype=jnp.int32),
+            max_new_tokens=np.int64(1),
+            temperature=0.0,
+            bos_token_id=np.int64(config.bos_token_id),
+            eos_token_id=np.int64(config.eos_token_id),
+        )
+        assert output.shape == (1, 4)
 
     def test_generate_uses_last_valid_token_with_padding(
         self,
@@ -401,6 +479,29 @@ class TestSamplingAndGeneration:
             assert actual_layer.attn is not None and expected_layer.attn is not None
             assert int(actual_layer.attn.count) == int(expected_layer.attn.count)
 
+    @pytest.mark.parametrize("advanced", [False, True])
+    def test_generate_rejects_empty_prompt_continuation(self, advanced: bool) -> None:
+        """An empty prompt cannot silently append BOS to an existing timeline."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        if advanced:
+            _, cache = model(
+                jnp.asarray([[1, 2]], dtype=jnp.int32),
+                return_cache=True,
+            )
+        else:
+            cache = init_cache(config)
+        assert cache is not None
+
+        with pytest.raises(ValueError, match="empty-prompt continuation"):
+            generate(
+                model,
+                jnp.empty((1, 0), dtype=jnp.int32),
+                max_new_tokens=1,
+                temperature=0.0,
+                cache=cache,
+            )
+
     def test_generate_sampling_requires_key(self) -> None:
         """Ensure sampling requires a PRNG key.
 
@@ -456,6 +557,7 @@ class TestConversion:
     """Strict native and original-upstream checkpoint tests."""
 
     @pytest.mark.torch_ref
+    @pytest.mark.fast
     def test_original_upstream_manifest_is_source_transcribed(self) -> None:
         """Check converter keys, shapes, and dtypes against a hand-authored source manifest."""
         torch = pytest.importorskip("torch")
@@ -550,6 +652,7 @@ class TestConversion:
         for name in manifest:
             assert torch.equal(roundtripped[name], source_state[name]), name
 
+    @pytest.mark.fast
     def test_native_v2_roundtrip_is_exact(self, tmp_path: Path) -> None:
         """Native save/reload preserves every tensor and model output."""
         config = small_config()
@@ -750,6 +853,7 @@ class TestConversion:
         )
 
     @pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16])
+    @pytest.mark.fast
     def test_cache_roundtrip_and_config_binding(
         self,
         tmp_path: Path,
@@ -835,6 +939,7 @@ class TestConversion:
         with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
             load_inference_cache(corrupted, config)
 
+    @pytest.mark.fast
     def test_cache_schema_and_position_invariants_fail_closed(self, tmp_path: Path) -> None:
         """Presence metadata and redundant attention positions must remain self-consistent."""
         from safetensors import safe_open

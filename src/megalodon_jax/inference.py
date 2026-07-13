@@ -56,7 +56,58 @@ def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCac
     :param ModelCache cache: Cache to slice.
     :param Int[Array, "new_batch"] indices: Batch indices to select.
     :return ModelCache: Sliced cache.
+    :raises TypeError: If indices do not have an integer dtype.
+    :raises ValueError: If indices are not rank one or are out of bounds.
     """
+
+    indices = jnp.asarray(indices)
+    if indices.ndim != 1:
+        raise ValueError(f"indices must be rank one, got shape {indices.shape}")
+    if not jnp.issubdtype(indices.dtype, jnp.integer):
+        raise TypeError(f"indices must have integer dtype, got {indices.dtype}")
+
+    batch_size: int | None = None
+
+    def bind_batch(name: str, x: Array) -> None:
+        """Bind and cross-check the batch width of one cache array.
+
+        :param str name: Cache component name used in validation errors.
+        :param Array x: Cache array with a leading batch dimension.
+        """
+        nonlocal batch_size
+        if x.ndim == 0:
+            raise ValueError(f"{name} must have a batch dimension")
+        if batch_size is None:
+            batch_size = x.shape[0]
+        elif x.shape[0] != batch_size:
+            raise ValueError(f"cache batch mismatch at {name}: {x.shape[0]} != {batch_size}")
+
+    for layer_index, layer_cache in enumerate(cache.layer_caches):
+        if layer_cache is None:
+            continue
+        if layer_cache.attn is not None:
+            bind_batch(f"layers.{layer_index}.attn.k", layer_cache.attn.k)
+            bind_batch(f"layers.{layer_index}.attn.v", layer_cache.attn.v)
+        if layer_cache.norm is not None:
+            bind_batch(f"layers.{layer_index}.norm.count", layer_cache.norm.count)
+            bind_batch(f"layers.{layer_index}.norm.mean", layer_cache.norm.mean)
+            bind_batch(f"layers.{layer_index}.norm.var", layer_cache.norm.var)
+        if layer_cache.ema is not None:
+            bind_batch(f"layers.{layer_index}.ema.h", layer_cache.ema.h)
+    if cache.final_norm is not None:
+        bind_batch("final_norm.count", cache.final_norm.count)
+        bind_batch("final_norm.mean", cache.final_norm.mean)
+        bind_batch("final_norm.var", cache.final_norm.var)
+
+    if batch_size is None:
+        if indices.size != 0:
+            raise ValueError("cannot index a sparse cache without allocated batch state")
+    else:
+        indices = eqx.error_if(
+            indices,
+            jnp.any((indices < 0) | (indices >= batch_size)),
+            f"cache indices must be in [0, {batch_size})",
+        )
 
     def index_array(x: Array | None) -> Array | None:
         """Index a cache array along the batch dimension.
@@ -287,6 +338,50 @@ def _validate_sampling(
         raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
 
 
+def _validate_max_new_tokens(max_new_tokens: object) -> int:
+    """Normalize a requested generation length through the integer protocol.
+
+    :param object max_new_tokens: Requested number of generated tokens.
+    :raises ValueError: If the value is not a positive, non-boolean integer.
+    :return int: Normalized positive generation length.
+    """
+    if isinstance(max_new_tokens, bool):
+        raise ValueError("max_new_tokens must be a positive integer")
+    try:
+        value = operator.index(max_new_tokens)
+    except TypeError as error:
+        raise ValueError("max_new_tokens must be a positive integer") from error
+    if value <= 0:
+        raise ValueError("max_new_tokens must be a positive integer")
+    return value
+
+
+def _validate_token_id_override(
+    name: str,
+    token_id: object | None,
+    vocab_size: int,
+) -> int | None:
+    """Normalize an optional special-token override and enforce vocabulary bounds.
+
+    :param str name: Argument name used in validation errors.
+    :param object | None token_id: Optional token ID override.
+    :param int vocab_size: Exclusive upper vocabulary bound.
+    :raises ValueError: If the override is not a non-boolean integer in range.
+    :return int | None: Normalized token ID or ``None``.
+    """
+    if token_id is None:
+        return None
+    if isinstance(token_id, bool):
+        raise ValueError(f"{name} must be an integer token ID")
+    try:
+        value = operator.index(token_id)
+    except TypeError as error:
+        raise ValueError(f"{name} must be an integer token ID") from error
+    if not 0 <= value < vocab_size:
+        raise ValueError(f"{name} must be in [0, {vocab_size}), got {value}")
+    return value
+
+
 def _generate_core(
     model: MegalodonForCausalLM,
     prompt_ids: Int[Array, "batch prompt_len"],
@@ -332,13 +427,6 @@ def _generate_core(
         top_p,
         model.config.effective_output_size,
     )
-    if max_new_tokens < 0:
-        raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
-    if max_new_tokens == 0:
-        raise ValueError(
-            "max_new_tokens must be > 0 to generate; Transformers treats this as an invalid length."
-        )
-
     needs_rng = temperature != 0.0
     if needs_rng and key is None:
         raise ValueError("key is required when temperature > 0.")
@@ -347,6 +435,11 @@ def _generate_core(
     B, prompt_len = prompt_ids.shape
 
     if prompt_len == 0:
+        if cache is not None:
+            raise ValueError(
+                "empty-prompt continuation with a cache is unsupported; "
+                "provide the final context token or cached logits"
+            )
         if bos_token_id is None:
             bos_token_id = getattr(model.config, "bos_token_id", None)
         if bos_token_id is None:
@@ -545,6 +638,18 @@ def generate(
     :raises ValueError: If inputs are invalid or padding constraints are violated.
     :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
     """
+
+    max_new_tokens = _validate_max_new_tokens(max_new_tokens)
+    bos_token_id = _validate_token_id_override(
+        "bos_token_id",
+        bos_token_id,
+        model.config.vocab_size,
+    )
+    eos_token_id = _validate_token_id_override(
+        "eos_token_id",
+        eos_token_id,
+        model.config.vocab_size,
+    )
 
     if attention_mask is None:
         return _generate_core(

@@ -78,6 +78,49 @@ class TestMegalodonBlock:
         assert out.shape == (batch, seq, config.model_dim)
         assert cache is None
 
+    @pytest.mark.fast
+    def test_direct_cache_requires_complete_aligned_state(self, random_seed: int) -> None:
+        """Direct block calls cannot mix reset and continued layer components."""
+        config = small_config()
+        block = MegalodonBlock(config, layer_id=0, key=jax.random.PRNGKey(random_seed))
+        x = jax.random.normal(jax.random.PRNGKey(1), (1, 3, config.model_dim))
+        _, cache = block(x, return_cache=True)
+        assert cache is not None and cache.attn is not None and cache.norm is not None
+
+        malformed = (
+            replace(cache, attn=None),
+            replace(cache, norm=None),
+            replace(cache, ema=None),
+            replace(cache, position=cache.position + 1),
+            replace(cache, norm=replace(cache.norm, count=cache.norm.count + 1)),
+            replace(
+                cache,
+                norm=replace(cache.norm, mean=cache.norm.mean.at[0, 0].set(jnp.nan)),
+            ),
+        )
+        for invalid in malformed:
+            with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+                jax.block_until_ready(block(x[:, :1], cache=invalid, return_cache=True))
+
+        expected, _ = block(x, return_cache=True)
+        actual, _ = block(x, cache=LayerCache(), return_cache=True)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+    @pytest.mark.fast
+    def test_direct_cache_is_inference_only(self, random_seed: int) -> None:
+        """Direct block calls enforce the model's inference-only cache contract."""
+        config = small_config()
+        block = MegalodonBlock(config, layer_id=0, key=jax.random.PRNGKey(random_seed))
+        x = jnp.zeros((1, 1, config.model_dim), dtype=jnp.float32)
+
+        with pytest.raises(ValueError, match="inference-only"):
+            block(
+                x,
+                return_cache=True,
+                deterministic=False,
+                key=jax.random.PRNGKey(1),
+            )
+
     def test_streaming_with_cache(self, random_seed: int) -> None:
         """Test that streaming with cache produces consistent outputs.
 
@@ -298,6 +341,7 @@ class TestMegalodonModel:
 class TestMegalodonForCausalLM:
     """Tests for MegalodonForCausalLM."""
 
+    @pytest.mark.fast
     def test_bf16_cached_logits_stay_within_compute_envelope(self) -> None:
         """Live cache outputs may change BF16 GEMM association, not semantics."""
         config = small_config(compute_dtype=jnp.bfloat16)
@@ -798,6 +842,43 @@ class TestModelCache:
             with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
                 jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
 
+    @pytest.mark.fast
+    def test_model_cache_rejects_invalid_compact_norm_values(self, random_seed: int) -> None:
+        """Model entry always validates small normalization-state payloads."""
+        config = small_config()
+        model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
+        _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
+        assert cache is not None and cache.final_norm is not None
+        first = cache.layer_caches[0]
+        assert first is not None and first.norm is not None
+
+        invalid_layer_norms = (
+            replace(first.norm, mean=first.norm.mean.at[0, 0].set(jnp.nan)),
+            replace(first.norm, var=first.norm.var.at[0, 0].set(jnp.nan)),
+            replace(first.norm, var=first.norm.var.at[0, 0].set(-1.0)),
+        )
+        malformed = [
+            replace(
+                cache,
+                layer_caches=(replace(first, norm=state), *cache.layer_caches[1:]),
+            )
+            for state in invalid_layer_norms
+        ]
+        malformed.append(
+            replace(
+                cache,
+                final_norm=replace(
+                    cache.final_norm,
+                    mean=cache.final_norm.mean.at[0, 0].set(jnp.nan),
+                ),
+            )
+        )
+
+        for invalid in malformed:
+            with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+                jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
+
+    @pytest.mark.fast
     def test_model_cache_rejects_coherent_count_overflow(self, random_seed: int) -> None:
         """Model-entry validation checks one shared timeline before all layers."""
         config = small_config()

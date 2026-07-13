@@ -74,6 +74,7 @@ sequenceDiagram
 - `attention_window=None` is the released chunk-local behavior. The fixed ring capacity is `chunk_size`, and attention/RoPE restart at each source chunk boundary.
 - `attention_window=W` enables the intentional fixed-width sliding-window extension with ring capacity `W` and a per-query age mask.
 - Both modes are invariant to call partitioning: full calls, arbitrary chunks, token-by-token calls, and save/reload continuation produce the same outputs for identical semantics.
+- Direct `MegalodonBlock` calls accept either a sparse zero-history `LayerCache` or complete attention, TimestepNorm, and CEMA state on one nonnegative timeline. Partial or misaligned layer state is rejected, and cache input or output requires deterministic inference.
 
 ## RoPE offsets
 
@@ -112,7 +113,7 @@ The segmented CEMA path and its memory/speed tradeoff are described in [EMA impl
 - `generate()` rejects left padding because shifting physical chunk boundaries changes released chunk-local semantics. It accepts right padding only for a single uncached generated token; direct noncached model calls support right-padded training batches.
 - Batch variable-length prompts by equal unpadded length or generate them separately when a cache is required.
 - Pass `attention_mask=None` when every token is valid. `generate()` canonicalizes an all-True mask to `None`; direct model calls retain an array-valued mask and therefore use the general masked TimestepNorm path.
-- An empty prompt is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token. Generation raises when neither is available.
+- An empty prompt without a cache is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token. Empty-prompt continuation with a cache is rejected because the cache does not store next-token logits; provide the final context token instead.
 - `generate()` requires the output width to equal `vocab_size` so every generated ID is valid for the next embedding lookup.
 - Cache input and cache return are deterministic inference operations. Model calls with `deterministic=False` reject both.
 

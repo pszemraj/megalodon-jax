@@ -21,7 +21,7 @@ import numpy as np
 from jaxtyping import Array, Bool
 
 from megalodon_jax.config import MegalodonConfig
-from megalodon_jax.types import ModelCache, NormState
+from megalodon_jax.types import LayerCache, ModelCache, NormState
 
 CACHE_INVARIANT_MESSAGE = (
     "cache must be either a sparse zero-history initializer or a complete, "
@@ -54,27 +54,85 @@ def _any(predicates: list[Array]) -> Bool[Array, ""]:
     return jnp.any(jnp.stack([jnp.asarray(predicate) for predicate in predicates]))
 
 
+def layer_cache_invariant_violation(
+    cache: LayerCache,
+    *,
+    batch_size: int,
+    increment: int = 0,
+) -> Bool[Array, ""]:
+    """Return whether one layer cache has an invalid continuation timeline.
+
+    A direct layer call accepts either the sparse zero-history representation
+    (all optional components absent and ``position == 0``) or a complete
+    continuation with aligned attention and normalization counts. Compact
+    normalization values are always checked because their cost is independent
+    of attention-cache capacity.
+
+    :param LayerCache cache: Layer cache to validate.
+    :param int batch_size: Expected batch size.
+    :param int increment: Timeline increment to validate against int32 overflow.
+    :return Bool[Array, ""]: Scalar predicate that is true for an invalid cache.
+    :raises ValueError: If the cache has partial state or invalid static schema.
+    """
+    if increment < 0 or increment > jnp.iinfo(jnp.int32).max:
+        raise ValueError(f"cache increment must fit non-negative int32, got {increment}")
+
+    _require_array("cache.position", cache.position, (), jnp.int32)
+    present = (cache.attn is not None, cache.norm is not None, cache.ema is not None)
+    if not any(present):
+        return cache.position != 0
+    if not all(present):
+        raise ValueError(CACHE_INVARIANT_MESSAGE)
+
+    assert cache.attn is not None
+    assert cache.norm is not None
+    assert cache.ema is not None
+    _require_array("cache.attn.count", cache.attn.count, (), jnp.int32)
+    _require_array("cache.norm.count", cache.norm.count, (batch_size,), jnp.int32)
+    if cache.norm.mean.ndim != 2 or cache.norm.mean.shape[0] != batch_size:
+        raise ValueError(
+            f"cache.norm.mean must have shape (batch, groups), got {cache.norm.mean.shape}"
+        )
+    _require_array("cache.norm.mean", cache.norm.mean, cache.norm.mean.shape, jnp.float32)
+    _require_array("cache.norm.var", cache.norm.var, cache.norm.mean.shape, jnp.float32)
+
+    return _any(
+        [
+            cache.position < 0,
+            cache.attn.count != cache.position,
+            jnp.any(cache.norm.count != cache.position),
+            cache.position > jnp.iinfo(jnp.int32).max - increment,
+            jnp.any(~jnp.isfinite(cache.norm.mean)),
+            jnp.any(~jnp.isfinite(cache.norm.var)),
+            jnp.any(cache.norm.var < 0.0),
+            # Allocated history at position zero is not the sparse initializer.
+            cache.position == 0,
+        ]
+    )
+
+
 def cache_invariant_violation(
     cache: ModelCache,
     config: MegalodonConfig,
     *,
     batch_size: int | None = None,
     increment: int = 0,
-    check_finite: bool = False,
+    check_full_payload: bool = False,
 ) -> Bool[Array, ""]:
     """Return whether a cache violates the streaming-state coherence contract.
 
     Static schema errors raise immediately. Dynamic values produce one scalar
     predicate suitable for ``eqx.error_if`` under JIT or host evaluation during
-    persistence. Content finiteness is optional because scanning the full KV
-    ring on every decode step would make model-entry validation proportional to
-    cache capacity; persistence enables it before data crosses a trust boundary.
+    persistence. Compact normalization values are always checked. Full payload
+    finiteness is optional because scanning the KV ring on every decode step
+    would make model-entry validation proportional to cache capacity;
+    persistence enables it before data crosses a trust boundary.
 
     :param ModelCache cache: Cache to validate.
     :param MegalodonConfig config: Model configuration defining the cache schema.
     :param int | None batch_size: Expected batch size, or None to infer it.
     :param int increment: Timeline increment to validate against int32 overflow.
-    :param bool check_finite: Whether to validate the contents of allocated arrays.
+    :param bool check_full_payload: Whether to validate attention and EMA contents.
     :return Bool[Array, ""]: Scalar predicate that is true for an invalid cache.
     """
     if increment < 0 or increment > jnp.iinfo(jnp.int32).max:
@@ -186,17 +244,17 @@ def cache_invariant_violation(
     counters = [*positions, *attention_counts, *(state.count for state in norm_states)]
     violations = [jnp.any(counter < 0) for counter in counters]
     has_history_buffers = bool(attention_arrays or ema_states)
-    if check_finite:
+    for state in norm_states:
+        violations.extend(
+            (
+                jnp.any(~jnp.isfinite(state.mean)),
+                jnp.any(~jnp.isfinite(state.var)),
+                jnp.any(state.var < 0.0),
+            )
+        )
+    if check_full_payload:
         violations.extend(jnp.any(~jnp.isfinite(value)) for value in attention_arrays)
         violations.extend(jnp.any(~jnp.isfinite(value)) for value in ema_states)
-        for state in norm_states:
-            violations.extend(
-                (
-                    jnp.any(~jnp.isfinite(state.mean)),
-                    jnp.any(~jnp.isfinite(state.var)),
-                    jnp.any(state.var < 0.0),
-                )
-            )
 
     def pristine_violation() -> Bool[Array, ""]:
         """Check state that affects computation when the timeline is zero."""
@@ -248,6 +306,6 @@ def validate_model_cache_host(cache: ModelCache, config: MegalodonConfig) -> Non
     :param MegalodonConfig config: Model configuration defining the cache schema.
     :raises ValueError: If the cache violates a structural or value invariant.
     """
-    violation = cache_invariant_violation(cache, config, check_finite=True)
+    violation = cache_invariant_violation(cache, config, check_full_payload=True)
     if bool(np.asarray(jax.device_get(violation))):
         raise ValueError(CACHE_INVARIANT_MESSAGE)
