@@ -13,6 +13,8 @@ from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.layers.norms import BatchedLayerNorm
 from megalodon_jax.types import LayerCache
 
+pytestmark = pytest.mark.fast
+
 
 class TestMegalodonConfig:
     """Tests for MegalodonConfig dataclass."""

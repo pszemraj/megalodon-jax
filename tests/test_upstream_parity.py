@@ -38,6 +38,7 @@ def parity_config(*, swiglu: bool = True) -> MegalodonConfig:
 
 
 @pytest.mark.torch_ref
+@pytest.mark.fast
 @pytest.mark.parametrize("swiglu", [False, True])
 def test_tiny_forward_matches_released_source_equations(swiglu: bool) -> None:
     """Compare complete logits against the local-source-derived Torch oracle."""
@@ -60,6 +61,7 @@ def test_tiny_forward_matches_released_source_equations(swiglu: bool) -> None:
 
 
 @pytest.mark.torch_ref
+@pytest.mark.fast
 def test_all_parameter_gradients_match_released_source_equations() -> None:
     """Compare every trainable upstream-schema gradient, not selected probes."""
     torch = pytest.importorskip("torch")

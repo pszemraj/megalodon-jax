@@ -95,6 +95,7 @@ class TestTimestepNorm:
         for expected, actual in zip(left, _merge_m2(left, identity), strict=True):
             np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
+    @pytest.mark.fast
     def test_streaming_state_continuity(self, random_seed: int) -> None:
         """Test that processing in chunks matches full sequence.
 
@@ -136,6 +137,7 @@ class TestTimestepNorm:
         np.testing.assert_array_equal(np.array(norm.weight), np.zeros(64))
         np.testing.assert_array_equal(np.array(norm.bias), np.zeros(64))
 
+    @pytest.mark.fast
     def test_exact_scalar_population_moments(self) -> None:
         """Each valid token contributes all scalar features in its group."""
         norm = TimestepNorm(4, 2, eps=0.0)
@@ -199,6 +201,7 @@ class TestTimestepNorm:
         np.testing.assert_array_equal(np.array(state_masked.count), np.array([8, 8]))
         np.testing.assert_array_equal(np.asarray(y_masked[:, 8:]), np.zeros((batch, 8, dim)))
 
+    @pytest.mark.fast
     def test_fully_masked_row_preserves_incoming_state(self) -> None:
         """A row containing only identity summaries returns its state exactly."""
         norm = TimestepNorm(8, 2)
@@ -218,6 +221,7 @@ class TestTimestepNorm:
                 np.asarray(getattr(state, name)),
             )
 
+    @pytest.mark.fast
     def test_state_dtype_fp32(self, random_seed: int) -> None:
         """Ensure running stats stay in float32 for bf16 inputs."""
         dim = 64
@@ -329,6 +333,7 @@ class TestTimestepNorm:
                 assert bool(jnp.all(jnp.isfinite(prefix_var)))
                 assert float(jnp.min(prefix_var)) >= 0.0
 
+    @pytest.mark.fast
     @pytest.mark.parametrize("mode", ["plain", "masked", "packed", "continuation"])
     def test_matches_float64_paper_oracle(self, mode: str) -> None:
         """Production paths agree with an independent scalar paper equation."""
@@ -384,6 +389,7 @@ class TestTimestepNorm:
         np.testing.assert_allclose(np.asarray(final.var), expected_final.var, atol=3e-5)
         np.testing.assert_array_equal(np.asarray(output)[~valid], 0.0)
 
+    @pytest.mark.fast
     def test_large_offset_continuation_matches_oracle_and_gradients(self) -> None:
         """Large-count shifted continuation remains stable and differentiable."""
         norm = TimestepNorm(4, 2, eps=1e-5)
@@ -503,6 +509,7 @@ class TestTimestepNorm:
         for actual, expected in zip(gradients, expected_gradients, strict=True):
             np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-2, atol=5e-3)
 
+    @pytest.mark.fast
     @pytest.mark.parametrize("mode", ["plain", "masked", "packed"])
     def test_forward_and_backward_have_no_sequence_while(self, mode: str) -> None:
         """Production sequence work remains outside runtime WhileOps."""
@@ -572,6 +579,7 @@ class TestTimestepNorm:
         np.testing.assert_allclose(np.asarray(state.mean), [[4.0, 8.0]], atol=1e-6)
         np.testing.assert_allclose(np.asarray(state.var), [[5.0, 20.0]], atol=1e-6)
 
+    @pytest.mark.fast
     def test_masked_nonfinite_tokens_have_zero_finite_gradients(self) -> None:
         """Inactive NaN/Inf payloads cannot poison reverse-mode arithmetic."""
         norm = TimestepNorm(8, 2)
@@ -720,6 +728,7 @@ class TestTimestepNormSegmentReset:
         np.testing.assert_array_equal(np.array(state_base.mean), np.array(state_none.mean))
         np.testing.assert_array_equal(np.array(state_base.var), np.array(state_none.var))
 
+    @pytest.mark.fast
     def test_segment_reset_matches_per_doc_alone(self, random_seed: int) -> None:
         """Packed docs with resets must normalize like each doc alone.
 
@@ -747,6 +756,7 @@ class TestTimestepNormSegmentReset:
             err_msg="Doc B slice should match doc B alone (no stat leak)",
         )
 
+    @pytest.mark.fast
     def test_contiguous_runs_cover_reused_ids_singletons_and_padding(
         self, random_seed: int
     ) -> None:
@@ -779,6 +789,7 @@ class TestTimestepNormSegmentReset:
                 atol=2e-5,
             )
 
+    @pytest.mark.fast
     def test_fully_padded_packed_row_returns_prior(self) -> None:
         """Segment ID zero is an identity and cannot leak nonfinite input."""
         norm = TimestepNorm(8, 2)
@@ -915,6 +926,7 @@ class TestTimestepNormSegmentReset:
 class TestComplexEMA:
     """Recurrence and state-continuation tests for ComplexEMA."""
 
+    @pytest.mark.fast
     def test_pristine_prefill_matches_sequential_recurrence(self, random_seed: int) -> None:
         """FFT outputs plus compact final state match the full recurrence.
 
@@ -953,6 +965,7 @@ class TestComplexEMA:
             err_msg="State-only recurrence must match the full recurrence",
         )
 
+    @pytest.mark.fast
     def test_state_continuity(self, random_seed: int) -> None:
         """Test that chunked processing with state matches full sequence.
 
@@ -1127,6 +1140,7 @@ class TestComplexEMASegmentReset:
             err_msg="Final state should equal doc B's standalone state",
         )
 
+    @pytest.mark.fast
     @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
     def test_associative_matches_sequential_reset(self, random_seed: int, dtype: Any) -> None:
         """Associative and sequential segmented paths must agree.
@@ -1257,6 +1271,7 @@ class TestComplexEMASegmentReset:
 class TestPrecisionPolicy:
     """Tests for bf16/fp16 precision handling."""
 
+    @pytest.mark.fast
     def test_timestep_norm_bf16_input(self, random_seed: int) -> None:
         """Test TimestepNorm works correctly with bf16 inputs.
 
@@ -1341,6 +1356,7 @@ class TestPrecisionPolicy:
             err_msg="bf16 params should produce fp32 coefficients close to fp32 params",
         )
 
+    @pytest.mark.fast
     def test_complex_ema_fft_vs_sequential_bf16(self, random_seed: int) -> None:
         """Test FFT and sequential paths produce equivalent results in bf16.
 
