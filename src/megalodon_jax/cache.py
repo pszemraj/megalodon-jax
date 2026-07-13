@@ -30,7 +30,13 @@ CACHE_INVARIANT_MESSAGE = (
 
 
 def _require_array(name: str, value: Array, shape: tuple[int, ...], dtype: jnp.dtype) -> None:
-    """Validate static array schema available during eager execution and tracing."""
+    """Validate static array schema available during eager execution and tracing.
+
+    :param str name: Array name used in validation errors.
+    :param Array value: Array to validate.
+    :param tuple[int, ...] shape: Required array shape.
+    :param jnp.dtype dtype: Required array dtype.
+    """
     if value.shape != shape:
         raise ValueError(f"{name} must have shape {shape}, got {value.shape}")
     if jnp.dtype(value.dtype) != jnp.dtype(dtype):
@@ -38,7 +44,11 @@ def _require_array(name: str, value: Array, shape: tuple[int, ...], dtype: jnp.d
 
 
 def _any(predicates: list[Array]) -> Bool[Array, ""]:
-    """Combine scalar predicates without requiring a nonempty list."""
+    """Combine scalar predicates without requiring a nonempty list.
+
+    :param list[Array] predicates: Scalar predicates to combine.
+    :return Bool[Array, ""]: Whether any predicate is true.
+    """
     if not predicates:
         return jnp.asarray(False)
     return jnp.any(jnp.stack([jnp.asarray(predicate) for predicate in predicates]))
@@ -59,6 +69,13 @@ def cache_invariant_violation(
     persistence. Content finiteness is optional because scanning the full KV
     ring on every decode step would make model-entry validation proportional to
     cache capacity; persistence enables it before data crosses a trust boundary.
+
+    :param ModelCache cache: Cache to validate.
+    :param MegalodonConfig config: Model configuration defining the cache schema.
+    :param int | None batch_size: Expected batch size, or None to infer it.
+    :param int increment: Timeline increment to validate against int32 overflow.
+    :param bool check_finite: Whether to validate the contents of allocated arrays.
+    :return Bool[Array, ""]: Scalar predicate that is true for an invalid cache.
     """
     if increment < 0 or increment > jnp.iinfo(jnp.int32).max:
         raise ValueError(f"cache increment must fit non-negative int32, got {increment}")
@@ -70,7 +87,12 @@ def cache_invariant_violation(
     bound_batch = batch_size
 
     def bind_batch(name: str, size: int) -> int:
-        """Require one batch width across every allocated state component."""
+        """Require one batch width across every allocated state component.
+
+        :param str name: State component name used in validation errors.
+        :param int size: Batch width of the state component.
+        :return int: Validated batch width.
+        """
         nonlocal bound_batch
         if bound_batch is None:
             bound_batch = size
@@ -220,7 +242,12 @@ def cache_invariant_violation(
 
 
 def validate_model_cache_host(cache: ModelCache, config: MegalodonConfig) -> None:
-    """Raise ``ValueError`` when a concrete cache violates shared invariants."""
+    """Raise ``ValueError`` when a concrete cache violates shared invariants.
+
+    :param ModelCache cache: Concrete cache to validate on the host.
+    :param MegalodonConfig config: Model configuration defining the cache schema.
+    :raises ValueError: If the cache violates a structural or value invariant.
+    """
     violation = cache_invariant_violation(cache, config, check_finite=True)
     if bool(np.asarray(jax.device_get(violation))):
         raise ValueError(CACHE_INVARIANT_MESSAGE)

@@ -27,7 +27,13 @@ SensitivePath = tuple[str, Callable[[MegalodonModel], Array]]
 
 
 def _iter_sensitive_paths(core: MegalodonModel) -> Iterable[SensitivePath]:
-    """Yield the single authoritative set of fp32-sensitive model paths."""
+    """Yield the single authoritative set of fp32-sensitive model paths.
+
+    :param MegalodonModel core: Core model whose parameter topology selects optional paths.
+
+    Yields:
+        SensitivePath: Parameter name and selector for each fp32-sensitive array.
+    """
     for i, layer in enumerate(core.layers):
         attn = layer.attn
         prefix = f"layers.{i}.attn"

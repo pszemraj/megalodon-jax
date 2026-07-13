@@ -36,6 +36,15 @@ def _torch_tensor(
     *,
     dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
+    """Convert an array-like value to a writable PyTorch tensor.
+
+    Floating-point inputs first pass through NumPy float32 to preserve the
+    released checkpoint representation.
+
+    :param Any value: Array-like value to convert.
+    :param torch.dtype | None dtype: Optional destination dtype.
+    :return torch.Tensor: Writable CPU tensor.
+    """
     array = np.asarray(value)
     if np.issubdtype(array.dtype, np.floating):
         array = array.astype(np.float32, copy=False)
@@ -46,12 +55,24 @@ def _torch_tensor(
 
 
 def _jax_float(value: torch.Tensor, name: str) -> Array:
+    """Convert an upstream tensor to a JAX float32 array.
+
+    :param torch.Tensor value: Upstream tensor to convert.
+    :param str name: Upstream key used in validation errors.
+    :raises TypeError: If ``value`` is not a PyTorch tensor.
+    :return Array: JAX float32 array on the default device.
+    """
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"upstream value {name!r} is not a torch.Tensor")
     return jnp.asarray(value.detach().float().cpu().numpy(), dtype=jnp.float32)
 
 
 def _rope_frequencies(config: MegalodonConfig) -> np.ndarray:
+    """Construct the released adjacent-pair RoPE frequency vector.
+
+    :param MegalodonConfig config: Model configuration defining head size and RoPE base.
+    :return np.ndarray: Float32 frequencies with shape ``(head_dim / 2,)``.
+    """
     half = config.head_dim // 2
     exponent = np.arange(half, dtype=np.float32) / half
     return np.power(np.float32(config.effective_rope_base), -exponent).astype(np.float32)
@@ -62,13 +83,29 @@ def export_upstream_state_dict(
     *,
     dtype: torch.dtype | None = None,
 ) -> StateDict:
-    """Export an exact world-size-one released-source state dictionary."""
+    """Export an exact world-size-one released-source state dictionary.
+
+    :param MegalodonForCausalLM model: JAX model to export.
+    :param torch.dtype | None dtype: Optional dtype for ordinary projection tensors.
+        Numerically sensitive parameters remain float32.
+    :return StateDict: Released-source keyspace backed by CPU PyTorch tensors.
+    """
     config = model.config
 
     def ordinary(value: Any) -> torch.Tensor:
+        """Convert an ordinary parameter using the requested export dtype.
+
+        :param Any value: Parameter value to convert.
+        :return torch.Tensor: Converted CPU tensor.
+        """
         return _torch_tensor(value, dtype=dtype)
 
     def fp32(value: Any) -> torch.Tensor:
+        """Convert a numerically sensitive parameter to float32.
+
+        :param Any value: Parameter value to convert.
+        :return torch.Tensor: Float32 CPU tensor.
+        """
         return _torch_tensor(value, dtype=torch.float32)
 
     state: StateDict = {
@@ -156,6 +193,13 @@ def _validate_prior(
     prefix: str,
     expected_groups: int,
 ) -> None:
+    """Validate the zero-prior convention used by released top-level models.
+
+    :param StateDict state: Upstream state dictionary.
+    :param str prefix: TimestepNorm key prefix.
+    :param int expected_groups: Required number of normalization groups.
+    :raises ValueError: If the prior count, shapes, or values are incompatible.
+    """
     count = state[f"{prefix}.prior_count"]
     if count.numel() != 1 or int(count.item()) != 0:
         raise ValueError(
@@ -175,7 +219,14 @@ def load_upstream_state_dict(
     model: MegalodonForCausalLM,
     state_dict: StateDict,
 ) -> MegalodonForCausalLM:
-    """Load an exact released world-size-one state dictionary, strictly."""
+    """Load an exact released world-size-one state dictionary, strictly.
+
+    :param MegalodonForCausalLM model: Initialized JAX model defining the target schema.
+    :param StateDict state_dict: Released-source state dictionary.
+    :raises TypeError: If an upstream value is not a PyTorch tensor.
+    :raises ValueError: If keys, tensor layouts, priors, or tied weights are incompatible.
+    :return MegalodonForCausalLM: Model with converted upstream parameters.
+    """
     expected = set(export_upstream_state_dict(model))
     actual = set(state_dict)
     _require_exact_keys(actual, expected, context="strict original-upstream key mismatch")
@@ -288,6 +339,13 @@ def load_upstream_state_dict(
 
 
 def _replicated(shards: list[torch.Tensor], key: str) -> torch.Tensor:
+    """Validate and select a parameter replicated across model-parallel ranks.
+
+    :param list[torch.Tensor] shards: Per-rank copies of the parameter.
+    :param str key: Upstream key used in validation errors.
+    :raises ValueError: If replicated values differ across ranks.
+    :return torch.Tensor: The common replicated tensor.
+    """
     first = shards[0]
     if any(not torch.equal(first, shard) for shard in shards[1:]):
         raise ValueError(f"replicated upstream shard key differs across ranks: {key}")
@@ -300,6 +358,10 @@ def _merge_axis(key: str) -> int | None:
     Parameters constructed from a dimension divided by the model-parallel
     world size are concatenated. Full-width normalization and layer-scale
     parameters are replicated and must agree across ranks.
+
+    :param str key: Released-source parameter key.
+    :raises ValueError: If the key has no known sharding rule.
+    :return int | None: Concatenation axis, or ``None`` for replicated values.
     """
     if key == "embed.weight" or key == "output.output.weight":
         return 1
@@ -339,6 +401,14 @@ def _merge_axis(key: str) -> int | None:
 
 
 def _load_consolidated_directory(path: Path) -> StateDict:
+    """Load and merge an upstream consolidated model-parallel checkpoint.
+
+    :param Path path: Directory containing consolidation metadata and rank files.
+    :raises FileNotFoundError: If a required consolidated shard is absent.
+    :raises TypeError: If a consolidated value is not a tensor.
+    :raises ValueError: If metadata or shard structures are incompatible.
+    :return StateDict: Merged world-size-one state dictionary.
+    """
     config_path = path / "consolidate_config.json"
     if not config_path.is_file():
         raise ValueError(
@@ -379,7 +449,16 @@ def load_upstream_checkpoint(
     *,
     key: Array,
 ) -> MegalodonForCausalLM:
-    """Load a strict original-upstream file or consolidated directory."""
+    """Load a strict original-upstream file or consolidated directory.
+
+    :param str | Path path: Upstream checkpoint file or consolidated directory.
+    :param MegalodonConfig config: Configuration for the target JAX model.
+    :param Array key: PRNG key used to initialize the target model.
+    :raises FileNotFoundError: If the source or a required shard is absent.
+    :raises TypeError: If an upstream checkpoint value has the wrong type.
+    :raises ValueError: If the checkpoint schema is incompatible.
+    :return MegalodonForCausalLM: Model loaded with upstream parameters.
+    """
     source = Path(path)
     if source.is_dir():
         state = _load_consolidated_directory(source)
@@ -398,30 +477,56 @@ def load_upstream_checkpoint(
 
 
 def _removed(name: str, replacement: str) -> NoReturn:
+    """Raise the standard error for a removed ambiguous conversion API.
+
+    :param str name: Removed function name.
+    :param str replacement: Explicit replacement API.
+    :raises RuntimeError: Always, with migration guidance.
+    """
     raise RuntimeError(
         f"{name} was removed because it ambiguously targeted a different schema; use {replacement}"
     )
 
 
 def convert_jax_to_torch(*args: Any, **kwargs: Any) -> NoReturn:
-    """Reject the historical Hugging-Face-shaped exporter."""
+    """Reject the historical Hugging Face-shaped exporter.
+
+    :param Any args: Ignored historical positional arguments.
+    :param Any kwargs: Ignored historical keyword arguments.
+    :raises RuntimeError: Always; use :func:`export_upstream_state_dict`.
+    """
     del args, kwargs
     _removed("convert_jax_to_torch", "export_upstream_state_dict")
 
 
 def load_weights_from_torch(*args: Any, **kwargs: Any) -> NoReturn:
-    """Reject the historical Hugging-Face-shaped loader."""
+    """Reject the historical Hugging Face-shaped loader.
+
+    :param Any args: Ignored historical positional arguments.
+    :param Any kwargs: Ignored historical keyword arguments.
+    :raises RuntimeError: Always; use :func:`load_upstream_state_dict`.
+    """
     del args, kwargs
     _removed("load_weights_from_torch", "load_upstream_state_dict")
 
 
 def load_from_pretrained(*args: Any, **kwargs: Any) -> NoReturn:
-    """Reject schema guessing between native and upstream checkpoints."""
+    """Reject schema guessing between native and upstream checkpoints.
+
+    :param Any args: Ignored historical positional arguments.
+    :param Any kwargs: Ignored historical keyword arguments.
+    :raises RuntimeError: Always; use an explicit native or upstream loader.
+    """
     del args, kwargs
     _removed("load_from_pretrained", "load_checkpoint or load_upstream_checkpoint")
 
 
 def save_safetensors(*args: Any, **kwargs: Any) -> NoReturn:
-    """Reject the historical metadata-free SafeTensors writer."""
+    """Reject the historical metadata-free SafeTensors writer.
+
+    :param Any args: Ignored historical positional arguments.
+    :param Any kwargs: Ignored historical keyword arguments.
+    :raises RuntimeError: Always; use :func:`save_checkpoint`.
+    """
     del args, kwargs
     _removed("save_safetensors", "save_checkpoint")

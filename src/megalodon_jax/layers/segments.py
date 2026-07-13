@@ -25,7 +25,11 @@ from jaxtyping import Array, Bool, Int
 
 
 def valid_segment_mask(segment_ids: Int[Array, "batch seq"]) -> Bool[Array, "batch seq"]:
-    """Return the shared validity predicate for positive packed-sequence IDs."""
+    """Return the shared validity predicate for positive packed-sequence IDs.
+
+    :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs, with zero as padding.
+    :return Bool[Array, "batch seq"]: True for tokens belonging to a real segment.
+    """
     return segment_ids > 0
 
 

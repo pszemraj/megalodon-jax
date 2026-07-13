@@ -26,7 +26,11 @@ from megalodon_jax.types import NormState
 
 
 def _block_moments(x: Array) -> tuple[Array, Array]:
-    """Return stable population moments over the final feature axis."""
+    """Return stable population moments over the final feature axis.
+
+    :param Array x: Grouped input values.
+    :return tuple[Array, Array]: Population mean and variance for each group.
+    """
     mean = jnp.mean(x, axis=-1)
     var = jnp.mean(jnp.square(x - mean[..., None]), axis=-1)
     return mean, var
@@ -50,7 +54,12 @@ class _SegmentedSummary(NamedTuple):
 
 
 def _merge_m2(left: _MomentSummary, right: _MomentSummary) -> _MomentSummary:
-    """Associatively merge Chan--Golub--LeVeque block summaries."""
+    """Associatively merge Chan--Golub--LeVeque block summaries.
+
+    :param _MomentSummary left: Summary for the earlier interval.
+    :param _MomentSummary right: Summary for the later interval.
+    :return _MomentSummary: Summary for the concatenated interval.
+    """
     count_a, mean_a, m2_a = left
     count_b, mean_b, m2_b = right
     count = count_a + count_b
@@ -72,7 +81,12 @@ def _merge_segmented_m2(
     left: _SegmentedSummary,
     right: _SegmentedSummary,
 ) -> _SegmentedSummary:
-    """Merge summaries while discarding everything before a right-hand reset."""
+    """Merge summaries while discarding everything before a right-hand reset.
+
+    :param _SegmentedSummary left: Summary for the earlier interval.
+    :param _SegmentedSummary right: Summary for the later interval.
+    :return _SegmentedSummary: Reset-aware summary for the concatenated interval.
+    """
     merged = _merge_m2(
         _MomentSummary(left.count, left.mean, left.m2),
         _MomentSummary(right.count, right.mean, right.m2),
@@ -91,7 +105,13 @@ def _shifted_cumsum_prefix(
     block_var: Array,
     initial: NormState,
 ) -> tuple[Array, Array, Array]:
-    """Compute an unmasked prefix from one shifted first/second-moment cumsum."""
+    """Compute an unmasked prefix from one shifted first/second-moment cumsum.
+
+    :param Array block_mean: Per-token population means by group.
+    :param Array block_var: Per-token population variances by group.
+    :param NormState initial: Incoming causal normalization state.
+    :return tuple[Array, Array, Array]: Prefix counts, means, and population variances.
+    """
     _, length, groups = block_mean.shape
     anchor = jnp.where(initial.count[:, None] > 0, initial.mean, block_mean[:, 0])
     anchor = jax.lax.stop_gradient(anchor)
@@ -199,7 +219,11 @@ class TimestepNorm(eqx.Module):
         self.bias = jnp.zeros(num_features, dtype=jnp.float32)
 
     def _prior_state(self, batch_size: int) -> NormState:
-        """Create the source-compatible initial state for a batch."""
+        """Create the source-compatible initial state for a batch.
+
+        :param int batch_size: Number of rows in the batch.
+        :return NormState: Broadcast learned prior or default zero-history state.
+        """
         count = jnp.full((batch_size,), self.prior_count, dtype=jnp.int32)
         if self.prior_mean is None:
             mean = jnp.zeros((batch_size, self.num_groups), dtype=jnp.float32)

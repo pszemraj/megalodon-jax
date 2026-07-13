@@ -53,6 +53,12 @@ def get_initializer(
     """
 
     def require_matrix(shape: tuple[int, ...]) -> tuple[int, int]:
+        """Return fan-in and fan-out for a matrix-shaped parameter.
+
+        :param tuple[int, ...] shape: Parameter shape ending in output and input axes.
+        :raises ValueError: If ``shape`` does not describe a matrix.
+        :return tuple[int, int]: Fan-in and fan-out.
+        """
         if len(shape) < 2:
             raise ValueError(f"{mode} initializer requires a matrix shape, got {shape}")
         return int(shape[-1]), int(shape[-2])
@@ -60,6 +66,13 @@ def get_initializer(
     if mode == "he":
 
         def he(key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32) -> Array:
+            """Draw source-compatible Kaiming-normal values.
+
+            :param PRNGKeyArray key: Random key.
+            :param tuple[int, ...] shape: Output array shape.
+            :param jnp.dtype dtype: Output dtype.
+            :return Array: Initialized array.
+            """
             fan_in, _ = require_matrix(shape)
             std = 1.0 / jnp.sqrt(3.0 * fan_in)
             return jax.random.normal(key, shape, dtype=dtype) * std
@@ -71,6 +84,13 @@ def get_initializer(
         def xavier(
             key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
         ) -> Array:
+            """Draw Xavier-uniform values.
+
+            :param PRNGKeyArray key: Random key.
+            :param tuple[int, ...] shape: Output array shape.
+            :param jnp.dtype dtype: Output dtype.
+            :return Array: Initialized array.
+            """
             fan_in, fan_out = require_matrix(shape)
             bound = jnp.sqrt(6.0 / (fan_in + fan_out))
             return jax.random.uniform(
@@ -88,6 +108,13 @@ def get_initializer(
         def bert(
             key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
         ) -> Array:
+            """Draw normal values with the BERT standard deviation.
+
+            :param PRNGKeyArray key: Random key.
+            :param tuple[int, ...] shape: Output array shape.
+            :param jnp.dtype dtype: Output dtype.
+            :return Array: Initialized array.
+            """
             return jax.random.normal(key, shape, dtype=dtype) * 0.02
 
         return bert
@@ -98,6 +125,13 @@ def get_initializer(
         def gaussian(
             key: PRNGKeyArray, shape: tuple[int, ...], dtype: jnp.dtype = jnp.float32
         ) -> Array:
+            """Draw truncated-normal values using the configured deviation.
+
+            :param PRNGKeyArray key: Random key.
+            :param tuple[int, ...] shape: Output array shape.
+            :param jnp.dtype dtype: Output dtype.
+            :return Array: Initialized array.
+            """
             values = jax.random.truncated_normal(
                 key,
                 lower=-3.0,
@@ -115,7 +149,11 @@ def get_initializer(
 def get_boundary_initializer(
     model_dim: int,
 ) -> Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]:
-    """Return the fixed embedding/output-head initializer from upstream."""
+    """Return the fixed embedding/output-head initializer from upstream.
+
+    :param int model_dim: Model width controlling the initializer standard deviation.
+    :return Callable[[PRNGKeyArray, tuple[int, ...], jnp.dtype], Array]: Boundary initializer.
+    """
     if model_dim <= 0:
         raise ValueError(f"model_dim must be positive, got {model_dim}")
     return get_initializer("gaussian", dim=model_dim)

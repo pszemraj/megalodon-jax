@@ -279,7 +279,12 @@ class MegalodonConfig:
 
     @classmethod
     def from_upstream_mega200m(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
-        """Create the released mega200M configuration."""
+        """Create the released mega200M configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released mega200M configuration.
+        """
         return cls(
             vocab_size=vocab_size,
             output_size=output_size,
@@ -295,7 +300,12 @@ class MegalodonConfig:
 
     @classmethod
     def from_upstream_mega1_3b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
-        """Create the released mega1.3B configuration."""
+        """Create the released mega1.3B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released mega1.3B configuration.
+        """
         return cls(
             vocab_size=vocab_size,
             output_size=output_size,
@@ -313,7 +323,12 @@ class MegalodonConfig:
     def from_upstream_mega1_3b_pg19(
         cls, *, vocab_size: int, output_size: int = -1
     ) -> "MegalodonConfig":
-        """Create the released tied PG-19 mega1.3B configuration."""
+        """Create the released tied PG-19 mega1.3B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released tied PG-19 mega1.3B configuration.
+        """
         return cls(
             vocab_size=vocab_size,
             output_size=output_size,
@@ -332,7 +347,12 @@ class MegalodonConfig:
 
     @classmethod
     def from_upstream_mega7_1b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
-        """Create the released non-SwiGLU mega7.1B configuration."""
+        """Create the released non-SwiGLU mega7.1B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released non-SwiGLU mega7.1B configuration.
+        """
         return cls(
             vocab_size=vocab_size,
             output_size=output_size,
@@ -348,7 +368,12 @@ class MegalodonConfig:
 
     @classmethod
     def from_upstream_mega7_3b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
-        """Create the released SwiGLU mega7.3B configuration."""
+        """Create the released SwiGLU mega7.3B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released SwiGLU mega7.3B configuration.
+        """
         return cls(
             vocab_size=vocab_size,
             output_size=output_size,
@@ -365,7 +390,12 @@ class MegalodonConfig:
 
     @classmethod
     def from_paper_7b(cls, *, vocab_size: int = 32_000, output_size: int = -1) -> "MegalodonConfig":
-        """Create the distinct 7B training configuration reported in the paper."""
+        """Create the distinct 7B training configuration reported in the paper.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Training configuration reported for the paper's 7B model.
+        """
         return cls(
             vocab_size=vocab_size,
             output_size=output_size,

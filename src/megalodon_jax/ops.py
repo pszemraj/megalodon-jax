@@ -22,7 +22,11 @@ from jaxtyping import Array, Float
 
 
 def dot_precision(compute_dtype: jnp.dtype) -> jax.lax.Precision | None:
-    """Select full FP32 products without constraining native BF16 GEMMs."""
+    """Select full FP32 products without constraining native BF16 GEMMs.
+
+    :param jnp.dtype compute_dtype: Matrix-product compute dtype.
+    :return jax.lax.Precision | None: Highest precision for FP32, otherwise the backend default.
+    """
     if jnp.dtype(compute_dtype) == jnp.dtype(jnp.float32):
         return jax.lax.Precision.HIGHEST
     return None
@@ -36,7 +40,16 @@ def _matmul_3d(
     output_dtype: jnp.dtype,
     bias: Array | None = None,
 ) -> Array:
-    """Apply the shared mixed-precision matrix product used by 3D projections."""
+    """Apply the shared mixed-precision matrix product used by 3D projections.
+
+    :param Array x: Input tensor with its feature dimension last.
+    :param Array weight: Output-by-input weight matrix.
+    :param jnp.dtype compute_dtype: Operand dtype used by the matrix product.
+    :param jnp.dtype accum_dtype: Preferred accumulation dtype.
+    :param jnp.dtype output_dtype: Dtype of the returned tensor.
+    :param Array | None bias: Optional output-feature bias.
+    :return Array: Projected tensor in ``output_dtype``.
+    """
     y = jnp.matmul(
         x.astype(compute_dtype),
         weight.astype(compute_dtype).T,

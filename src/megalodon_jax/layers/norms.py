@@ -20,7 +20,12 @@ from jaxtyping import Array, Float, PRNGKeyArray
 
 
 def _rms_normalize(x: Array, eps: float) -> Array:
-    """Return RMS-normalized values in fp32 for numerically sensitive callers."""
+    """Return RMS-normalized values in fp32 for numerically sensitive callers.
+
+    :param Array x: Values to normalize over their final axis.
+    :param float eps: Numerical stability epsilon added to the mean square.
+    :return Array: RMS-normalized fp32 values.
+    """
     x_f32 = x.astype(jnp.float32)
     rms = jnp.sqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + eps)
     return x_f32 / rms

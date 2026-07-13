@@ -40,7 +40,13 @@ def _require_dropout_key(
     deterministic: bool,
     key: PRNGKeyArray | None,
 ) -> None:
-    """Reject training-time dropout without an explicit PRNG key."""
+    """Reject training-time dropout without an explicit PRNG key.
+
+    :param MegalodonConfig config: Configuration containing dropout probabilities.
+    :param bool deterministic: Whether the call disables stochastic operations.
+    :param PRNGKeyArray | None key: PRNG key supplied for stochastic execution.
+    :raises ValueError: If dropout is active during training and no key is supplied.
+    """
     dropout_enabled = any(
         rate > 0.0 for rate in (config.dropout, config.attention_dropout, config.hidden_dropout)
     )

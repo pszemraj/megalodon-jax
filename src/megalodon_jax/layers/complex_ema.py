@@ -399,7 +399,12 @@ class ComplexEMA(eqx.Module):
         x: Float[Array, "batch dim seq"],
         h_init: Complex[Array, "batch dim ndim"] | None = None,
     ) -> Complex[Array, "batch dim ndim"]:
-        """Advance only the compact recurrent state without emitting outputs."""
+        """Advance only the compact recurrent state without emitting outputs.
+
+        :param Float[Array, "batch dim seq"] x: Input sequence.
+        :param Complex[Array, "batch dim ndim"] | None h_init: Optional incoming EMA state.
+        :return Complex[Array, "batch dim ndim"]: Final recurrent state.
+        """
         batch, dim, _ = x.shape
         p, q, _ = self._coeffs()
         if h_init is None:
@@ -408,6 +413,12 @@ class ComplexEMA(eqx.Module):
         q_b = q[None, :, :]
 
         def step(h: Array, x_t: Array) -> tuple[Array, None]:
+            """Advance the recurrent state by one timestep.
+
+            :param Array h: Previous complex EMA state.
+            :param Array x_t: Input vectors for one timestep.
+            :return tuple[Array, None]: Updated state and an empty scan output.
+            """
             x_t_c = x_t[:, :, None].astype(jnp.complex64)
             return q_b * h + p_b * x_t_c, None
 

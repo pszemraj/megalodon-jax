@@ -53,6 +53,11 @@ _DTYPE_FIELDS = (
 
 
 def _config_dict(config: MegalodonConfig) -> dict[str, Any]:
+    """Serialize a model configuration with portable dtype names.
+
+    :param MegalodonConfig config: Configuration to serialize.
+    :return dict[str, Any]: Configuration fields suitable for JSON encoding.
+    """
     data = dataclasses.asdict(config)
     for field in _DTYPE_FIELDS:
         data[field] = str(jnp.dtype(data[field]))
@@ -60,10 +65,21 @@ def _config_dict(config: MegalodonConfig) -> dict[str, Any]:
 
 
 def _config_json(config: MegalodonConfig) -> str:
+    """Encode a model configuration as deterministic compact JSON.
+
+    :param MegalodonConfig config: Configuration to encode.
+    :return str: Deterministic JSON representation.
+    """
     return json.dumps(_config_dict(config), sort_keys=True, separators=(",", ":"))
 
 
 def _config_from_json(payload: str) -> MegalodonConfig:
+    """Decode and validate a checkpoint configuration.
+
+    :param str payload: JSON-encoded configuration.
+    :raises ValueError: If the payload is invalid or uses an unsupported schema or dtype.
+    :return MegalodonConfig: Validated model configuration.
+    """
     try:
         data = json.loads(payload)
     except json.JSONDecodeError as exc:
@@ -87,11 +103,20 @@ def _config_from_json(payload: str) -> MegalodonConfig:
 
 
 def config_fingerprint(config: MegalodonConfig) -> str:
-    """Return the stable fingerprint used to bind caches and checkpoints."""
+    """Return the stable fingerprint used to bind caches and checkpoints.
+
+    :param MegalodonConfig config: Configuration to fingerprint.
+    :return str: SHA-256 digest of the canonical configuration JSON.
+    """
     return hashlib.sha256(_config_json(config).encode("utf-8")).hexdigest()
 
 
 def _manifest(tensors: dict[str, Array]) -> str:
+    """Fingerprint tensor names, shapes, and dtypes.
+
+    :param dict[str, Array] tensors: Named tensors in the persisted artifact.
+    :return str: SHA-256 digest of the canonical tensor schema.
+    """
     rows = [
         (name, tuple(int(size) for size in value.shape), str(value.dtype))
         for name, value in sorted(tensors.items())
@@ -106,7 +131,13 @@ def _require_exact_keys(
     *,
     context: str,
 ) -> None:
-    """Require an exact key set and report both sides of any mismatch."""
+    """Require an exact key set and report both sides of any mismatch.
+
+    :param Collection[str] actual: Keys present in the input.
+    :param Collection[str] expected: Required keys.
+    :param str context: Description included in a mismatch error.
+    :raises ValueError: If keys are missing or unexpected.
+    """
     actual_set = set(actual)
     expected_set = set(expected)
     missing = sorted(expected_set - actual_set)
@@ -123,7 +154,17 @@ def _require_tensor(
     *,
     context: str,
 ) -> Array:
-    """Return a tensor only when its shape and dtype match exactly."""
+    """Return a tensor only when its shape and dtype match exactly.
+
+    :param dict[str, Array] tensors: Tensor mapping to inspect.
+    :param str name: Tensor key to retrieve.
+    :param tuple[int, ...] shape: Required tensor shape.
+    :param jnp.dtype dtype: Required tensor dtype.
+    :param str context: Description included in validation errors.
+    :raises KeyError: If ``name`` is absent.
+    :raises ValueError: If the tensor shape or dtype differs.
+    :return Array: Validated tensor.
+    """
     value = tensors[name]
     if value.shape != shape:
         raise ValueError(f"{context} {name} has shape {value.shape}, expected {shape}")
@@ -140,7 +181,15 @@ def _load_manifest_tensors(
     manifest_key: str,
     error: str,
 ) -> dict[str, Array]:
-    """Load tensors and validate the schema manifest recorded in metadata."""
+    """Load tensors and validate the schema manifest recorded in metadata.
+
+    :param Path path: SafeTensors file to load.
+    :param dict[str, str] metadata: Artifact metadata.
+    :param str manifest_key: Metadata key containing the expected manifest digest.
+    :param str error: Error message for a manifest mismatch.
+    :raises ValueError: If the loaded tensor manifest does not match the metadata.
+    :return dict[str, Array]: Loaded tensor mapping.
+    """
     tensors = load_file(str(path))
     if _manifest(tensors) != metadata.get(manifest_key):
         raise ValueError(error)
@@ -154,7 +203,14 @@ def _save_atomic_safetensors(
     *,
     suffix_error: str,
 ) -> None:
-    """Write a SafeTensors file atomically after validating its suffix."""
+    """Write a SafeTensors file atomically after validating its suffix.
+
+    :param Path destination: Final SafeTensors path.
+    :param dict[str, Array] tensors: Tensors to persist.
+    :param dict[str, str] metadata: Metadata to persist.
+    :param str suffix_error: Error message for a non-SafeTensors destination.
+    :raises ValueError: If ``destination`` does not use the ``.safetensors`` suffix.
+    """
     if destination.suffix != ".safetensors":
         raise ValueError(suffix_error)
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -170,9 +226,20 @@ Entry = tuple[
 
 
 def _model_entries(model: MegalodonForCausalLM) -> list[Entry]:
+    """Enumerate native checkpoint parameters and their replacement selectors.
+
+    :param MegalodonForCausalLM model: Model whose parameters are enumerated.
+    :return list[Entry]: Native name, current value, and Equinox selector triples.
+    """
     entries: list[Entry] = []
 
     def add(name: str, value: Array, where: Callable[[MegalodonForCausalLM], Array]) -> None:
+        """Append one native checkpoint entry.
+
+        :param str name: Native checkpoint key.
+        :param Array value: Current parameter value.
+        :param Callable[[MegalodonForCausalLM], Array] where: Parameter selector.
+        """
         entries.append((name, value, where))
 
     add("model.embed.weight", model.model.embed.weight, lambda root: root.model.embed.weight)
@@ -276,11 +343,21 @@ def _model_entries(model: MegalodonForCausalLM) -> list[Entry]:
 
 
 def model_state_dict(model: MegalodonForCausalLM) -> dict[str, Array]:
-    """Return the canonical v2 native parameter mapping."""
+    """Return the canonical v2 native parameter mapping.
+
+    :param MegalodonForCausalLM model: Model to serialize.
+    :return dict[str, Array]: Native checkpoint parameter mapping.
+    """
     return {name: value for name, value, _ in _model_entries(model)}
 
 
 def _metadata(path: Path) -> dict[str, str]:
+    """Read SafeTensors metadata from a file.
+
+    :param Path path: SafeTensors file to inspect.
+    :raises ValueError: If the file is not readable as SafeTensors.
+    :return dict[str, str]: File metadata, or an empty mapping when absent.
+    """
     try:
         with safe_open(str(path), framework="flax") as handle:
             metadata = handle.metadata()
@@ -290,6 +367,13 @@ def _metadata(path: Path) -> dict[str, str]:
 
 
 def _read_model_file(path: Path) -> tuple[dict[str, Array], dict[str, str]]:
+    """Load a native checkpoint after validating its format and metadata.
+
+    :param Path path: Native checkpoint path.
+    :raises FileNotFoundError: If the checkpoint does not exist.
+    :raises ValueError: If its format, metadata, configuration, or manifest is invalid.
+    :return tuple[dict[str, Array], dict[str, str]]: Tensors and validated metadata.
+    """
     if not path.is_file():
         raise FileNotFoundError(path)
     metadata = _metadata(path)
@@ -346,6 +430,14 @@ def _apply_parameters(
     *,
     include: Collection[str] | None = None,
 ) -> tuple[MegalodonForCausalLM, dict[str, Any]]:
+    """Apply strict checkpoint tensors to a model.
+
+    :param MegalodonForCausalLM model: Model providing parameter shapes and selectors.
+    :param dict[str, Array] tensors: Native checkpoint tensor mapping.
+    :param Collection[str] | None include: Optional explicit subset to restore.
+    :raises ValueError: If keys, shapes, dtypes, or a partial selection are invalid.
+    :return tuple[MegalodonForCausalLM, dict[str, Any]]: Updated model and restore report.
+    """
     entries = _model_entries(model)
     expected = {name for name, _, _ in entries}
     available = set(tensors)
@@ -379,7 +471,12 @@ def _apply_parameters(
 
 
 def save_checkpoint(model: MegalodonForCausalLM, path: str | Path) -> None:
-    """Save a strict native v2 model checkpoint."""
+    """Save a strict native v2 model checkpoint.
+
+    :param MegalodonForCausalLM model: Model to save.
+    :param str | Path path: Destination ending in ``.safetensors``.
+    :raises ValueError: If the destination suffix is invalid.
+    """
     destination = Path(path)
     tensors = model_state_dict(model)
     config_json = _config_json(model.config)
@@ -409,7 +506,14 @@ def load_checkpoint(
     *,
     key: Array,
 ) -> MegalodonForCausalLM:
-    """Load a strict native v2 model checkpoint."""
+    """Load a strict native v2 model checkpoint.
+
+    :param str | Path path: Native checkpoint path.
+    :param Array key: PRNG key used to construct the target model.
+    :raises FileNotFoundError: If the checkpoint does not exist.
+    :raises ValueError: If the checkpoint is incompatible or malformed.
+    :return MegalodonForCausalLM: Restored model.
+    """
     tensors, metadata = _read_model_file(Path(path))
     config = _config_from_json(metadata["config_json"])
     model = MegalodonForCausalLM(config, key=key)
@@ -424,7 +528,16 @@ def load_partial_checkpoint(
     *,
     key: Array,
 ) -> tuple[MegalodonForCausalLM, dict[str, Any]]:
-    """Restore an explicit parameter allowlist into a freshly initialized model."""
+    """Restore an explicit parameter allowlist into a freshly initialized model.
+
+    :param str | Path path: Native checkpoint path.
+    :param MegalodonConfig config: Configuration for the target model.
+    :param Collection[str] include: Native parameter names to restore.
+    :param Array key: PRNG key used to initialize parameters not restored.
+    :raises FileNotFoundError: If the checkpoint does not exist.
+    :raises ValueError: If the checkpoint or restore selection is invalid.
+    :return tuple[MegalodonForCausalLM, dict[str, Any]]: Model and restore report.
+    """
     tensors, metadata = _read_model_file(Path(path))
     model = MegalodonForCausalLM(config, key=key)
     model, report = _apply_parameters(model, tensors, include=include)
@@ -441,6 +554,12 @@ def load_partial_checkpoint(
 
 
 def _cache_tensors(cache: ModelCache) -> tuple[dict[str, Array], list[str]]:
+    """Flatten a model cache into persisted tensors and presence records.
+
+    :param ModelCache cache: Inference cache to flatten.
+    :raises ValueError: If a layer position differs from its attention count.
+    :return tuple[dict[str, Array], list[str]]: Tensor mapping and component presence list.
+    """
     tensors: dict[str, Array] = {}
     present: list[str] = []
     for index, layer in enumerate(cache.layer_caches):
@@ -478,7 +597,13 @@ def save_inference_cache(
     path: str | Path,
     config: MegalodonConfig,
 ) -> None:
-    """Save an inference cache bound to an exact model configuration."""
+    """Save an inference cache bound to an exact model configuration.
+
+    :param ModelCache cache: Inference cache to save.
+    :param str | Path path: Destination ending in ``.safetensors``.
+    :param MegalodonConfig config: Exact configuration that owns the cache.
+    :raises ValueError: If the cache is invalid or the destination suffix is wrong.
+    """
     destination = Path(path)
     validate_model_cache_host(cache, config)
     tensors, present = _cache_tensors(cache)
@@ -501,7 +626,13 @@ def load_inference_cache(
     path: str | Path,
     config: MegalodonConfig,
 ) -> ModelCache:
-    """Load a same-schema inference cache for an exact configuration."""
+    """Load a same-schema inference cache for an exact configuration.
+
+    :param str | Path path: Inference-cache SafeTensors path.
+    :param MegalodonConfig config: Exact configuration expected by the caller.
+    :raises ValueError: If metadata, tensors, cache structure, or configuration is invalid.
+    :return ModelCache: Validated inference cache.
+    """
     source = Path(path)
     metadata = _metadata(source)
     if (
@@ -572,6 +703,12 @@ def load_inference_cache(
     batch_size: int | None = None
 
     def bind_batch(name: str, size: int) -> None:
+        """Bind or validate the common cache batch size.
+
+        :param str name: Tensor name used in a mismatch error.
+        :param int size: Tensor batch dimension.
+        :raises ValueError: If ``size`` differs from an earlier tensor.
+        """
         nonlocal batch_size
         if batch_size is None:
             batch_size = size
@@ -579,6 +716,15 @@ def load_inference_cache(
             raise ValueError(f"cache batch mismatch at {name}: {size} != {batch_size}")
 
     def require(name: str, shape: tuple[int, ...], dtype: jnp.dtype) -> Array:
+        """Retrieve one cache tensor with exact shape and dtype validation.
+
+        :param str name: Tensor key to retrieve.
+        :param tuple[int, ...] shape: Required tensor shape.
+        :param jnp.dtype dtype: Required tensor dtype.
+        :raises KeyError: If ``name`` is absent.
+        :raises ValueError: If its shape or dtype differs.
+        :return Array: Validated cache tensor.
+        """
         return _require_tensor(tensors, name, shape, dtype, context="cache tensor")
 
     layers: list[LayerCache | None] = []

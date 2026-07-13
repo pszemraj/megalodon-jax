@@ -47,7 +47,12 @@ from megalodon_jax.types import AttentionCache, EMAState, LayerCache
 
 
 def _validate_dropout_rate(name: str, value: float) -> None:
-    """Reject probabilities that make inverted dropout undefined."""
+    """Reject probabilities that make inverted dropout undefined.
+
+    :param str name: Configuration field name used in validation errors.
+    :param float value: Dropout probability to validate.
+    :raises ValueError: If value is outside the half-open interval ``[0, 1)``.
+    """
     if not 0.0 <= value < 1.0:
         raise ValueError(f"{name} must be in [0, 1), got {value}")
 
@@ -61,7 +66,13 @@ def _validate_dropout_mode(mode: AttentionDropoutMode) -> None:
 
 
 def _inverted_dropout(x: Array, rate: float, key: PRNGKeyArray) -> Array:
-    """Apply inverted dropout while preserving the input dtype."""
+    """Apply inverted dropout while preserving the input dtype.
+
+    :param Array x: Activations to mask.
+    :param float rate: Probability of dropping each activation.
+    :param PRNGKeyArray key: Random key used to sample the keep mask.
+    :return Array: Masked activations rescaled by the inverse keep probability.
+    """
     keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
     inv_keep = jnp.asarray(1.0 / (1.0 - rate), dtype=x.dtype)
     return jnp.where(keep, x * inv_keep, jnp.zeros((), dtype=x.dtype))
@@ -331,11 +342,11 @@ def attention_multi_chunk(
         run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
         local_chunks = local_positions // chunk_size
 
-        def window_keys(z: jnp.ndarray, fill_value) -> jnp.ndarray:
+        def window_keys(z: jnp.ndarray, fill_value: jax.typing.ArrayLike) -> jnp.ndarray:
             """Prepend each chunk's predecessor along the key axis.
 
             :param jnp.ndarray z: Per-token array of shape (B, L_padded, ...).
-            :param fill_value: Fill for the first chunk's missing predecessor.
+            :param jax.typing.ArrayLike fill_value: Fill for the first chunk's missing predecessor.
             :return jnp.ndarray: Windowed array of shape (B*NC, 2*chunk, ...).
             """
             zc = z.reshape(B, num_chunks, chunk_size, *z.shape[2:])
@@ -489,7 +500,18 @@ class ChunkedAttention(eqx.Module):
         deterministic: bool,
         key: PRNGKeyArray | None,
     ) -> Float[Array, "batch seq heads value_dim"]:
-        """Evaluate the optional sliding extension without a cache."""
+        """Evaluate the optional sliding extension without a cache.
+
+        :param Float[Array, "batch seq heads head_dim"] q: Query vectors.
+        :param Float[Array, "batch seq heads head_dim"] k: Key vectors.
+        :param Float[Array, "batch seq heads value_dim"] v: Value vectors.
+        :param Bool[Array, "batch seq"] | None mask: Optional token-validity mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional packed-sequence IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional rotary positions.
+        :param bool deterministic: Whether attention dropout is disabled.
+        :param PRNGKeyArray | None key: Random key used by attention dropout.
+        :return Float[Array, "batch seq heads value_dim"]: Sliding-attention output.
+        """
         batch, length = q.shape[:2]
         if segment_ids is not None:
             run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
@@ -542,7 +564,15 @@ class ChunkedAttention(eqx.Module):
         AttentionCache,
         Int[Array, ""],
     ]:
-        """Evaluate a pristine prompt vectorially and materialize its ring tail."""
+        """Evaluate a pristine prompt vectorially and materialize its ring tail.
+
+        :param Float[Array, "batch seq heads head_dim"] q: Prompt query vectors.
+        :param Float[Array, "batch seq heads head_dim"] k: Prompt key vectors.
+        :param Float[Array, "batch seq heads value_dim"] v: Prompt value vectors.
+        :param bool deterministic: Whether attention dropout is disabled.
+        :param PRNGKeyArray | None key: Random key used by attention dropout.
+        :return tuple: Attention output, materialized ring cache, and prompt length.
+        """
         batch, length = q.shape[:2]
         if self.attention_window is None:
             out = attention_multi_chunk(
@@ -580,7 +610,13 @@ class ChunkedAttention(eqx.Module):
         )
 
         def rotate_key_at_position(q_t: Array, k_t: Array, position: Array) -> Array:
-            """Match the scalar-position rotation used by tokenwise decode."""
+            """Match the scalar-position rotation used by tokenwise decode.
+
+            :param Array q_t: Query vectors at one absolute timestep.
+            :param Array k_t: Key vectors at one absolute timestep.
+            :param Array position: Scalar rotary position for the timestep.
+            :return Array: Rotated key vectors.
+            """
             _, k_rot = self.rotary(q_t[:, None], k_t[:, None], position)
             return k_rot[:, 0]
 
@@ -718,6 +754,11 @@ class ChunkedAttention(eqx.Module):
             )
 
         def run_streaming(_: None) -> tuple[Array, AttentionCache | None, Array]:
+            """Run tokenwise attention while updating the fixed-capacity ring.
+
+            :param None _: Unused operand supplied by ``lax.cond``.
+            :return tuple: Attention output, optional updated cache, and final position.
+            """
             use_rng = not deterministic and self.attention_dropout > 0.0
             rng = key if key is not None else jax.random.PRNGKey(0)
             slots = jnp.arange(capacity, dtype=jnp.int32)
@@ -726,6 +767,12 @@ class ChunkedAttention(eqx.Module):
                 carry: tuple[Array, Array, Array, Array],
                 inputs: tuple[Array, Array, Array],
             ) -> tuple[tuple[Array, Array, Array, Array], Array]:
+                """Process one token and advance the ring-buffer state.
+
+                :param tuple carry: Cached keys, cached values, position, and random key.
+                :param tuple inputs: Query, key, and value vectors for one timestep.
+                :return tuple: Updated carry and the timestep attention output.
+                """
                 current_k, current_v, position, current_rng = carry
                 q_t, k_t, v_t = inputs
                 rope_position = (
@@ -1034,6 +1081,11 @@ class MegalodonAttention(eqx.Module):
         cema_input = x_tn.transpose(0, 2, 1)  # (B, D, L)
 
         def run_cema(h_init: Array | None) -> tuple[Array, Array | None]:
+            """Apply CEMA using an optional incoming recurrent state.
+
+            :param Array | None h_init: Incoming complex EMA state.
+            :return tuple[Array, Array | None]: CEMA output and optional final state.
+            """
             return self.cema(
                 cema_input,
                 h_init=h_init,

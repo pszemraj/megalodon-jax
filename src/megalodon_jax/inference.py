@@ -132,7 +132,12 @@ def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, "batch"]:
 
 
 def _top_k(logits: Array, k: int) -> tuple[Array, Array]:
-    """Run ``lax.top_k`` after clamping k to the vocabulary width."""
+    """Run ``lax.top_k`` after clamping k to the vocabulary width.
+
+    :param Array logits: Logits whose final axis is the vocabulary dimension.
+    :param int k: Requested number of leading values and indices.
+    :return tuple[Array, Array]: Top values and their indices, ordered by value.
+    """
     return jax.lax.top_k(logits, min(k, logits.shape[-1]))
 
 
@@ -259,7 +264,14 @@ def _validate_sampling(
     top_p: float | None,
     output_size: int,
 ) -> None:
-    """Validate sampling controls before selecting greedy or stochastic execution."""
+    """Validate sampling controls before selecting greedy or stochastic execution.
+
+    :param float temperature: Sampling temperature, including zero for greedy decoding.
+    :param int | None top_k: Maximum number of candidate tokens, or None.
+    :param float | None top_p: Nucleus probability threshold, or None.
+    :param int output_size: Width of the model output vocabulary.
+    :raises ValueError: If a control is non-finite, out of range, or has an invalid type.
+    """
     if not math.isfinite(temperature) or temperature < 0.0:
         raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
     if top_k is not None:
