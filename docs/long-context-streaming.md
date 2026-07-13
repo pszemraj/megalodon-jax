@@ -78,9 +78,9 @@ sequenceDiagram
 
 ## Cache integrity and indexing
 
-Direct `MegalodonBlock` calls accept either a sparse zero-history `LayerCache` or complete attention, TimestepNorm, and CEMA state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, non-finite normalization or EMA state, and negative variances. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V payload as described in [Inference cache persistence](jax-torch.md#inference-cache-persistence).
+Top-level `ModelCache` values use exactly two schemas: the sparse initializer has `None` for every layer and final normalization state, while a continuation contains every attention, TimestepNorm, CEMA, and final-normalization component. Direct `MegalodonBlock` calls separately accept either an empty `LayerCache()` or complete layer state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, invalid array schemas, non-finite normalization values, and negative variances; model entry also checks compact EMA state. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V payload as described in [Inference cache persistence](jax-torch.md#inference-cache-persistence).
 
-`index_cache(cache, indices)` reorders or duplicates allocated batch state for beam search. Indices must be a rank-one integer array within the allocated batch range; repeated, reordered, and empty selections are supported. A sparse cache without allocated batch state accepts only an empty selection.
+`index_cache(cache, indices)` reorders or duplicates allocated batch state for beam search. Indices must be a rank-one int32 array within the allocated batch range; repeated, reordered, and empty selections are supported. A sparse cache without allocated batch state accepts only an empty selection.
 
 ## RoPE offsets
 

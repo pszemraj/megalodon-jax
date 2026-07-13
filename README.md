@@ -151,7 +151,7 @@ The [documentation index](docs/README.md) covers streaming and packed execution,
 ```
 src/megalodon_jax/
 ├── config.py          # MegalodonConfig (frozen dataclass)
-├── cache.py           # Sparse cache construction and invariant checks
+├── cache.py           # Cache schema and invariant checks
 ├── checkpoint.py      # Strict native model/cache persistence
 ├── convert.py         # Exact original-upstream checkpoint conversion
 ├── inference.py       # Cache indexing, sampling, and generation
