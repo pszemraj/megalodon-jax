@@ -57,6 +57,8 @@ The default training matrix enables gradient checkpointing and covers batches 1/
 
 The cross-revision default uses tied embedding/output weights because historical `main` inferred tying for vocabulary-sized outputs. Measure the current untied production topology separately with `--config-json '{"share_emb": false}'`. Topology-sensitive cases that cannot match the requested topology are recorded as `completed_noncomparable` and excluded from cross-revision timing ratios.
 
+Stochastic training cases derive a repeatable dropout key from the case seed. When dropout is active, packed cases validate the timed stochastic loss and gradients for finiteness, then use a separate untimed deterministic packed-versus-independent reference because changing document batch shapes necessarily changes dropout masks.
+
 Run the benchmark with the default compiler configuration. Do not mix results produced with different `XLA_FLAGS` or CUDA library search paths.
 
 ```bash

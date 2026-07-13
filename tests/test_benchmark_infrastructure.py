@@ -8,6 +8,9 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from benchmarks import benchmark_model_paths as benchmark
@@ -142,3 +145,64 @@ def test_supervisor_discards_stale_worker_result(
     assert report["summary"]["failed"] == 1
     assert report["cases"][0]["status"] == "failed"
     assert report["cases"][0]["error"]["type"] == "WorkerProcessError"
+
+
+def test_training_case_reuses_stable_dropout_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Timed and reference stochastic losses receive the same explicit key."""
+    observed_keys: list[np.ndarray] = []
+
+    class DropoutModel:
+        def compute_loss(
+            self,
+            *args: object,
+            deterministic: bool,
+            key: object,
+            **kwargs: object,
+        ) -> jax.Array:
+            del args, kwargs
+            assert deterministic is False
+            assert key is not None
+            observed_keys.append(np.asarray(key))
+            return jnp.asarray(1.25, dtype=jnp.float32)
+
+    def measure_once(
+        jax_module: object,
+        function: object,
+        arguments: tuple[object, ...],
+        warmups: int,
+        iterations: int,
+        profile_dir: Path | None,
+    ) -> tuple[dict[str, object], object]:
+        del jax_module, warmups, iterations, profile_dir
+        return {}, function(*arguments)
+
+    monkeypatch.setattr(benchmark, "_lower_compile_measure", measure_once)
+    case = {
+        "mode": "all_true",
+        "operation": "forward",
+        "seed": 1729,
+        "warmups": 0,
+        "iterations": 1,
+        "atol": 0.0,
+        "rtol": 0.0,
+    }
+    tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+    inputs = {
+        "prefix": tokens,
+        "labels": tokens,
+        "all_true": jnp.ones_like(tokens, dtype=jnp.bool_),
+    }
+    fake_eqx = SimpleNamespace(filter_jit=lambda function: function)
+
+    _, correctness = benchmark._training_case(
+        case,
+        jax,
+        jnp,
+        fake_eqx,
+        DropoutModel(),
+        inputs,
+    )
+
+    assert correctness["passed"] is True
+    assert len(observed_keys) == 2
+    np.testing.assert_array_equal(observed_keys[0], observed_keys[1])

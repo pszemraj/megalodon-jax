@@ -1304,14 +1304,21 @@ def _training_case(
     labels = inputs["labels"]
 
     def loss_function(
-        candidate: Any, token_ids: Any, target_ids: Any, attention_mask: Any, segment_ids: Any
+        candidate: Any,
+        token_ids: Any,
+        target_ids: Any,
+        attention_mask: Any,
+        segment_ids: Any,
+        dropout_key: Any,
+        deterministic: bool,
     ) -> Any:
         return candidate.compute_loss(
             token_ids,
             target_ids,
             attention_mask=attention_mask,
             segment_ids=segment_ids,
-            deterministic=False,
+            deterministic=deterministic,
+            key=dropout_key,
         )
 
     if case["operation"] == "forward":
@@ -1320,7 +1327,8 @@ def _training_case(
         function = eqx.filter_jit(eqx.filter_value_and_grad(loss_function))
     else:  # pragma: no cover - supervisor validates the operation
         raise ValueError(f"unsupported training operation: {case['operation']}")
-    arguments = (model, tokens, labels, mask, segments)
+    dropout_key = jax.random.fold_in(jax.random.PRNGKey(int(case["seed"])), 1)
+    arguments = (model, tokens, labels, mask, segments, dropout_key, False)
     metrics, result = _lower_compile_measure(
         jax,
         function,
@@ -1340,7 +1348,7 @@ def _training_case(
 
     reference: dict[str, Any] = {"kind": None, "max_abs_error": None, "passed": True}
     if mode == "all_true":
-        plain = eqx.filter_jit(loss_function)(model, tokens, labels, None, None)
+        plain = eqx.filter_jit(loss_function)(model, tokens, labels, None, None, dropout_key, False)
         _block_tree(jax, plain)
         error = abs(loss_value - float(plain))
         tolerance = float(case["atol"]) + float(case["rtol"]) * abs(float(plain))
@@ -1352,6 +1360,26 @@ def _training_case(
             "passed": error <= tolerance,
         }
     elif mode == "packed":
+        config = getattr(model, "config", None)
+        reference_deterministic = any(
+            float(getattr(config, name, 0.0)) > 0.0
+            for name in ("dropout", "attention_dropout", "hidden_dropout")
+        )
+        if reference_deterministic:
+            packed_reference_loss = eqx.filter_jit(loss_function)(
+                model,
+                tokens,
+                labels,
+                mask,
+                segments,
+                dropout_key,
+                True,
+            )
+            _block_tree(jax, packed_reference_loss)
+            reference_loss_value = float(packed_reference_loss)
+        else:
+            reference_loss_value = loss_value
+
         # Recover actual contiguous runs from host segment IDs. Raw identifiers
         # deliberately recur in non-adjacent runs, and each batch row rotates
         # the unaligned run-width pattern. Group equal widths so the independent
@@ -1393,21 +1421,25 @@ def _training_case(
                 document_labels,
                 None,
                 None,
+                dropout_key,
+                reference_deterministic,
             )
             _block_tree(jax, document_loss)
             weight = len(runs) * (width - 1)
             weighted_loss += float(document_loss) * weight
             transitions += weight
         expected = weighted_loss / max(transitions, 1)
-        error = abs(loss_value - expected)
+        error = abs(reference_loss_value - expected)
         tolerance = float(case["atol"]) + float(case["rtol"]) * abs(expected)
         reference = {
             "kind": "transition_weighted_independent_segments",
+            "observed_loss": reference_loss_value,
             "expected_loss": expected,
             "max_abs_error": error,
             "tolerance": tolerance,
             "passed": error <= tolerance,
             "row_run_lengths": row_run_lengths,
+            "deterministic_auxiliary": reference_deterministic,
         }
 
     gradients_pass = gradient_summary is None or gradient_summary["finite"]
