@@ -112,11 +112,11 @@ class TestTimestepNorm:
         x = jax.random.normal(key, (batch, seq, dim))
 
         # Full sequence at once
-        y_full, state_full = jax_norm(x)
+        y_full, _ = jax_norm(x)
 
         # Process in two chunks with state passing
         y1, state1 = jax_norm(x[:, :16, :])
-        y2, state2 = jax_norm(x[:, 16:, :], state=state1)
+        y2, _ = jax_norm(x[:, 16:, :], state=state1)
         y_chunked = jnp.concatenate([y1, y2], axis=1)
 
         # Outputs should match (with some tolerance due to floating point)
@@ -989,7 +989,7 @@ class TestComplexEMA:
 
         # Two chunks with state passing
         y1, h1 = jax_ema(x[:, :, :16], return_state=True)
-        y2, h2 = jax_ema(x[:, :, 16:], h_init=h1, return_state=True)
+        y2, _ = jax_ema(x[:, :, 16:], h_init=h1, return_state=True)
         y_chunked = jnp.concatenate([y1, y2], axis=-1)
 
         # Should match (within numerical tolerance)

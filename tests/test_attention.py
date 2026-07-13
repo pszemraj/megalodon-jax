@@ -1570,7 +1570,7 @@ class TestParity:
         cache = AttentionCache(k=cache_k, v=cache_v, count=jnp.array(2, dtype=jnp.int32))
 
         # Process multi-token call that spans boundary
-        out_multi, cache_multi, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
+        out_multi, _, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
 
         # Now compare with token-by-token processing
         streaming_outputs = []

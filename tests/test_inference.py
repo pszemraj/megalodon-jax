@@ -27,6 +27,7 @@ from megalodon_jax.convert import (
     load_from_pretrained,
     load_upstream_checkpoint,
     load_upstream_state_dict,
+    load_weights_from_torch,
     save_safetensors,
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token
@@ -996,6 +997,8 @@ class TestConversion:
         model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
         with pytest.raises(RuntimeError, match="export_upstream_state_dict"):
             convert_jax_to_torch(model)
+        with pytest.raises(RuntimeError, match="load_upstream_state_dict"):
+            load_weights_from_torch({})
         with pytest.raises(RuntimeError, match="save_checkpoint"):
             save_safetensors(model, tmp_path / "model.safetensors")
         with pytest.raises(RuntimeError, match="load_checkpoint"):
