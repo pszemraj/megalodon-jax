@@ -35,7 +35,7 @@ CI runs the fast gate on Python 3.11 and 3.13 with the minimum supported JAX and
 
 ## Modeling verifier
 
-`tools/verify_modeling_correctness.py` compares the implementation with independent mathematical oracles and the exact released source. It requires local paths to the paper and original source tree. A release-quality run includes the slow forward, gradient, optimizer, conversion, save/reload, and cache-partition checks:
+`tools/verify_modeling_correctness.py` compares the implementation with independent mathematical oracles and, when available, the exact released source. Repository-only checks run without the untracked evidence files and report source-anchoring checks as skipped. A release-quality run supplies both local evidence paths and includes the slow forward, gradient, optimizer, conversion, save/reload, and cache-partition checks:
 
 ```bash
 conda run --name mega-jax python tools/verify_modeling_correctness.py \

@@ -114,8 +114,6 @@ CANONICAL_CONFIG: dict[str, Any] = {
     "accum_dtype": "float32",
     "attention_softmax_dtype": "float32",
     "loss_softmax_dtype": "float32",
-    "softmax_dtype": "float32",
-    "gemm_backend": "default",
 }
 
 SOURCE_PATHS = (

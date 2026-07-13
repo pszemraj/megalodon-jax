@@ -2,9 +2,10 @@
 """Verify Megalodon JAX modeling semantics against local authoritative sources.
 
 This standalone verifier compares the JAX implementation against independent mathematical
-oracles and the exact local original PyTorch/CUDA source. It uses small deterministic
-examples and does not build the fused CUDA extension, import downstream ports, or import
-an installed Megalodon package.
+oracles and, when available, the exact local original PyTorch/CUDA source. Repository-only
+checks remain runnable without untracked evidence files; source-anchoring checks are reported
+as skipped. The verifier does not build the fused CUDA extension, import downstream ports, or
+import an installed Megalodon package.
 
 Usage:
     python tools/verify_modeling_correctness.py \
@@ -22,6 +23,7 @@ import argparse
 import dataclasses
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -324,24 +326,26 @@ def source_parameter_count(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    default_repo = Path("/mnt/data/megalodon-jax-extract/megalodon-jax")
     parser.add_argument(
         "--jax-repo",
         type=Path,
-        default=default_repo if default_repo.exists() else Path.cwd(),
+        default=Path.cwd(),
         help="Root of the megalodon-jax repository (must contain src/megalodon_jax).",
     )
     parser.add_argument(
         "--upstream-repo",
         type=Path,
         default=None,
-        help="Exact local original PyTorch/CUDA repository (defaults under local-scratch).",
+        help=(
+            "Exact local original PyTorch/CUDA repository; source checks use the "
+            "local-scratch default when present and skip otherwise"
+        ),
     )
     parser.add_argument(
         "--paper",
         type=Path,
         default=None,
-        help="Local paper Markdown path (defaults under local-scratch).",
+        help="Local paper Markdown path; recorded from local-scratch when present",
     )
     parser.add_argument(
         "--backend",
@@ -376,12 +380,15 @@ def main() -> int:
     if not package.is_dir():
         print(f"ERROR: {package} does not exist", file=sys.stderr)
         return 2
-    if not upstream.is_dir():
+    if args.upstream_repo is not None and not upstream.is_dir():
         print(f"ERROR: local upstream repository does not exist: {upstream}", file=sys.stderr)
         return 2
-    if not paper.is_file():
+    if args.paper is not None and not paper.is_file():
         print(f"ERROR: local paper does not exist: {paper}", file=sys.stderr)
         return 2
+    upstream_available = upstream.is_dir()
+    paper_available = paper.is_file()
+    upstream_config_path = upstream / "megalodon" / "config.py"
     repository_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repository_root))
     sys.path.insert(0, str(src))
@@ -552,27 +559,19 @@ def main() -> int:
 
     def check_rope_trainability() -> tuple[bool, str, dict[str, Any]]:
         module = RotaryEmbedding(8, base=10000.0)
-        q = jnp.arange(1, 9, dtype=jnp.float32).reshape(1, 1, 1, 8)
-        k = q * 1.3
-
-        def objective(m: Any) -> Any:
-            qo, ko = m(q, k, jnp.asarray(7, jnp.int32))
-            return jnp.sum(qo * 0.37 + ko * 0.11)
-
-        grad = eqx.filter_grad(objective)(module)
-        inv_grad = getattr(grad, "inv_freq", None)
-        if inv_grad is None:
-            norm = 0.0
-            passed = True
-        else:
-            norm = float(jnp.linalg.norm(inv_grad))
-            passed = norm == 0.0
+        array_leaves = [leaf for leaf in jax.tree.leaves(module) if eqx.is_array(leaf)]
+        passed = not array_leaves
         return (
             passed,
-            "RoPE frequencies are non-trainable"
+            "RoPE contains no trainable array leaves; frequencies are derived"
             if passed
-            else "RoPE inv_freq receives gradients and will enter generic Equinox optimizers",
-            {"inv_freq_gradient": inv_grad, "gradient_l2_norm": norm},
+            else "RoPE contains array leaves that will enter generic Equinox optimizers",
+            {
+                "array_leaf_count": len(array_leaves),
+                "array_leaves": [
+                    {"shape": list(leaf.shape), "dtype": str(leaf.dtype)} for leaf in array_leaves
+                ],
+            },
         )
 
     audit.run("rope_frequency_is_buffer", "P0", check_rope_trainability)
@@ -905,7 +904,15 @@ def main() -> int:
         )
         return passed, summary, facts
 
-    audit.run("upstream_initialization_contract", "INFO", check_upstream_init_contract)
+    if upstream_available:
+        audit.run("upstream_initialization_contract", "INFO", check_upstream_init_contract)
+    else:
+        audit.skip(
+            "upstream_initialization_contract",
+            "INFO",
+            "Local upstream source is unavailable; repository-only checks still ran",
+            expected_path=upstream,
+        )
 
     def check_torch_oracle_source_contract() -> tuple[bool, str, dict[str, Any]]:
         attention_path = upstream / "megalodon" / "modules" / "moving_average_gated_attention.py"
@@ -943,7 +950,15 @@ def main() -> int:
             },
         )
 
-    audit.run("torch_oracle_source_contract", "INFO", check_torch_oracle_source_contract)
+    if upstream_available:
+        audit.run("torch_oracle_source_contract", "INFO", check_torch_oracle_source_contract)
+    else:
+        audit.skip(
+            "torch_oracle_source_contract",
+            "INFO",
+            "Local upstream source is unavailable; the bundled oracle was not source-anchored",
+            expected_path=upstream,
+        )
 
     def check_cuda_source_mask_contract() -> tuple[bool, str, dict[str, Any]]:
         source_path = upstream / "megalodon" / "csrc" / "ops" / "timestep_norm_kernel.cu"
@@ -964,7 +979,15 @@ def main() -> int:
             },
         )
 
-    audit.run("cuda_timestep_mask_source_contract", "INFO", check_cuda_source_mask_contract)
+    if upstream_available:
+        audit.run("cuda_timestep_mask_source_contract", "INFO", check_cuda_source_mask_contract)
+    else:
+        audit.skip(
+            "cuda_timestep_mask_source_contract",
+            "INFO",
+            "Local upstream CUDA source is unavailable",
+            expected_path=upstream,
+        )
     audit.skip(
         "cuda_timestep_mask_runtime_parity",
         "INFO",
@@ -1197,11 +1220,20 @@ def main() -> int:
                 },
             )
 
-        audit.run(
-            "source_torch_jax_forward_gradient_parity",
-            "P0",
-            check_torch_forward_and_gradients,
-        )
+        torch_available = importlib.util.find_spec("torch") is not None
+        if torch_available:
+            audit.run(
+                "source_torch_jax_forward_gradient_parity",
+                "P0",
+                check_torch_forward_and_gradients,
+            )
+        else:
+            audit.skip(
+                "source_torch_jax_forward_gradient_parity",
+                "P0",
+                "PyTorch is unavailable; install the convert extra to run parity",
+                required_extra="convert",
+            )
 
         def check_short_adamw_parity() -> tuple[bool, str, dict[str, Any]]:
             import torch
@@ -1305,7 +1337,15 @@ def main() -> int:
                 },
             )
 
-        audit.run("source_torch_jax_three_step_adamw", "P0", check_short_adamw_parity)
+        if torch_available:
+            audit.run("source_torch_jax_three_step_adamw", "P0", check_short_adamw_parity)
+        else:
+            audit.skip(
+                "source_torch_jax_three_step_adamw",
+                "P0",
+                "PyTorch is unavailable; install the convert extra to run optimizer parity",
+                required_extra="convert",
+            )
 
         def check_tiny_overfit() -> tuple[bool, str, dict[str, Any]]:
             details = deterministic_tiny_overfit()
@@ -1491,8 +1531,8 @@ def main() -> int:
 
     print("\nMEGALODON JAX MODELING CORRECTNESS VERIFICATION")
     print(f"Repository: {repo}")
-    print(f"Upstream evidence: {upstream}")
-    print(f"Paper evidence: {paper}")
+    print(f"Upstream evidence: {upstream if upstream_available else 'unavailable'}")
+    print(f"Paper evidence: {paper if paper_available else 'unavailable'}")
     print(f"JAX: {jax.__version__}; platform: {jax.default_backend()}")
     print("-" * 100)
     for result in audit.results:
@@ -1517,10 +1557,12 @@ def main() -> int:
     report = {
         "repository": str(repo),
         "repository_commit": _git_revision(repo),
-        "upstream_repository": str(upstream),
-        "paper": str(paper),
-        "paper_sha256": _sha256(paper),
-        "upstream_config_sha256": _sha256(upstream / "megalodon" / "config.py"),
+        "upstream_repository": str(upstream) if upstream_available else None,
+        "paper": str(paper) if paper_available else None,
+        "paper_sha256": _sha256(paper) if paper_available else None,
+        "upstream_config_sha256": (
+            _sha256(upstream_config_path) if upstream_config_path.is_file() else None
+        ),
         "python_version": platform.python_version(),
         "jax_version": jax.__version__,
         "equinox_version": importlib.metadata.version("equinox"),

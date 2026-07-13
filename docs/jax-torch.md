@@ -93,4 +93,4 @@ Cache files are bound to the full configuration fingerprint and validate the exa
 
 ## Parity gates
 
-`tests/test_upstream_parity.py` uses a small differentiable Torch oracle derived from the exact released source. `tools/verify_modeling_correctness.py` additionally reads the local paper and upstream source paths supplied on its command line. Neither imports another Megalodon package or builds the fused extension. The complete gate compares full logits, every trainable upstream-schema gradient, and three AdamW steps; fused CUDA is checked at source level only.
+`tests/test_upstream_parity.py` uses a small differentiable Torch oracle derived from the exact released source. `tools/verify_modeling_correctness.py` additionally reads local paper and upstream source paths when they are available; without them it runs repository-only checks and reports source-anchoring checks as skipped. Neither imports another Megalodon package or builds the fused extension. The complete gate compares full logits, every trainable upstream-schema gradient, and three AdamW steps; fused CUDA is checked at source level only.

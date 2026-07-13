@@ -17,6 +17,8 @@ pytestmark = pytest.mark.fast
 def test_cross_revision_default_uses_tied_topology() -> None:
     """The default must match historical output topology for LM timing ratios."""
     assert benchmark.CANONICAL_CONFIG["share_emb"] is True
+    assert "softmax_dtype" not in benchmark.CANONICAL_CONFIG
+    assert "gemm_backend" not in benchmark.CANONICAL_CONFIG
 
     config = {
         "requested": {"share_emb": True},
