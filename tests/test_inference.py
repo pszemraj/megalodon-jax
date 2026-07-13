@@ -435,7 +435,7 @@ class TestSamplingAndGeneration:
     def test_generate_rejects_left_padding(self) -> None:
         """Physical left padding cannot silently shift chunk-local semantics."""
         model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
-        with pytest.raises(Exception, match="left-padded.*right padding"):
+        with pytest.raises(Exception, match="contiguous valid prefix.*right padding"):
             generate(
                 model,
                 jnp.asarray([[0, 0, 1, 2]], dtype=jnp.int32),

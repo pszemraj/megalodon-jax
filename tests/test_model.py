@@ -1125,17 +1125,36 @@ class TestPaddingContract:
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
 
-        # Create input with pad tokens
-        input_ids = jnp.array([[5, 0, 10, 0, 15]])
+        # Create input with a valid prefix and trailing pad tokens.
+        input_ids = jnp.array([[5, 10, 15, 0, 0]])
 
         # Forward pass should preserve bf16 dtype
         hidden, _ = model(
             input_ids,
-            attention_mask=jnp.array([[True, False, True, False, True]]),
+            attention_mask=jnp.array([[True, True, True, False, False]]),
             return_cache=False,
         )
 
         assert hidden.dtype == jnp.bfloat16, f"Expected bf16 output, got {hidden.dtype}."
+
+    @pytest.mark.parametrize(
+        "attention_mask",
+        [
+            pytest.param([[False, False, True, True]], id="left-padding"),
+            pytest.param([[True, True, False, True]], id="interior-hole"),
+        ],
+    )
+    def test_non_right_padded_masks_are_rejected(
+        self,
+        random_seed: int,
+        attention_mask: list[list[bool]],
+    ) -> None:
+        """Physical padding cannot interrupt or precede the valid token prefix."""
+        model = MegalodonModel(small_config(num_layers=1), key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray([[5, 10, 15, 20]], dtype=jnp.int32)
+
+        with pytest.raises(Exception, match="contiguous valid prefix.*right padding"):
+            model(input_ids, attention_mask=jnp.asarray(attention_mask))
 
 
 class TestFix3UntiedLMHead:

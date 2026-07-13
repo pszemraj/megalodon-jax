@@ -419,11 +419,15 @@ class MegalodonModel(eqx.Module):
                     f"attention_mask must have shape {input_ids.shape}, got {attention_mask.shape}"
                 )
             mask = attention_mask.astype(jnp.bool_)
-            has_left_padding = (~mask[:, 0]) & jnp.any(mask, axis=1)
+            # Physical positions determine chunk boundaries and RoPE phases.
+            # A False->True transition would therefore shift later valid tokens
+            # instead of behaving like removable padding.
+            has_non_right_padding = jnp.any((~mask[:, :-1]) & mask[:, 1:], axis=1)
             attention_mask = eqx.error_if(
                 mask,
-                jnp.any(has_left_padding),
-                "left-padded attention masks are unsupported; use right padding",
+                jnp.any(has_non_right_padding),
+                "attention_mask rows must contain a contiguous valid prefix followed by "
+                "optional right padding",
             )
 
         # Validate token bounds - prevents silent incorrect embeddings from OOB indices

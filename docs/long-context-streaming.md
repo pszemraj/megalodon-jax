@@ -116,7 +116,7 @@ The segmented CEMA path and its memory/speed tradeoff are described in [EMA impl
 
 - In this JAX implementation, cached decoding does not support padding because cache validity is not tracked per position.
 - `generate()` rejects padded `attention_mask` when cached generation is requested (`max_new_tokens > 1`, `return_cache=True`, or a cache is provided).
-- `generate()` rejects left padding because shifting physical chunk boundaries changes released chunk-local semantics. It accepts right padding only for a single uncached generated token; direct noncached model calls support right-padded training batches.
+- Model calls require every `attention_mask` row to be a contiguous valid prefix followed by optional right padding. Left padding and interior masked holes are rejected because shifting physical chunk boundaries changes released chunk-local semantics. `generate()` accepts right padding only for a single uncached generated token; direct noncached model calls support right-padded training batches.
 - Batch variable-length prompts by equal unpadded length or generate them separately when a cache is required.
 - Pass `attention_mask=None` when every token is valid. `generate()` canonicalizes an all-True mask to `None`; direct model calls retain an array-valued mask and therefore use the general masked TimestepNorm path.
 - An empty prompt without a cache is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token. Empty-prompt continuation with a cache is rejected because the cache does not store next-token logits; provide the final context token instead.
