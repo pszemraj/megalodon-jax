@@ -1,12 +1,14 @@
-# JAX and Original PyTorch Interoperability
+# JAX and original PyTorch interoperability
 
-Conversion targets the exact released Megalodon PyTorch keyspace under the local original source, not a Hugging Face port or an installed package with a similar name. Torch is optional at runtime; install `megalodon-jax[convert]` when conversion is needed.
+Conversion targets the exact released Megalodon PyTorch keyspace, not a Hugging Face port or an installed package with a similar name. A local upstream checkout is used to audit that mapping but is not required to load a checkpoint. Torch is optional at runtime; install `megalodon-jax[convert]` when conversion is needed.
 
 ## Native JAX checkpoints
 
 Use the versioned SafeTensors format for JAX training and inference:
 
 ```python
+import jax
+
 from megalodon_jax import load_checkpoint, save_checkpoint
 
 save_checkpoint(model, "model.safetensors")
@@ -91,4 +93,4 @@ Cache files are bound to the full configuration fingerprint and validate the exa
 
 ## Parity gates
 
-`tests/test_upstream_parity.py` and `tools/verify_modeling_correctness.py` use a small differentiable Torch oracle derived directly from the exact released source. They do not import another Megalodon package or build the fused extension. The gate compares full logits, every trainable upstream-schema gradient, and three AdamW steps; fused CUDA is checked at source level only.
+`tests/test_upstream_parity.py` uses a small differentiable Torch oracle derived from the exact released source. `tools/verify_modeling_correctness.py` additionally reads the local paper and upstream source paths supplied on its command line. Neither imports another Megalodon package or builds the fused extension. The complete gate compares full logits, every trainable upstream-schema gradient, and three AdamW steps; fused CUDA is checked at source level only.

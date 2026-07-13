@@ -5,7 +5,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 ## Features
 
 - Pure JAX/Equinox implementation in [src/megalodon_jax](src/megalodon_jax)
-- Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
+- Core architecture: ComplexEMA, chunked rotary attention, fixed-capacity streaming caches, RMSNorm, and TimestepNorm
 - Packed-sequence training with full document isolation: `segment_ids` masks attention, resets EMA/norm state at boundaries, and excludes cross-document label pairs from the loss
 - JAX pytree caches for JIT-compatible streaming inference
 - Strict native SafeTensors checkpoints plus exact original-upstream PyTorch checkpoint conversion
@@ -27,7 +27,7 @@ pip install "megalodon-jax[cuda13] @ git+https://github.com/pszemraj/megalodon-j
 
 The `cuda13` extra installs the matching JAX plugin, PJRT, CUDA, and cuDNN wheels. Keep `LD_LIBRARY_PATH` unset when using these bundled libraries; pointing it at another CUDA toolkit can make XLA load an incompatible library set.
 
-### development install
+### Development install
 
 For development on an NVIDIA system, clone the repository and install the CUDA 13 and developer extras together:
 
@@ -37,9 +37,9 @@ cd megalodon-jax
 pip install -e ".[cuda13,dev]"
 ```
 
-Requires Python 3.11+, JAX 0.10.2 through 0.10.x, and Equinox 0.13.8 through 0.13.x. CPU-only development can use `pip install -e ".[dev]"`. PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
+Requires Python 3.11+, JAX `>=0.10.2,<0.11`, and Equinox `>=0.13.8,<0.14`. CPU-only development can use `pip install -e ".[dev]"`. PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
 
-## Quick Start
+## Quick start
 
 ```python
 import jax
@@ -78,7 +78,7 @@ Preset names are explicit because the paper 7B configuration and the two release
 
 `from_7b()` intentionally raises because its historical definition mixed incompatible upstream presets. Use `config.parameter_count_breakdown()` for exact counts at another vocabulary size or output width. Output tying is controlled only by the explicit `share_emb` field; it is never inferred from matching shapes.
 
-### Streaming Inference
+### Streaming inference
 
 ```python
 # Continue from cache
@@ -100,11 +100,9 @@ tokens, cache, key = generate(
 )
 ```
 
-Note: when `attention_mask` contains padding, cached generation (`max_new_tokens > 1`, `return_cache=True`, or `cache` provided) is not supported.
+Cached-generation constraints and cache semantics are described in [Long-context streaming](docs/long-context-streaming.md#padding-and-generation).
 
-Pass `attention_mask=None` when every token is valid. An all-True array is mathematically equivalent, but general model calls cannot statically select the faster unmasked TimestepNorm path from an array value.
-
-### Training with Loss
+### Training with loss
 
 ```python
 import equinox as eqx
@@ -120,7 +118,7 @@ def loss_fn(model, input_ids, labels):
 grads = loss_fn(model, input_ids, labels)
 ```
 
-### Packed-Sequence Training
+### Packed-sequence training
 
 Multiple documents can share one row with full isolation - attention, EMA state, and running norm statistics all reset at document boundaries, and the loss automatically skips cross-document label pairs:
 
@@ -142,81 +140,33 @@ loss = model.compute_loss(
 )
 ```
 
-Each packed document produces the same outputs (and gradients) as running it alone. Packed metadata is training-only: it is rejected whenever a cache is involved. Harnesses can detect support via `getattr(model, "supports_segment_reset", False)`. See [docs/dev.md](docs/dev.md#packed-sequence-state-isolation) for design notes and benchmarks.
+Each packed document produces the same outputs and gradients as running it alone. See [Packed-sequence training](docs/long-context-streaming.md#packed-sequence-training) for boundary, padding, cache, and loss semantics.
 
-## Architecture
+## Documentation
 
-### Key Design Decisions
+The [documentation index](docs/README.md) covers streaming and packed execution, precision, ComplexEMA, checkpoint interoperability, paper/source differences, tests, and benchmarks.
 
-1. **JAX Pytree Caches**: All cache/state objects are registered as JAX pytrees. Position counters are JAX scalar arrays (not Python ints) to prevent recompilation.
-
-2. **Three-Path ComplexEMA**:
-   - FFT path: O(L log L), used during training when no state needed
-   - Sequential scan: O(L), maintains complex hidden state for streaming
-   - Segmented associative scan: O(L log L) work, resets state at document boundaries for packed training
-
-3. **Normalized Attention**: Q/K use per-head RMSNorm before affine transform. Attention uses `scale=1.0` (no `/sqrt(d_head)` scaling).
-
-4. **Two-Hop Residual**: FFN adds residual from block input, not post-attention activations.
-
-5. **Mask-Aware Loss**: Attention masks, ignored labels, padding segments, and cross-document shifted pairs are excluded explicitly.
-
-### Source Layout
+### Source layout
 
 ```
 src/megalodon_jax/
 ├── config.py          # MegalodonConfig (frozen dataclass)
+├── cache.py           # Sparse cache construction and invariant checks
+├── checkpoint.py      # Strict native model/cache persistence
+├── convert.py         # Exact original-upstream checkpoint conversion
+├── inference.py       # Cache indexing, sampling, and generation
+├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM
+├── ops.py             # Dtype-aware linear algebra
+├── precision.py       # Sensitive-parameter dtype audit and repair
 ├── types.py           # Cache/state pytrees
 ├── utils.py           # Weight initialization
-├── checkpoint.py      # Strict native model/cache persistence
-├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM
-├── convert.py         # Exact original-upstream checkpoint conversion
 └── layers/
-    ├── norms.py       # RMSNorm
-    ├── rotary.py      # RotaryEmbedding
-    ├── timestep_norm.py  # TimestepNorm (streaming GroupNorm)
+    ├── attention.py      # ChunkedAttention, MegalodonAttention, NormalizedFFN
     ├── complex_ema.py    # ComplexEMA
-    └── attention.py      # ChunkedAttention, MegalodonAttention, NormalizedFFN
-```
-
-## Precision
-
-- Parameter storage and accumulation are float32; compute is float32 by default.
-- Set `compute_dtype=jnp.bfloat16` for BF16 compute while retaining FP32 parameters and accumulation.
-- `attention_softmax_dtype` and `loss_softmax_dtype` control attention and language-model loss math independently; FP32 is recommended for both.
-- Use `megalodon_jax.precision.audit_sensitive_param_dtypes` to verify fp32-sensitive params.
-- Avoid blanket `jax.tree.map` casts to bf16; use the config dtypes or `ensure_sensitive_param_dtype`.
-- See `docs/dtypes-and-stability.md` for downstream training guidance.
-- Float16 is deliberately unsupported. Use FP32, or BF16 on hardware with native BF16 support; older GPUs without native BF16 must use FP32.
-
-## Performance
-
-- **Sequence length padding**: JAX recompiles for each unique input shape. Pad sequences to consistent lengths (e.g., powers of 2) during training to avoid excessive recompilation.
-
-## Current Status
-
-- Core components + streaming cache utilities
-- Sampling + `generate()` loop for text generation
-- Versioned native SafeTensors persistence and exact original-upstream `.pth` conversion
-
-## Limitations
-
-- Pure JAX implementation (no fused CUDA kernels)
-- Nonzero-cache CEMA continuation is sequential; training and pristine prefill compute outputs with FFT convolution
-- No 4D chunk parallelism (out of scope for single-device)
-- Cached decoding does not support padded batches
-- Packed-sequence metadata (`segment_ids`/`position_ids`) is training-only; rejected on cached/streaming calls
-- Token IDs are never treated as padding implicitly; callers must provide attention/loss masks and keep unknown-token semantics separate from padding metadata
-
-## Testing
-
-```bash
-pytest -m fast                    # Routine CPU correctness gate
-pytest                          # All CPU tests
-pytest -m "not torch_ref"       # JAX-only tests
-pytest -m torch_ref             # Independent source-derived Torch parity tests
-pytest tests/test_model.py -v   # Single file
-python tools/verify_modeling_correctness.py --jax-repo . --backend cpu --include-slow
+    ├── norms.py          # RMSNorm and plus-one LayerNorm
+    ├── rotary.py         # RotaryEmbedding
+    ├── segments.py       # Packed boundary and position helpers
+    └── timestep_norm.py  # TimestepNorm (streaming GroupNorm)
 ```
 
 ## Related

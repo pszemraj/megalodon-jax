@@ -1,4 +1,4 @@
-# Dtypes and Stability Guide
+# Dtypes and numerical stability
 
 Megalodon JAX supports two numerical modes: FP32 and BF16 compute with FP32 storage/accumulation. Float16 is intentionally unsupported because the EMA, FFT, normalization, and long-context state paths are not reliable in that range.
 
@@ -43,7 +43,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 ## Fixed precision behavior
 
 - TimestepNorm state, running moments, RMSNorm statistics, and LayerNorm statistics are FP32.
-- TimestepNorm uses plain FP32 block-Welford accumulation; unlike the released CUDA kernel, it does not carry Kahan compensation terms across updates.
+- TimestepNorm uses shifted FP32 first/second-moment prefixes for unmasked input and associative FP32 Welford prefixes for masked or packed input. Unlike the released CUDA kernel, none of these paths stores Kahan compensation terms.
 - TimestepNorm and cache position counters are int32 and guard against overflow; the released TimestepNorm count is int64, which is not enabled implicitly because JAX x64 is a global execution policy.
 - CEMA coefficients and state are FP32/complex64.
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
@@ -52,7 +52,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 - Returned logits are always FP32, matching the original released model.
 - Parameter gradients have the FP32 storage dtype even under BF16 compute.
 
-The two softmax fields are deliberately independent. Changing `attention_softmax_dtype` does not alter loss math, and changing `loss_softmax_dtype` does not alter attention. FP32 is recommended for both.
+The two softmax fields are deliberately independent. Changing `attention_softmax_dtype` does not alter loss math, and changing `loss_softmax_dtype` does not alter attention. FP32 is recommended for both. BF16 attention softmax is an experimental JAX tradeoff, not released-source parity.
 
 ## Do not cast the model tree
 
@@ -101,11 +101,11 @@ def train_step(candidate, state, input_ids, labels, key):
     return eqx.apply_updates(candidate, updates), state, loss
 ```
 
-## Checkpoints and conversion
+## Checkpoint dtypes
 
-Native v2 checkpoints preserve the exact FP32 parameter contract and store the dtype policy in serialized configuration metadata. `load_checkpoint` refuses metadata-free and incompatible files rather than guessing their semantics. Partial restore requires an explicit parameter-name allowlist and reports every initialized leaf.
+Native model checkpoints preserve the FP32 parameter contract and store the dtype policy in configuration metadata. Loading converts original-upstream floating tensors to FP32 parameter storage.
 
-Original-upstream conversion uses FP32 by default. `export_upstream_state_dict(model, dtype=torch.bfloat16)` may be used for a BF16 transport copy, while source-sensitive normalization/CEMA tensors remain explicitly represented according to the original schema. Loading converts floating tensors to the model's FP32 storage contract.
+`export_upstream_state_dict(model, dtype=torch.bfloat16)` may create a BF16 transport copy. Format versions, strict loading, partial restore, and conversion behavior are described in [JAX and PyTorch interoperability](jax-torch.md).
 
 ## Troubleshooting
 

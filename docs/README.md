@@ -1,10 +1,8 @@
-# Docs Index
+# Documentation
 
-Quick links to the documentation in this folder.
-
-- [dev.md](dev.md): Dev notes, internal decisions, testing guidance, and release notes.
-- [dtypes-and-stability.md](dtypes-and-stability.md): Precision policy, bf16 guidance, and stability tips.
-- [ema-implementation.md](ema-implementation.md): Details on the ComplexEMA implementation and numerical behavior.
-- [jax-torch.md](jax-torch.md): JAX/PyTorch interoperability, conversion workflows, and parity tips.
-- [long-context-streaming.md](long-context-streaming.md): Streaming/cache design, padding constraints, and inference notes.
-- [paper-deviations.md](paper-deviations.md): Known departures from the paper and their rationale.
+- [Development](dev.md): code quality, test gates, correctness verification, and performance benchmarks.
+- [Dtypes and numerical stability](dtypes-and-stability.md): FP32/BF16 policy, training guidance, and stability checks.
+- [ComplexEMA implementation](ema-implementation.md): execution paths, packed resets, and numerical behavior.
+- [JAX and PyTorch interoperability](jax-torch.md): native persistence, original-upstream conversion, and parity gates.
+- [Long-context streaming](long-context-streaming.md): attention/cache behavior, padding constraints, generation, and packed training.
+- [Paper and source differences](paper-deviations.md): released-source compatibility choices and intentional JAX extensions.

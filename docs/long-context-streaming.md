@@ -1,10 +1,10 @@
-# Megalodon Long-Context Streaming (Conceptual Flow)
+# Long-context streaming
 
-This note sketches how "unlimited context" is achieved without holding a global KV cache. The long-range signal flows through **stateful EMA + TimestepNorm**, while attention uses a **local KV** (chunk-local by default; optional sliding window).
+Megalodon carries long-range signal through stateful CEMA and TimestepNorm without retaining a global KV cache. Attention uses local KV support: released chunk-local behavior by default or an optional sliding window.
 
 Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention stays chunk-local by default; EMA/Norm carry the full history. A sliding KV window is an optional extension.
 
-## 1) Chunked Attention vs. Stateful Memory
+## Chunked attention and stateful memory
 
 ```mermaid
 flowchart LR
@@ -47,10 +47,10 @@ flowchart LR
     TN2 -.-> TNN
 ```
 
-- **Long-range path:** CEMA state `h` + TimestepNorm running stats propagate across all chunks (O(1) memory). This is the "unlimited" context carrier.
-- **Local path:** Attention uses only a local KV window (within chunk or sliding window). Older KV can be dropped once their effect is absorbed into EMA/Norm state.
+- **Long-range path:** CEMA state `h` and TimestepNorm running statistics propagate across all chunks in O(1) state memory.
+- **Local path:** Attention uses only its defined chunk or sliding-window support. Keys outside that support are discarded independently of the recurrent state path.
 
-## 2) Optional Sliding KV Window (decode)
+## Optional sliding KV window
 
 ```mermaid
 sequenceDiagram
@@ -59,14 +59,14 @@ sequenceDiagram
     participant Block as Attn Block
     Note over Cache: attention_window=None => released chunk-local mode<br/>attention_window=W => fixed W-token sliding window
 
-    Loop for each chunk
+    Loop for each streaming update
         Block->>State: TimestepNorm (update running mean/var)
         State-->>Block: stats for this chunk
         Block->>State: CEMA (init with h_prev)
         State-->>Block: h_new
-        Block->>Cache: append K,V (after RoPE)
-        Cache-->>Block: (optionally) drop oldest if |KV|>W
-        Block->>Block: Local SDPA over windowed KV
+        Block->>Cache: write K,V (after RoPE) into fixed ring
+        Cache-->>Block: expose valid local K,V slots
+        Block->>Block: local attention over valid K,V
         Block-->>State: store h_new (for next chunk)
     end
 ```
@@ -75,7 +75,7 @@ sequenceDiagram
 - `attention_window=W` enables the intentional fixed-width sliding-window extension with ring capacity `W` and a per-query age mask.
 - Both modes are invariant to call partitioning: full calls, arbitrary chunks, token-by-token calls, and save/reload continuation produce the same outputs for identical semantics.
 
-## 3) RoPE Offsets
+## RoPE offsets
 
 ```mermaid
 flowchart TD
@@ -88,19 +88,32 @@ flowchart TD
 
 - The cache tracks absolute token count. Released chunk-local mode derives RoPE position as `absolute_position % chunk_size`, matching the source's per-chunk coordinate restart. Sliding-window mode uses absolute positions so retained keys and new queries remain in one coordinate system.
 
-## 4) Training vs. Inference
+## Training and inference
 
-- **Training:** `attention_window=None` gives released block-diagonal attention per chunk; setting `attention_window` opts into sliding attention. EMA uses FFT when no state/reset is required. Packed rows may pass `segment_ids`/`position_ids` for full per-document isolation; see [dev.md](dev.md#packed-sequence-state-isolation).
-- **Inference:** pristine prefill uses vectorized attention and FFT CEMA outputs while materializing only final continuation state. Calls with nonzero history use sequential EMA and tokenwise ring updates. Attention is chunk-local by default with optional sliding KV. RoPE restarts per source chunk in faithful mode and remains absolute in sliding mode. Packed metadata is rejected on any cached/streaming call before compute.
+- **Training:** `attention_window=None` gives released block-diagonal attention per chunk; setting `attention_window` opts into sliding attention. CEMA uses FFT when no state or packed reset is required.
+- **Inference:** pristine prefill uses vectorized attention and FFT CEMA outputs while materializing final continuation state. Calls with nonzero history use sequential CEMA and tokenwise ring updates. RoPE restarts per source chunk in faithful mode and remains absolute in sliding mode.
 
-## 5) Padding and Generation
+## Packed-sequence training
+
+`segment_ids` isolates contiguous documents across attention, CEMA, TimestepNorm, RoPE, gradients, and shifted loss pairs. Positive values identify real tokens and zero identifies padding. Raw IDs may be reused for non-adjacent documents because boundaries are defined by changes between neighboring IDs, not by global ID equality.
+
+- Packed metadata is training-only. `segment_ids` and `position_ids` are rejected whenever a cache is supplied or requested.
+- When `position_ids` is omitted, RoPE positions restart automatically at each contiguous document boundary.
+- Chunk boundaries re-anchor at each document, so a document beginning partway through a physical batch chunk has the same block-diagonal attention pattern as an independent run.
+- CEMA and TimestepNorm reset at every boundary. Trailing padding does not replace the returned state of the last real token, and an all-padding row returns fresh state.
+- `compute_loss` excludes targets in segment zero and shifted pairs that cross a document boundary. An `attention_mask` alone applies to target positions; use `ignore_index` labels when stricter loss exclusion is required.
+
+The segmented CEMA path and its memory/speed tradeoff are described in [EMA implementation](ema-implementation.md#segmented-path). Harnesses can detect complete packed-state support with `getattr(model, "supports_segment_reset", False)`.
+
+## Padding and generation
 
 - In this JAX implementation, cached decoding does not support padding because cache validity is not tracked per position.
 - `generate()` rejects padded `attention_mask` when cached generation is requested (`max_new_tokens > 1`, `return_cache=True`, or a cache is provided).
-- For variable-length prompts, trim/pad on the caller side or loop over prompts.
+- `generate()` rejects left padding because shifting physical chunk boundaries changes released chunk-local semantics. It accepts right padding only for a single uncached generated token; direct noncached model calls support right-padded training batches.
+- Batch variable-length prompts by equal unpadded length or generate them separately when a cache is required.
+- Pass `attention_mask=None` when every token is valid. `generate()` canonicalizes an all-True mask to `None`; direct model calls retain an array-valued mask and therefore use the general masked TimestepNorm path.
+- An empty prompt is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token. Generation raises when neither is available.
+- `generate()` requires the output width to equal `vocab_size` so every generated ID is valid for the next embedding lookup.
+- Cache input and cache return are deterministic inference operations. Model calls with `deterministic=False` reject both.
 
-## Defaults and Options
-
-- **Original release:** chunk-local attention with per-chunk RoPE coordinates; long-range information flows through CEMA and stateful normalization.
-- **Paper theory:** "unlimited" context is carried by recurrent state rather than an unbounded global KV cache.
-- **This repo:** `attention_window=None` preserves released behavior. A positive `attention_window` explicitly opts into the partition-invariant sliding extension.
+Token IDs never imply padding. `pad_token_id` is metadata; callers must supply masks and keep unknown-token IDs distinct from padding metadata.
