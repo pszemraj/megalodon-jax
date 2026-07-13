@@ -622,6 +622,8 @@ class ChunkedAttention(eqx.Module):
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
+        *,
+        _cache_validated: bool = False,
     ) -> tuple[
         Float[Array, "batch seq heads value_dim"],
         AttentionCache | None,
@@ -708,7 +710,7 @@ class ChunkedAttention(eqx.Module):
             new_cache = AttentionCache(k=cache_k, v=cache_v, count=count) if return_cache else None
             return v, new_cache, count
 
-        if cache is not None:
+        if cache is not None and not _cache_validated:
             count = eqx.error_if(
                 count,
                 (count < 0) | (count > jnp.iinfo(jnp.int32).max - length),
@@ -972,6 +974,8 @@ class MegalodonAttention(eqx.Module):
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
+        *,
+        _cache_validated: bool = False,
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Forward pass through the attention block.
 
@@ -984,6 +988,7 @@ class MegalodonAttention(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
+        :param bool _cache_validated: Internal signal that model cache counts were checked.
         :return tuple[jax.Array, LayerCache | None]: Output tensor and updated cache.
         """
         if (
@@ -1015,7 +1020,11 @@ class MegalodonAttention(eqx.Module):
 
         # TimestepNorm (segment_ids resets running stats at packed-doc boundaries)
         x_tn, new_norm_state = self.timenorm(
-            x, state=norm_state, mask=mask, segment_ids=segment_ids
+            x,
+            state=norm_state,
+            mask=mask,
+            segment_ids=segment_ids,
+            _state_validated=_cache_validated,
         )
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
@@ -1089,6 +1098,7 @@ class MegalodonAttention(eqx.Module):
             return_cache=return_cache,
             deterministic=deterministic,
             key=k1,
+            _cache_validated=_cache_validated,
         )
 
         # Reshape attention output: (B, L, H, Dv) -> (B, L, value_dim)

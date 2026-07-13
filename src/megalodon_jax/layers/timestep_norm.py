@@ -221,6 +221,8 @@ class TimestepNorm(eqx.Module):
         state: NormState | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
         segment_ids: Int[Array, "batch seq"] | None = None,
+        *,
+        _state_validated: bool = False,
     ) -> tuple[Float[Array, "batch seq dim"], NormState]:
         """Normalize a sequence and return its final causal statistic state.
 
@@ -232,6 +234,7 @@ class TimestepNorm(eqx.Module):
         :param NormState | None state: Optional continuation state.
         :param Bool[Array, "batch seq"] | None mask: Valid-token mask.
         :param Int[Array, "batch seq"] | None segment_ids: Packed-sequence ids.
+        :param bool _state_validated: Internal model-path signal that cache counts were checked.
         :raises ValueError: If shapes are invalid or packed resets are combined with state.
         :raises TypeError: If float16 input is provided.
         :return tuple: Normalized output and final population-statistic state.
@@ -291,18 +294,22 @@ class TimestepNorm(eqx.Module):
                 raise ValueError("TimestepNorm int32 count would overflow")
             initial_count = initial.count
         else:
-            max_increment = (
-                jnp.asarray(length, dtype=jnp.int32)
-                if valid is None
-                else valid.astype(jnp.int32).sum(axis=1)
-            )
-            initial_count = eqx.error_if(
-                initial.count,
-                jnp.any(
-                    (initial.count < 0) | (initial.count > jnp.iinfo(jnp.int32).max - max_increment)
-                ),
-                "TimestepNorm count must be non-negative and must not overflow int32",
-            )
+            if _state_validated:
+                initial_count = initial.count
+            else:
+                max_increment = (
+                    jnp.asarray(length, dtype=jnp.int32)
+                    if valid is None
+                    else valid.astype(jnp.int32).sum(axis=1)
+                )
+                initial_count = eqx.error_if(
+                    initial.count,
+                    jnp.any(
+                        (initial.count < 0)
+                        | (initial.count > jnp.iinfo(jnp.int32).max - max_increment)
+                    ),
+                    "TimestepNorm count must be non-negative and must not overflow int32",
+                )
         initial = NormState(count=initial_count, mean=initial.mean, var=initial.var)
 
         groups = self.num_groups

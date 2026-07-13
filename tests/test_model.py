@@ -798,6 +798,41 @@ class TestModelCache:
             with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
                 jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
 
+    def test_model_cache_rejects_coherent_count_overflow(self, random_seed: int) -> None:
+        """Model-entry validation checks one shared timeline before all layers."""
+        config = small_config()
+        model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
+        _, cache = model(jnp.asarray([[1]], dtype=jnp.int32), return_cache=True)
+        assert cache is not None and cache.final_norm is not None
+        maximum = jnp.asarray(jnp.iinfo(jnp.int32).max, dtype=jnp.int32)
+        exhausted_layers = []
+        for layer in cache.layer_caches:
+            assert layer is not None and layer.attn is not None and layer.norm is not None
+            exhausted_layers.append(
+                replace(
+                    layer,
+                    position=maximum,
+                    attn=replace(layer.attn, count=maximum),
+                    norm=replace(
+                        layer.norm,
+                        count=jnp.full_like(layer.norm.count, maximum),
+                    ),
+                )
+            )
+        exhausted = replace(
+            cache,
+            layer_caches=tuple(exhausted_layers),
+            final_norm=replace(
+                cache.final_norm,
+                count=jnp.full_like(cache.final_norm.count, maximum),
+            ),
+        )
+
+        with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+            jax.block_until_ready(
+                model(jnp.asarray([[2]], dtype=jnp.int32), cache=exhausted, return_cache=True)
+            )
+
     def test_pristine_cache_rejects_history_buffers(self, random_seed: int) -> None:
         """A zero timeline cannot carry zero-filled or active history buffers."""
         config = small_config()

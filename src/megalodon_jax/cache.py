@@ -49,6 +49,7 @@ def cache_invariant_violation(
     config: MegalodonConfig,
     *,
     batch_size: int | None = None,
+    increment: int = 0,
     check_finite: bool = False,
 ) -> Bool[Array, ""]:
     """Return whether a cache violates the streaming-state coherence contract.
@@ -59,6 +60,8 @@ def cache_invariant_violation(
     ring on every decode step would make model-entry validation proportional to
     cache capacity; persistence enables it before data crosses a trust boundary.
     """
+    if increment < 0 or increment > jnp.iinfo(jnp.int32).max:
+        raise ValueError(f"cache increment must fit non-negative int32, got {increment}")
     if len(cache.layer_caches) != config.num_layers:
         raise ValueError(
             f"cache has {len(cache.layer_caches)} layer entries, expected {config.num_layers}"
@@ -199,6 +202,7 @@ def cache_invariant_violation(
         violations.extend(position != timeline for position in positions)
         violations.extend(count != timeline for count in attention_counts)
         violations.extend(jnp.any(state.count != timeline) for state in norm_states)
+        violations.append(timeline > jnp.iinfo(jnp.int32).max - increment)
         violations.append((timeline == 0) & has_history_buffers)
         violations.append(
             jax.lax.cond(

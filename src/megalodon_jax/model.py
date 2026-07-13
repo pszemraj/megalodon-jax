@@ -189,6 +189,8 @@ class MegalodonBlock(eqx.Module):
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
+        *,
+        _cache_validated: bool = False,
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Apply attention + FFN with two-hop residual.
 
@@ -202,6 +204,7 @@ class MegalodonBlock(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
+        :param bool _cache_validated: Internal signal that model cache counts were checked.
         :return tuple[Float[Array, "batch seq dim"], LayerCache | None]: Output and cache.
         """
         # CRITICAL: Two-hop residual - save BEFORE attention
@@ -223,6 +226,7 @@ class MegalodonBlock(eqx.Module):
             return_cache=return_cache,
             deterministic=deterministic,
             key=k_attn,
+            _cache_validated=_cache_validated,
         )
 
         # FFN with two-hop residual
@@ -373,7 +377,12 @@ class MegalodonModel(eqx.Module):
         if cache is not None:
             input_ids = eqx.error_if(
                 input_ids,
-                cache_invariant_violation(cache, self.config, batch_size=B),
+                cache_invariant_violation(
+                    cache,
+                    self.config,
+                    batch_size=B,
+                    increment=L,
+                ),
                 CACHE_INVARIANT_MESSAGE,
             )
         if key is not None:
@@ -493,12 +502,17 @@ class MegalodonModel(eqx.Module):
                     return_cache=layer_return_cache,
                     deterministic=deterministic,
                     key=layer_key,
+                    _cache_validated=cache is not None,
                 )
                 new_caches.append(new_cache)
 
         # Final TimestepNorm (segment-aware for packed sequences)
         x, final_norm_state = self.norm(
-            x, state=final_norm_state, mask=attention_mask, segment_ids=segment_ids
+            x,
+            state=final_norm_state,
+            mask=attention_mask,
+            segment_ids=segment_ids,
+            _state_validated=cache is not None,
         )
 
         # Build output cache with stop_gradient to prevent accidental backprop
