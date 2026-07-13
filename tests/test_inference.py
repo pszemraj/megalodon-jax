@@ -853,6 +853,35 @@ class TestConversion:
             np.asarray(model.model.layers[0].ffn.alpha),
         )
 
+    @pytest.mark.torch_ref
+    @pytest.mark.parametrize(
+        ("metadata", "message"),
+        [
+            ("{", "invalid consolidate_config.json"),
+            ("[]", "must contain a JSON object"),
+            ("{}", "missing required model_parallel_size"),
+            ('{"model_parallel_size": true}', "must be a positive integer"),
+            ('{"model_parallel_size": 1.5}', "must be a positive integer"),
+            ('{"model_parallel_size": 0}', "must be a positive integer"),
+        ],
+    )
+    def test_consolidation_metadata_errors_are_descriptive(
+        self,
+        tmp_path: Path,
+        metadata: str,
+        message: str,
+    ) -> None:
+        """Malformed consolidation metadata fails before shard discovery."""
+        pytest.importorskip("torch")
+        (tmp_path / "consolidate_config.json").write_text(metadata, encoding="utf-8")
+
+        with pytest.raises(ValueError, match=message):
+            load_upstream_checkpoint(
+                tmp_path,
+                small_config(),
+                key=jax.random.PRNGKey(0),
+            )
+
     @pytest.mark.parametrize("compute_dtype", [jnp.float32, jnp.bfloat16])
     @pytest.mark.fast
     def test_cache_roundtrip_and_config_binding(

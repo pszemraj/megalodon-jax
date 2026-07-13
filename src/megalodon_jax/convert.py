@@ -155,7 +155,8 @@ def export_upstream_state_dict(
         fp = f"layers.{index}.nffn"
         if ffn.norm.weight is not None:
             state[f"{fp}.norm.weight"] = fp32(ffn.norm.weight)
-            assert ffn.norm.bias is not None
+            if ffn.norm.bias is None:
+                raise ValueError(f"{fp}.norm has weight but no required bias")
             state[f"{fp}.norm.bias"] = fp32(ffn.norm.bias)
         state[f"{fp}.fc1.weight"] = ordinary(ffn.fc1.weight)
         state[f"{fp}.fc2.weight"] = ordinary(ffn.fc2.weight)
@@ -415,9 +416,20 @@ def _load_consolidated_directory(path: Path) -> StateDict:
             "raw FSDP checkpoints are unsupported; run the original upstream "
             "consolidation script first"
         )
-    with config_path.open(encoding="utf-8") as handle:
-        metadata = json.load(handle)
-    world_size = int(metadata["model_parallel_size"])
+    try:
+        with config_path.open(encoding="utf-8") as handle:
+            metadata = json.load(handle)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"invalid {config_path.name}: {error}") from error
+    if not isinstance(metadata, dict):
+        raise ValueError(f"{config_path.name} must contain a JSON object")
+    if "model_parallel_size" not in metadata:
+        raise ValueError(f"{config_path.name} is missing required model_parallel_size")
+    world_size = metadata["model_parallel_size"]
+    if isinstance(world_size, bool) or not isinstance(world_size, int) or world_size <= 0:
+        raise ValueError(
+            f"{config_path.name} model_parallel_size must be a positive integer, got {world_size!r}"
+        )
     files = (
         [path / "consolidated.pth"]
         if world_size == 1
