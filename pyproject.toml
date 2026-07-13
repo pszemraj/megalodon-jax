@@ -33,8 +33,8 @@ classifiers = [
 dynamic = ["version"]
 requires-python = ">=3.11"
 dependencies = [
-  "jax>=0.8.2,<0.11",
-  "equinox>=0.13.2,<0.14",
+  "jax>=0.10.2,<0.11",
+  "equinox>=0.13.8,<0.14",
   "jaxtyping>=0.2",
   "numpy>=2.0",
   "safetensors>=0.4",
@@ -45,6 +45,9 @@ Homepage = "https://github.com/pszemraj/megalodon-jax"
 Repository = "https://github.com/pszemraj/megalodon-jax"
 
 [project.optional-dependencies]
+cuda13 = [
+  "jax[cuda13]>=0.10.2,<0.11",
+]
 convert = [
   "torch>=2.6",
 ]

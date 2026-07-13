@@ -19,17 +19,25 @@ Install with pip+git for the latest version:
 pip install "git+https://github.com/pszemraj/megalodon-jax.git"
 ```
 
+On Linux with an NVIDIA CUDA 13-capable driver, install JAX's official bundled CUDA stack:
+
+```sh
+pip install "megalodon-jax[cuda13] @ git+https://github.com/pszemraj/megalodon-jax.git"
+```
+
+The `cuda13` extra installs the matching JAX plugin, PJRT, CUDA, and cuDNN wheels. Keep `LD_LIBRARY_PATH` unset when using these bundled libraries; pointing it at another CUDA toolkit can make XLA load an incompatible library set.
+
 ### development install
 
-For development, clone the repository and install with the `[dev]` extras:
+For development on an NVIDIA system, clone the repository and install the CUDA 13 and developer extras together:
 
 ```bash
 git clone https://github.com/pszemraj/megalodon-jax.git
 cd megalodon-jax
-pip install -e ".[dev]"
+pip install -e ".[cuda13,dev]"
 ```
 
-Requires Python 3.11+, JAX 0.8.2 through 0.10.x, and Equinox 0.13.x. The correctness gate passes at both the installed baseline (JAX 0.8.2 / Equinox 0.13.2) and the current releases (JAX 0.10.2 / Equinox 0.13.8). PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
+Requires Python 3.11+, JAX 0.10.2 through 0.10.x, and Equinox 0.13.8 through 0.13.x. CPU-only development can use `pip install -e ".[dev]"`. PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
 
 ## Quick Start
 

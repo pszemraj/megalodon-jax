@@ -10,7 +10,7 @@
 - Unreleased: FP32 and BF16 are the complete supported numerical surface. Float16 is rejected.
 - Unreleased: FP32 dot products request per-operation highest precision on GPU; TensorFloat-32 is not treated as FP32 correctness mode.
 - Unreleased: downstream Megalodon packages were removed from development and tests. Parity uses the exact local source plus an independent differentiable Torch oracle.
-- Unreleased: the verified dependency window is JAX 0.8.2 through 0.10.x with Equinox 0.13.x; the baseline and latest endpoint pairs pass the complete verifier.
+- Unreleased: the verified dependency window is JAX 0.10.2 through 0.10.x with Equinox 0.13.8 through 0.13.x. NVIDIA validation uses JAX's bundled CUDA 13 plugin/PJRT stack with `LD_LIBRARY_PATH` unset.
 
 ## Architecture Overview
 

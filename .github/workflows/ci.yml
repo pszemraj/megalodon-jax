@@ -31,8 +31,8 @@ jobs:
       matrix:
         include:
           - python: "3.11"
-            jax: "0.8.2"
-            equinox: "0.13.2"
+            jax: "0.10.2"
+            equinox: "0.13.8"
           - python: "3.13"
             jax: "0.10.2"
             equinox: "0.13.8"
