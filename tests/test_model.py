@@ -477,6 +477,17 @@ class TestMegalodonForCausalLM:
         assert jnp.isfinite(loss)
         assert loss > 0
 
+    def test_compute_loss_validates_label_schema(self, random_seed: int) -> None:
+        """Loss labels must match inputs and use discrete token IDs."""
+        config = small_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="same shape as input_ids"):
+            model.compute_loss(input_ids, jnp.asarray([[1, 2]], dtype=jnp.int32))
+        with pytest.raises(TypeError, match="labels must have integer dtype"):
+            model.compute_loss(input_ids, input_ids.astype(jnp.float32))
+
     def test_streaming_generation(self, random_seed: int) -> None:
         """Test streaming token-by-token generation.
 

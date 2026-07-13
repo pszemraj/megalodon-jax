@@ -23,6 +23,7 @@ from collections.abc import Callable
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from megalodon_jax.config import MegalodonConfig
@@ -60,11 +61,15 @@ def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCac
     :raises ValueError: If indices are not rank one or are out of bounds.
     """
 
+    source_dtype = getattr(indices, "dtype", None)
+    if source_dtype is not None and np.dtype(source_dtype) != np.dtype(np.int32):
+        raise TypeError(f"indices must have dtype int32, got {source_dtype}")
+
     indices = jnp.asarray(indices)
     if indices.ndim != 1:
         raise ValueError(f"indices must be rank one, got shape {indices.shape}")
-    if not jnp.issubdtype(indices.dtype, jnp.integer):
-        raise TypeError(f"indices must have integer dtype, got {indices.dtype}")
+    if indices.dtype != jnp.int32:
+        raise TypeError(f"indices must have dtype int32, got {indices.dtype}")
 
     batch_size: int | None = None
 
@@ -203,9 +208,10 @@ def _apply_top_k(
     """
     if top_k is None or top_k <= 0:
         return logits
-    values, _ = _top_k(logits, top_k)
-    thresh = values[:, -1][:, None]
-    return jnp.where(logits < thresh, -jnp.inf, logits)
+    values, indices = _top_k(logits, top_k)
+    filtered = jnp.full_like(logits, -jnp.inf)
+    batch = jnp.arange(logits.shape[0])[:, None]
+    return filtered.at[batch, indices].set(values)
 
 
 def _apply_top_p(
@@ -323,6 +329,8 @@ def _validate_sampling(
     :param int output_size: Width of the model output vocabulary.
     :raises ValueError: If a control is non-finite, out of range, or has an invalid type.
     """
+    if isinstance(temperature, (bool, np.bool_)):
+        raise ValueError("temperature must be a non-boolean finite number")
     if not math.isfinite(temperature) or temperature < 0.0:
         raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
     if top_k is not None:
@@ -334,8 +342,11 @@ def _validate_sampling(
             raise ValueError(f"top_k must be an integer, got {top_k!r}") from error
         if not 0 <= top_k_value <= output_size:
             raise ValueError(f"top_k must be in [0, {output_size}], got {top_k}")
-    if top_p is not None and (not math.isfinite(top_p) or not 0.0 < top_p <= 1.0):
-        raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
+    if top_p is not None:
+        if isinstance(top_p, (bool, np.bool_)):
+            raise ValueError("top_p must be a non-boolean finite number")
+        if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
 
 
 def _validate_max_new_tokens(max_new_tokens: object) -> int:

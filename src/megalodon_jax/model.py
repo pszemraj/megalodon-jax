@@ -715,10 +715,18 @@ class MegalodonForCausalLM(eqx.Module):
         :param int ignore_index: Label value to ignore in loss computation.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
-        :raises ValueError: If dropout is enabled without a PRNG key.
+        :raises TypeError: If labels do not have an integer dtype.
+        :raises ValueError: If labels do not match the input shape or dropout lacks a key.
         :return Float[Array, ""]: Scalar cross-entropy loss.
         """
         _require_dropout_key(self.config, deterministic, key)
+        if labels.shape != input_ids.shape:
+            raise ValueError(
+                f"labels must have the same shape as input_ids; got {labels.shape} and "
+                f"{input_ids.shape}"
+            )
+        if not jnp.issubdtype(labels.dtype, jnp.integer):
+            raise TypeError(f"labels must have integer dtype, got {labels.dtype}")
 
         logits, _ = self(
             input_ids,

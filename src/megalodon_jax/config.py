@@ -76,6 +76,19 @@ class MegalodonConfig:
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
+        boolean_fields = (
+            ("swiglu", self.swiglu),
+            ("rescale_nffn", self.rescale_nffn),
+            ("scale_emb", self.scale_emb),
+            ("share_emb", self.share_emb),
+            ("norm_affine", self.norm_affine),
+            ("use_checkpoint", self.use_checkpoint),
+            ("use_associative_segment_scan", self.use_associative_segment_scan),
+        )
+        for name, value in boolean_fields:
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be bool, got {value!r}")
+
         integer_fields = (
             ("vocab_size", self.vocab_size),
             ("model_dim", self.model_dim),

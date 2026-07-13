@@ -216,6 +216,24 @@ class TestMegalodonConfig:
         with pytest.raises(ValueError, match=rf"{field} must be an integer"):
             MegalodonConfig(**{field: value})
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "swiglu",
+            "rescale_nffn",
+            "scale_emb",
+            "share_emb",
+            "norm_affine",
+            "use_checkpoint",
+            "use_associative_segment_scan",
+        ],
+    )
+    @pytest.mark.parametrize("value", [0, 1, "false"])
+    def test_boolean_fields_require_bool(self, field: str, value: object) -> None:
+        """Boolean configuration cannot change behavior through truthiness coercion."""
+        with pytest.raises(TypeError, match=rf"{field} must be bool"):
+            MegalodonConfig(**{field: value})
+
     def test_dtype_validation(self) -> None:
         """Test dtype constraints reject float16.
 

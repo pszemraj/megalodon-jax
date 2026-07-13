@@ -144,8 +144,10 @@ class TestCacheUtilities:
         for invalid_dtype in (
             jnp.asarray([0.0], dtype=jnp.float32),
             jnp.asarray([True], dtype=jnp.bool_),
+            jnp.asarray([0], dtype=jnp.int16),
+            np.asarray([2**32], dtype=np.int64),
         ):
-            with pytest.raises(TypeError, match="integer dtype"):
+            with pytest.raises(TypeError, match="dtype int32"):
                 index_cache(cache, invalid_dtype)
 
         for invalid in (
@@ -202,6 +204,14 @@ class TestSamplingAndGeneration:
         )
         assert int(token[0]) == 1
 
+    def test_top_k_ties_keep_exactly_k_candidates(self) -> None:
+        """Tied kth logits do not expand the stochastic candidate set."""
+        logits = jnp.zeros((1, 8), dtype=jnp.float32)
+        keys = jax.random.split(jax.random.PRNGKey(7), 32)
+        tokens = jax.vmap(lambda key: sample_token(logits, key, temperature=1.0, top_k=1))(keys)
+
+        assert np.unique(np.asarray(tokens)).size == 1
+
     @pytest.mark.parametrize(
         ("kwargs", "message"),
         [
@@ -214,6 +224,8 @@ class TestSamplingAndGeneration:
             ({"temperature": 0.0, "top_k": True}, "top_k must be an integer"),
             ({"temperature": 0.0, "top_p": 0.0}, "top_p must be finite"),
             ({"temperature": 0.0, "top_p": float("nan")}, "top_p must be finite"),
+            ({"temperature": True}, "temperature must be a non-boolean"),
+            ({"temperature": 0.0, "top_p": True}, "top_p must be a non-boolean"),
         ],
     )
     def test_sample_controls_validate_before_greedy(
