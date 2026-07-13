@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -58,6 +60,14 @@ def layer_cache_invariant_violation(
     cache: LayerCache,
     *,
     batch_size: int,
+    cache_capacity: int,
+    num_heads: int,
+    head_dim: int,
+    value_head_dim: int,
+    model_dim: int,
+    cema_ndim: int,
+    norm_num_groups: int,
+    compute_dtype: jnp.dtype,
     increment: int = 0,
 ) -> Bool[Array, ""]:
     """Return whether one layer cache has an invalid continuation timeline.
@@ -70,6 +80,14 @@ def layer_cache_invariant_violation(
 
     :param LayerCache cache: Layer cache to validate.
     :param int batch_size: Expected batch size.
+    :param int cache_capacity: Required attention ring capacity.
+    :param int num_heads: Required number of attention heads.
+    :param int head_dim: Required query/key width per head.
+    :param int value_head_dim: Required value width per head.
+    :param int model_dim: Required CEMA model dimension.
+    :param int cema_ndim: Required number of CEMA orders.
+    :param int norm_num_groups: Required number of TimestepNorm groups.
+    :param jnp.dtype compute_dtype: Required attention cache dtype.
     :param int increment: Timeline increment to validate against int32 overflow.
     :return Bool[Array, ""]: Scalar predicate that is true for an invalid cache.
     :raises ValueError: If the cache has partial state or invalid static schema.
@@ -87,14 +105,29 @@ def layer_cache_invariant_violation(
     assert cache.attn is not None
     assert cache.norm is not None
     assert cache.ema is not None
+    _require_array(
+        "cache.attn.k",
+        cache.attn.k,
+        (batch_size, cache_capacity, num_heads, head_dim),
+        compute_dtype,
+    )
+    _require_array(
+        "cache.attn.v",
+        cache.attn.v,
+        (batch_size, cache_capacity, num_heads, value_head_dim),
+        compute_dtype,
+    )
     _require_array("cache.attn.count", cache.attn.count, (), jnp.int32)
     _require_array("cache.norm.count", cache.norm.count, (batch_size,), jnp.int32)
-    if cache.norm.mean.ndim != 2 or cache.norm.mean.shape[0] != batch_size:
-        raise ValueError(
-            f"cache.norm.mean must have shape (batch, groups), got {cache.norm.mean.shape}"
-        )
-    _require_array("cache.norm.mean", cache.norm.mean, cache.norm.mean.shape, jnp.float32)
-    _require_array("cache.norm.var", cache.norm.var, cache.norm.mean.shape, jnp.float32)
+    norm_shape = (batch_size, norm_num_groups)
+    _require_array("cache.norm.mean", cache.norm.mean, norm_shape, jnp.float32)
+    _require_array("cache.norm.var", cache.norm.var, norm_shape, jnp.float32)
+    _require_array(
+        "cache.ema.h",
+        cache.ema.h,
+        (batch_size, model_dim, cema_ndim),
+        jnp.complex64,
+    )
 
     return _any(
         [
@@ -109,6 +142,42 @@ def layer_cache_invariant_violation(
             cache.position == 0,
         ]
     )
+
+
+def classify_model_cache(
+    cache: ModelCache,
+    *,
+    num_layers: int,
+) -> Literal["sparse", "complete"]:
+    """Classify one of the two executable top-level cache schemas.
+
+    A sparse model cache uses ``None`` for every layer and for final norm. A
+    complete continuation allocates every component in every layer plus final
+    norm. Direct ``LayerCache()`` use remains a separate lower-level contract.
+
+    :param ModelCache cache: Cache structure to classify.
+    :param int num_layers: Required number of model layers.
+    :raises ValueError: If the cache is partial or has the wrong layer count.
+    :return Literal["sparse", "complete"]: Valid cache schema.
+    """
+    if len(cache.layer_caches) != num_layers:
+        raise ValueError(
+            f"cache has {len(cache.layer_caches)} layer entries, expected {num_layers}"
+        )
+
+    if cache.final_norm is None and all(layer is None for layer in cache.layer_caches):
+        return "sparse"
+
+    if cache.final_norm is not None and all(
+        layer is not None
+        and layer.attn is not None
+        and layer.norm is not None
+        and layer.ema is not None
+        for layer in cache.layer_caches
+    ):
+        return "complete"
+
+    raise ValueError(CACHE_INVARIANT_MESSAGE)
 
 
 def cache_invariant_violation(
@@ -137,10 +206,9 @@ def cache_invariant_violation(
     """
     if increment < 0 or increment > jnp.iinfo(jnp.int32).max:
         raise ValueError(f"cache increment must fit non-negative int32, got {increment}")
-    if len(cache.layer_caches) != config.num_layers:
-        raise ValueError(
-            f"cache has {len(cache.layer_caches)} layer entries, expected {config.num_layers}"
-        )
+    cache_kind = classify_model_cache(cache, num_layers=config.num_layers)
+    if cache_kind == "sparse":
+        return jnp.asarray(False)
 
     bound_batch = batch_size
 
@@ -163,26 +231,11 @@ def cache_invariant_violation(
     attention_arrays: list[Array] = []
     norm_states: list[NormState] = []
     ema_states: list[Array] = []
-    complete = cache.final_norm is not None
-
     for index, layer in enumerate(cache.layer_caches):
         prefix = f"cache.layers.{index}"
-        if layer is None:
-            complete = False
-            continue
+        assert layer is not None
         _require_array(f"{prefix}.position", layer.position, (), jnp.int32)
         positions.append(layer.position)
-
-        component_presence = (
-            layer.attn is not None,
-            layer.norm is not None,
-            layer.ema is not None,
-        )
-        if any(component_presence) and not all(component_presence):
-            raise ValueError(CACHE_INVARIANT_MESSAGE)
-        if not any(component_presence):
-            complete = False
-            continue
 
         assert layer.attn is not None
         assert layer.norm is not None
@@ -229,26 +282,25 @@ def cache_invariant_violation(
         )
         ema_states.append(layer.ema.h)
 
-    if cache.final_norm is not None:
-        batch = bind_batch("cache.final_norm.count", cache.final_norm.count.shape[0])
-        _require_array("cache.final_norm.count", cache.final_norm.count, (batch,), jnp.int32)
-        _require_array(
-            "cache.final_norm.mean",
-            cache.final_norm.mean,
-            (batch, config.norm_num_groups),
-            jnp.float32,
-        )
-        _require_array(
-            "cache.final_norm.var",
-            cache.final_norm.var,
-            (batch, config.norm_num_groups),
-            jnp.float32,
-        )
-        norm_states.append(cache.final_norm)
+    assert cache.final_norm is not None
+    batch = bind_batch("cache.final_norm.count", cache.final_norm.count.shape[0])
+    _require_array("cache.final_norm.count", cache.final_norm.count, (batch,), jnp.int32)
+    _require_array(
+        "cache.final_norm.mean",
+        cache.final_norm.mean,
+        (batch, config.norm_num_groups),
+        jnp.float32,
+    )
+    _require_array(
+        "cache.final_norm.var",
+        cache.final_norm.var,
+        (batch, config.norm_num_groups),
+        jnp.float32,
+    )
+    norm_states.append(cache.final_norm)
 
     counters = [*positions, *attention_counts, *(state.count for state in norm_states)]
     violations = [jnp.any(counter < 0) for counter in counters]
-    has_history_buffers = bool(attention_arrays or ema_states)
     for state in norm_states:
         violations.extend(
             (
@@ -275,29 +327,22 @@ def cache_invariant_violation(
         pristine_checks.extend(jnp.any(state != 0.0) for state in ema_states)
         return _any(pristine_checks)
 
-    if complete:
-        if positions:
-            timeline = positions[0]
-        elif bound_batch is not None and bound_batch > 0:
-            assert cache.final_norm is not None
-            timeline = cache.final_norm.count[0]
-        else:
-            timeline = jnp.asarray(0, dtype=jnp.int32)
-
-        violations.extend(position != timeline for position in positions)
-        violations.extend(count != timeline for count in attention_counts)
-        violations.extend(jnp.any(state.count != timeline) for state in norm_states)
-        violations.append(timeline > jnp.iinfo(jnp.int32).max - increment)
-        violations.append((timeline == 0) & has_history_buffers)
-        # A complete nonzero-layer cache always has history buffers, so the
-        # previous check already rejects timeline zero. The zero-layer model
-        # has only final_norm and still needs its pristine values validated.
-        if config.num_layers == 0:
-            violations.append((timeline == 0) & pristine_violation())
+    if positions:
+        timeline = positions[0]
+    elif bound_batch is not None and bound_batch > 0:
+        timeline = cache.final_norm.count[0]
     else:
-        violations.extend(jnp.any(counter != 0) for counter in counters)
-        violations.append(jnp.asarray(has_history_buffers))
-        violations.append(pristine_violation())
+        timeline = jnp.asarray(0, dtype=jnp.int32)
+
+    violations.extend(position != timeline for position in positions)
+    violations.extend(count != timeline for count in attention_counts)
+    violations.extend(jnp.any(state.count != timeline) for state in norm_states)
+    violations.append(timeline > jnp.iinfo(jnp.int32).max - increment)
+    if config.num_layers == 0:
+        violations.append((timeline == 0) & pristine_violation())
+    else:
+        # Allocated per-layer histories are never the canonical empty cache.
+        violations.append(timeline == 0)
 
     return _any(violations)
 

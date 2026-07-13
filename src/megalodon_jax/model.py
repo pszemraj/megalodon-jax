@@ -26,7 +26,11 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, cache_invariant_violation
+from megalodon_jax.cache import (
+    CACHE_INVARIANT_MESSAGE,
+    cache_invariant_violation,
+    classify_model_cache,
+)
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
 from megalodon_jax.layers.segments import valid_segment_mask
@@ -375,9 +379,11 @@ class MegalodonModel(eqx.Module):
             )
         if (
             cache is not None
-            and len(cache.layer_caches) == len(self.layers)
-            and cache.final_norm is None
-            and all(layer is None for layer in cache.layer_caches)
+            and classify_model_cache(
+                cache,
+                num_layers=len(self.layers),
+            )
+            == "sparse"
         ):
             # Canonicalize the public sparse initializer before tracing so it
             # is exactly the same program as an omitted cache.

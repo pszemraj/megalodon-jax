@@ -63,6 +63,17 @@ class TestCacheUtilities:
         config = small_config()
         validate_model_cache_host(init_cache(config), config)
 
+    def test_noncanonical_sparse_layer_is_invalid(self) -> None:
+        """Top-level sparse caches use None rather than empty LayerCache objects."""
+        config = small_config()
+        malformed = ModelCache(
+            layer_caches=(LayerCache(), *([None] * (config.num_layers - 1))),
+            final_norm=None,
+        )
+
+        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
+            validate_model_cache_host(malformed, config)
+
     def test_index_cache_slices_batch(self) -> None:
         """Ensure index_cache slices the batch dimension correctly.
 
@@ -957,34 +968,21 @@ class TestConversion:
         with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
             save_inference_cache(partial_zero, tmp_path / "partial-zero.safetensors", config)
 
-    def test_load_rejects_partial_nonzero_cache(self, tmp_path: Path) -> None:
-        """A schema-valid sparse cache cannot carry a nonzero logical timeline."""
-        from safetensors import safe_open
-        from safetensors.flax import load_file, save_file
-
+    def test_pristine_cache_save_load_and_execute(self, tmp_path: Path) -> None:
+        """Every persisted pristine cache remains executable after loading."""
         config = small_config()
-        pristine_layer = LayerCache(
-            attn=None,
-            norm=None,
-            ema=None,
-            position=jnp.asarray(0, dtype=jnp.int32),
-        )
-        sparse = ModelCache(
-            layer_caches=(pristine_layer, *([None] * (config.num_layers - 1))),
-            final_norm=None,
-        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         valid = tmp_path / "sparse-zero.safetensors"
-        save_inference_cache(sparse, valid, config)
-        tensors = load_file(str(valid))
-        with safe_open(str(valid), framework="flax") as handle:
-            metadata = dict(handle.metadata() or {})
+        save_inference_cache(init_cache(config), valid, config)
+        restored = load_inference_cache(valid, config)
 
-        tensors["layers.0.position"] = jnp.asarray(1, dtype=jnp.int32)
-        corrupted = tmp_path / "sparse-nonzero.safetensors"
-        save_file(tensors, str(corrupted), metadata=metadata)
-
-        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
-            load_inference_cache(corrupted, config)
+        logits, updated = model(
+            jnp.asarray([[1]], dtype=jnp.int32),
+            cache=restored,
+            return_cache=True,
+        )
+        assert bool(jnp.all(jnp.isfinite(logits)))
+        assert updated is not None
 
     @pytest.mark.fast
     def test_cache_schema_and_position_invariants_fail_closed(self, tmp_path: Path) -> None:
@@ -1078,27 +1076,6 @@ class TestConversion:
             load_checkpoint(missing, key=jax.random.PRNGKey(0))
         with pytest.raises(FileNotFoundError):
             load_inference_cache(missing, small_config())
-
-    def test_sparse_cache_layer_presence_uses_exact_layer_names(self, tmp_path: Path) -> None:
-        """Layer 10 presence must not imply that similarly prefixed layer 1 exists."""
-        config = replace(small_config(), num_layers=11)
-        pristine_layer = LayerCache(
-            attn=None,
-            norm=None,
-            ema=None,
-            position=jnp.asarray(0, dtype=jnp.int32),
-        )
-        sparse = ModelCache(
-            layer_caches=(*([None] * 10), pristine_layer),
-            final_norm=None,
-        )
-        path = tmp_path / "sparse-cache.safetensors"
-
-        save_inference_cache(sparse, path, config)
-        loaded = load_inference_cache(path, config)
-
-        assert loaded.layer_caches[:10] == (None,) * 10
-        assert loaded.layer_caches[10] is not None
 
     def test_ambiguous_legacy_apis_refuse(self, tmp_path: Path) -> None:
         """Historical schema-guessing entry points provide migration guidance."""

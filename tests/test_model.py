@@ -114,6 +114,26 @@ class TestMegalodonBlock:
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
     @pytest.mark.fast
+    def test_direct_cache_requires_exact_array_schema(self, random_seed: int) -> None:
+        """Direct block caches fail before compute when shapes or dtypes drift."""
+        config = replace(small_config(), compute_dtype=jnp.bfloat16)
+        block = MegalodonBlock(config, layer_id=0, key=jax.random.PRNGKey(random_seed))
+        x = jnp.zeros((2, 3, config.model_dim), dtype=jnp.bfloat16)
+        _, cache = block(x, return_cache=True)
+        assert cache is not None and cache.attn is not None
+        assert cache.norm is not None and cache.ema is not None
+
+        malformed = (
+            replace(cache, attn=replace(cache.attn, k=cache.attn.k.astype(jnp.float32))),
+            replace(cache, attn=replace(cache.attn, v=cache.attn.v[:, :-1])),
+            replace(cache, norm=replace(cache.norm, mean=cache.norm.mean[:, :-1])),
+            replace(cache, ema=replace(cache.ema, h=cache.ema.h[:, :, :-1])),
+        )
+        for invalid in malformed:
+            with pytest.raises(ValueError, match="must have (shape|dtype)"):
+                block(x[:, :1], cache=invalid, return_cache=True)
+
+    @pytest.mark.fast
     def test_direct_cache_is_inference_only(self, random_seed: int) -> None:
         """Direct block calls enforce the model's inference-only cache contract."""
         config = small_config()
@@ -814,7 +834,7 @@ class TestModelCache:
             jax.block_until_ready(
                 model(
                     jnp.empty((1, 0), dtype=jnp.int32),
-                    cache=malformed["attention"],
+                    cache=cache,
                     return_cache=True,
                 )
             )
