@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -95,3 +96,49 @@ def test_source_archives_have_a_nonzero_version_fallback() -> None:
     configuration = tomllib.loads(pyproject.read_text(encoding="utf-8"))
     fallback = configuration["tool"]["setuptools_scm"]["fallback_version"]
     assert fallback != "0.0.0"
+
+
+def test_supervisor_discards_stale_worker_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crashed rerun cannot inherit a prior worker's passing evidence."""
+    output = tmp_path / "benchmark.json"
+    case = {
+        "case_id": "current--training--forward--plain--b1--l8",
+        "repo_root": str(tmp_path),
+    }
+    result_path = tmp_path / "benchmark.cases" / f"{case['case_id']}.json"
+    benchmark._atomic_json(result_path, {**case, "status": "passed"})
+    monkeypatch.setattr(benchmark, "_build_cases", lambda args, repos: [case])
+    monkeypatch.setattr(
+        benchmark,
+        "_repo_provenance",
+        lambda path: {"revision": "test", "dirty": False, "dirty_entries": []},
+    )
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout="", stderr="crashed"),
+    )
+    args = SimpleNamespace(
+        repo=None,
+        allow_unknown_revision=False,
+        allow_dirty=False,
+        output=output,
+        dry_run=False,
+        timeout_seconds=10.0,
+        warmups=0,
+        iterations=1,
+        profile_dir=None,
+        allow_failures=False,
+    )
+
+    exit_code = benchmark._supervisor(args)
+
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert exit_code == 1
+    assert report["summary"]["passed"] == 0
+    assert report["summary"]["failed"] == 1
+    assert report["cases"][0]["status"] == "failed"
+    assert report["cases"][0]["error"]["type"] == "WorkerProcessError"

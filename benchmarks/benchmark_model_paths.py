@@ -490,6 +490,7 @@ def _supervisor(args: argparse.Namespace) -> int:
             spec_path = case_directory / f"{case_id}.spec.json"
             result_path = case_directory / f"{case_id}.json"
             _atomic_json(spec_path, case)
+            result_path.unlink(missing_ok=True)
             command = [
                 sys.executable,
                 str(script),
