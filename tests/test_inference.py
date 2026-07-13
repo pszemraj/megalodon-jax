@@ -31,7 +31,7 @@ from megalodon_jax.convert import (
     save_safetensors,
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token
-from megalodon_jax.types import AttentionCache, LayerCache, ModelCache
+from megalodon_jax.types import AttentionCache, LayerCache, ModelCache, NormState
 from tests.factories import tiny_config
 
 
@@ -911,6 +911,23 @@ class TestConversion:
         with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
             save_inference_cache(nonfinite, tmp_path / "nonfinite.safetensors", config)
 
+        partial_zero = ModelCache(
+            layer_caches=(
+                LayerCache(
+                    norm=NormState(
+                        count=jnp.zeros((1,), dtype=jnp.int32),
+                        mean=jnp.zeros((1, config.norm_num_groups), dtype=jnp.float32),
+                        var=jnp.ones((1, config.norm_num_groups), dtype=jnp.float32),
+                    ),
+                    position=jnp.asarray(0, dtype=jnp.int32),
+                ),
+                *([None] * (config.num_layers - 1)),
+            ),
+            final_norm=None,
+        )
+        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
+            save_inference_cache(partial_zero, tmp_path / "partial-zero.safetensors", config)
+
     def test_load_rejects_partial_nonzero_cache(self, tmp_path: Path) -> None:
         """A schema-valid sparse cache cannot carry a nonzero logical timeline."""
         from safetensors import safe_open
@@ -970,6 +987,68 @@ class TestConversion:
         save_file(tensors, str(presence_path), metadata=bad_presence)
         with pytest.raises(ValueError, match="unknown entries"):
             load_inference_cache(presence_path, config)
+
+        partial_presence = dict(metadata)
+        partial_presence["present_json"] = json.dumps(
+            [item for item in present if item not in {"layers.0.attn", "layers.0.ema"}]
+        )
+        partial_path = tmp_path / "partial-presence.safetensors"
+        save_file(tensors, str(partial_path), metadata=partial_presence)
+        with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):
+            load_inference_cache(partial_path, config)
+
+    def test_atomic_writer_is_unique_durable_and_cleans_failures(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Atomic persistence avoids shared temp names and removes failed writes."""
+        import megalodon_jax.checkpoint as checkpoint_module
+
+        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
+        destination = tmp_path / "model.safetensors"
+        legacy_temporary = destination.with_suffix(".safetensors.tmp")
+        legacy_temporary.write_bytes(b"unrelated writer")
+        real_fsync = checkpoint_module.os.fsync
+        fsync_calls: list[int] = []
+
+        def record_fsync(file_descriptor: int) -> None:
+            fsync_calls.append(file_descriptor)
+            real_fsync(file_descriptor)
+
+        monkeypatch.setattr(checkpoint_module.os, "fsync", record_fsync)
+
+        save_checkpoint(model, destination)
+
+        assert destination.is_file()
+        assert legacy_temporary.read_bytes() == b"unrelated writer"
+        assert len(fsync_calls) == 2  # temporary contents, then containing directory
+        original = destination.read_bytes()
+
+        def fail_after_partial_write(
+            tensors: dict[str, object],
+            path: str,
+            *,
+            metadata: dict[str, str],
+        ) -> None:
+            del tensors, metadata
+            Path(path).write_bytes(b"partial")
+            raise RuntimeError("simulated persistence failure")
+
+        monkeypatch.setattr(checkpoint_module, "save_file", fail_after_partial_write)
+        with pytest.raises(RuntimeError, match="simulated persistence failure"):
+            save_checkpoint(model, destination)
+
+        assert destination.read_bytes() == original
+        assert list(tmp_path.glob(f".{destination.name}.*.tmp")) == []
+
+    def test_missing_persistence_files_raise_file_not_found(self, tmp_path: Path) -> None:
+        """Model and cache readers expose the same missing-file exception contract."""
+        missing = tmp_path / "missing.safetensors"
+        with pytest.raises(FileNotFoundError):
+            load_checkpoint(missing, key=jax.random.PRNGKey(0))
+        with pytest.raises(FileNotFoundError):
+            load_inference_cache(missing, small_config())
 
     def test_sparse_cache_layer_presence_uses_exact_layer_names(self, tmp_path: Path) -> None:
         """Layer 10 presence must not imply that similarly prefixed layer 1 exists."""

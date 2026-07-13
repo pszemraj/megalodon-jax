@@ -12,10 +12,11 @@ import numpy as np
 import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, cache_invariant_violation
 from megalodon_jax.inference import init_cache
+from megalodon_jax.layers import TimestepNorm
 from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
-from megalodon_jax.types import EMAState, LayerCache, ModelCache
+from megalodon_jax.types import EMAState, LayerCache, ModelCache, NormState
 from tests.factories import floating_to_bf16, tiny_config
 
 
@@ -101,6 +102,12 @@ class TestMegalodonBlock:
         for invalid in malformed:
             with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
                 jax.block_until_ready(block(x[:, :1], cache=invalid, return_cache=True))
+
+        compiled = eqx.filter_jit(
+            lambda values, state: block(values, cache=state, return_cache=True)
+        )
+        with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
+            jax.block_until_ready(compiled(x[:, :1], malformed[0]))
 
         expected, _ = block(x, return_cache=True)
         actual, _ = block(x, cache=LayerCache(), return_cache=True)
@@ -843,14 +850,14 @@ class TestModelCache:
                 jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
 
     @pytest.mark.fast
-    def test_model_cache_rejects_invalid_compact_norm_values(self, random_seed: int) -> None:
-        """Model entry always validates small normalization-state payloads."""
+    def test_model_cache_rejects_invalid_compact_state_values(self, random_seed: int) -> None:
+        """Model entry always validates normalization and EMA state payloads."""
         config = small_config()
         model = MegalodonModel(config, key=jax.random.PRNGKey(random_seed))
         _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
         assert cache is not None and cache.final_norm is not None
         first = cache.layer_caches[0]
-        assert first is not None and first.norm is not None
+        assert first is not None and first.norm is not None and first.ema is not None
 
         invalid_layer_norms = (
             replace(first.norm, mean=first.norm.mean.at[0, 0].set(jnp.nan)),
@@ -873,10 +880,66 @@ class TestModelCache:
                 ),
             )
         )
+        malformed_ema = replace(
+            cache,
+            layer_caches=(
+                replace(
+                    first,
+                    ema=replace(
+                        first.ema,
+                        h=first.ema.h.at[0, 0, 0].set(jnp.nan + 0.0j),
+                    ),
+                ),
+                *cache.layer_caches[1:],
+            ),
+        )
+        malformed.append(malformed_ema)
 
         for invalid in malformed:
             with pytest.raises(Exception, match=CACHE_INVARIANT_MESSAGE):
                 jax.block_until_ready(model(jnp.asarray([[4]], dtype=jnp.int32), cache=invalid))
+
+        compiled_violation = eqx.filter_jit(lambda state: cache_invariant_violation(state, config))
+        assert bool(np.asarray(compiled_violation(malformed_ema)))
+
+        assert bool(np.asarray(cache_invariant_violation(malformed_ema, config)))
+        assert first.attn is not None
+        malformed_kv = replace(
+            cache,
+            layer_caches=(
+                replace(
+                    first,
+                    attn=replace(
+                        first.attn,
+                        k=first.attn.k.at[0, 0, 0, 0].set(jnp.nan),
+                    ),
+                ),
+                *cache.layer_caches[1:],
+            ),
+        )
+        assert not bool(np.asarray(cache_invariant_violation(malformed_kv, config)))
+        assert bool(
+            np.asarray(
+                cache_invariant_violation(
+                    malformed_kv,
+                    config,
+                    check_full_payload=True,
+                )
+            )
+        )
+
+    def test_zero_layer_complete_cache_requires_pristine_final_norm(self) -> None:
+        """A final-norm-only zero-layer cache still validates its zero timeline."""
+        config = small_config(num_layers=0)
+        malformed = ModelCache(
+            layer_caches=(),
+            final_norm=NormState(
+                count=jnp.zeros((1,), dtype=jnp.int32),
+                mean=jnp.ones((1, config.norm_num_groups), dtype=jnp.float32),
+                var=jnp.ones((1, config.norm_num_groups), dtype=jnp.float32),
+            ),
+        )
+        assert bool(np.asarray(cache_invariant_violation(malformed, config)))
 
     @pytest.mark.fast
     def test_model_cache_rejects_coherent_count_overflow(self, random_seed: int) -> None:
@@ -1731,6 +1794,24 @@ class TestPrecisionAudit:
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
+        layer_prior = TimestepNorm(
+            config.model_dim,
+            config.norm_num_groups,
+            prior_count=2,
+            eps=config.norm_eps,
+        )
+        final_prior = TimestepNorm(
+            config.model_dim,
+            config.norm_num_groups,
+            prior_count=2,
+            eps=config.norm_eps,
+        )
+        core = eqx.tree_at(
+            lambda m: (m.layers[0].attn.timenorm, m.norm),
+            model.model,
+            (layer_prior, final_prior),
+        )
+        model = eqx.tree_at(lambda m: m.model, model, core)
 
         mismatches = audit_sensitive_param_dtypes(model)
         assert mismatches == {}
@@ -1739,6 +1820,10 @@ class TestPrecisionAudit:
         mismatches = audit_sensitive_param_dtypes(model_bf16)
         assert "layers.0.attn.cema.alpha" in mismatches
         assert "layers.0.ffn.alpha" in mismatches
+        assert "layers.0.attn.timenorm.prior_mean" in mismatches
+        assert "layers.0.attn.timenorm.prior_logv" in mismatches
+        assert "norm.prior_mean" in mismatches
+        assert "norm.prior_logv" in mismatches
 
         restored = ensure_sensitive_param_dtype(model_bf16)
         assert audit_sensitive_param_dtypes(restored) == {}

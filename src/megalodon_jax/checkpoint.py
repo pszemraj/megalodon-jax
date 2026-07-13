@@ -18,6 +18,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+import tempfile
 from collections.abc import Callable, Collection
 from pathlib import Path
 from typing import Any
@@ -29,7 +31,7 @@ from jaxtyping import Array
 from safetensors import safe_open
 from safetensors.flax import load_file, save_file
 
-from megalodon_jax.cache import validate_model_cache_host
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, validate_model_cache_host
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
@@ -213,9 +215,26 @@ def _save_atomic_safetensors(
     """
     if destination.suffix != ".safetensors":
         raise ValueError(suffix_error)
-    temporary = destination.with_suffix(destination.suffix + ".tmp")
-    save_file(tensors, str(temporary), metadata=metadata)
-    temporary.replace(destination)
+    with tempfile.NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        save_file(tensors, str(temporary), metadata=metadata)
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_fd = os.open(destination.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 Entry = tuple[
@@ -257,12 +276,15 @@ def _model_entries(model: MegalodonForCausalLM) -> list[Entry]:
             lambda root, i=index: root.model.layers[i].attn.timenorm.bias,
         )
         if attn.timenorm.prior_mean is not None:
+            if attn.timenorm.prior_logv is None:
+                raise ValueError(
+                    f"{ap}.timenorm prior_mean requires a matching prior_logv parameter"
+                )
             add(
                 f"{ap}.timenorm.prior_mean",
                 attn.timenorm.prior_mean,
                 lambda root, i=index: root.model.layers[i].attn.timenorm.prior_mean,
             )
-            assert attn.timenorm.prior_logv is not None
             add(
                 f"{ap}.timenorm.prior_logv",
                 attn.timenorm.prior_logv,
@@ -308,12 +330,13 @@ def _model_entries(model: MegalodonForCausalLM) -> list[Entry]:
         ffn = layer.ffn
         fp = f"model.layers.{index}.ffn"
         if ffn.norm.weight is not None:
+            if ffn.norm.bias is None:
+                raise ValueError(f"{fp}.norm weight requires a matching bias parameter")
             add(
                 f"{fp}.norm.weight",
                 ffn.norm.weight,
                 lambda root, i=index: root.model.layers[i].ffn.norm.weight,
             )
-            assert ffn.norm.bias is not None
             add(
                 f"{fp}.norm.bias",
                 ffn.norm.bias,
@@ -358,6 +381,8 @@ def _metadata(path: Path) -> dict[str, str]:
     :raises ValueError: If the file is not readable as SafeTensors.
     :return dict[str, str]: File metadata, or an empty mapping when absent.
     """
+    if not path.is_file():
+        raise FileNotFoundError(path)
     try:
         with safe_open(str(path), framework="flax") as handle:
             metadata = handle.metadata()
@@ -677,9 +702,12 @@ def load_inference_cache(
     expected_tensor_keys: set[str] = set()
     for index in range(config.num_layers):
         prefix = f"layers.{index}"
-        components = present & {f"{prefix}.attn", f"{prefix}.norm", f"{prefix}.ema"}
+        required_components = {f"{prefix}.attn", f"{prefix}.norm", f"{prefix}.ema"}
+        components = present & required_components
         if components and f"{prefix}.position" not in present:
             raise ValueError(f"cache layer {index} components require a position tensor")
+        if components and components != required_components:
+            raise ValueError(CACHE_INVARIANT_MESSAGE)
         if f"{prefix}.position" in present:
             expected_tensor_keys.add(f"{prefix}.position")
         if f"{prefix}.attn" in present:

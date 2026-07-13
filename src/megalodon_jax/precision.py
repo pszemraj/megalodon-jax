@@ -47,6 +47,16 @@ def _iter_sensitive_paths(core: MegalodonModel) -> Iterable[SensitivePath]:
         yield f"{prefix}.gamma", lambda m, i=i: m.layers[i].attn.gamma
         yield f"{prefix}.beta", lambda m, i=i: m.layers[i].attn.beta
 
+        if attn.timenorm.prior_mean is not None:
+            yield (
+                f"{prefix}.timenorm.prior_mean",
+                (lambda m, i=i: m.layers[i].attn.timenorm.prior_mean),
+            )
+        if attn.timenorm.prior_logv is not None:
+            yield (
+                f"{prefix}.timenorm.prior_logv",
+                (lambda m, i=i: m.layers[i].attn.timenorm.prior_logv),
+            )
         if attn.timenorm.weight is not None:
             yield f"{prefix}.timenorm.weight", lambda m, i=i: m.layers[i].attn.timenorm.weight
         if attn.timenorm.bias is not None:
@@ -61,6 +71,10 @@ def _iter_sensitive_paths(core: MegalodonModel) -> Iterable[SensitivePath]:
         if layer.ffn.alpha is not None:
             yield f"layers.{i}.ffn.alpha", lambda m, i=i: m.layers[i].ffn.alpha
 
+    if core.norm.prior_mean is not None:
+        yield "norm.prior_mean", lambda m: m.norm.prior_mean
+    if core.norm.prior_logv is not None:
+        yield "norm.prior_logv", lambda m: m.norm.prior_logv
     if core.norm.weight is not None:
         yield "norm.weight", lambda m: m.norm.weight
     if core.norm.bias is not None:
