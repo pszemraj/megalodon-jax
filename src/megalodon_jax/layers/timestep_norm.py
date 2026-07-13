@@ -107,6 +107,9 @@ def _shifted_cumsum_prefix(
 ) -> tuple[Array, Array, Array]:
     """Compute an unmasked prefix from one shifted first/second-moment cumsum.
 
+    "Shifted" refers to subtracting a numerical anchor from the moments; it
+    does not shift values along the sequence axis.
+
     :param Array block_mean: Per-token population means by group.
     :param Array block_var: Per-token population variances by group.
     :param NormState initial: Incoming causal normalization state.
@@ -189,8 +192,8 @@ class TimestepNorm(eqx.Module):
             raise ValueError(f"prior_count must be non-negative, got {prior_count}")
         if prior_count > jnp.iinfo(jnp.int32).max:
             raise ValueError("prior_count exceeds the supported int32 state range")
-        if not math.isfinite(eps) or eps < 0.0:
-            raise ValueError(f"eps must be finite and non-negative, got {eps}")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(f"eps must be finite and positive, got {eps}")
         if not affine:
             raise ValueError("TimestepNorm is always affine in the released architecture")
 

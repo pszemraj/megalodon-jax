@@ -424,9 +424,9 @@ def main() -> int:
 
     def check_timestep_math() -> tuple[bool, str, dict[str, Any]]:
         x = np.array([[[1.0, 3.0, 2.0, 6.0], [5.0, 7.0, 10.0, 14.0]]], dtype=np.float32)
-        module = TimestepNorm(4, 2, eps=0.0)
+        module = TimestepNorm(4, 2, eps=1e-8)
         actual, state = module(jnp.asarray(x))
-        expected, count, mean, var = exact_timestep_norm(x, 2, eps=0.0)
+        expected, count, mean, var = exact_timestep_norm(x, 2, eps=1e-8)
         y_err = _max_abs_error(actual, expected)
         var_err = _max_abs_error(state.var, var)
         passed = (
@@ -454,9 +454,9 @@ def main() -> int:
     def check_timestep_mask() -> tuple[bool, str, dict[str, Any]]:
         x = np.array([[[1.0, 3.0, 2.0, 6.0], [100.0, 200.0, 300.0, 400.0]]], dtype=np.float32)
         mask = np.array([[True, False]])
-        module = TimestepNorm(4, 2, eps=0.0)
+        module = TimestepNorm(4, 2, eps=1e-8)
         actual, state = module(jnp.asarray(x), mask=jnp.asarray(mask))
-        expected, count, mean, var = exact_timestep_norm(x, 2, mask=mask, eps=0.0)
+        expected, count, mean, var = exact_timestep_norm(x, 2, mask=mask, eps=1e-8)
         masked = np.asarray(actual)[0, 1]
         passed = np.array_equal(masked, np.zeros_like(masked)) and np.array_equal(
             np.asarray(state.count), count
@@ -491,9 +491,14 @@ def main() -> int:
             dtype=np.float32,
         )
         segments = np.array([[1, 1, 2, 2]], dtype=np.int32)
-        module = TimestepNorm(4, 2, eps=0.0)
+        module = TimestepNorm(4, 2, eps=1e-8)
         actual, state = module(jnp.asarray(x), segment_ids=jnp.asarray(segments))
-        expected, count, mean, var = exact_timestep_norm(x, 2, segment_ids=segments, eps=0.0)
+        expected, count, mean, var = exact_timestep_norm(
+            x,
+            2,
+            segment_ids=segments,
+            eps=1e-8,
+        )
         err = _max_abs_error(actual, expected)
         passed = (
             err <= 2e-6

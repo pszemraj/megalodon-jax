@@ -128,6 +128,29 @@ class TestTimestepNorm:
             err_msg="Chunked processing should match full sequence",
         )
 
+    def test_masked_streaming_state_continuity(self, random_seed: int) -> None:
+        """Masked associative prefixes continue identically across calls."""
+        norm = TimestepNorm(32, 4)
+        key = jax.random.PRNGKey(random_seed)
+        x = jax.random.normal(key, (2, 17, 32), dtype=jnp.float32)
+        mask = (jnp.arange(17)[None, :] + jnp.arange(2)[:, None]) % 4 != 1
+
+        expected, expected_state = norm(x, mask=mask)
+        first, state = norm(x[:, :7], mask=mask[:, :7])
+        second, actual_state = norm(x[:, 7:], state=state, mask=mask[:, 7:])
+        actual = jnp.concatenate((first, second), axis=1)
+
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=2e-5, atol=2e-5)
+        np.testing.assert_array_equal(
+            np.asarray(actual_state.count), np.asarray(expected_state.count)
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_state.mean), np.asarray(expected_state.mean), rtol=2e-5, atol=2e-5
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_state.var), np.asarray(expected_state.var), rtol=2e-5, atol=2e-5
+        )
+
     def test_weight_initialization(self) -> None:
         """Test that weight and bias are initialized to zeros.
 
@@ -140,7 +163,7 @@ class TestTimestepNorm:
     @pytest.mark.fast
     def test_exact_scalar_population_moments(self) -> None:
         """Each valid token contributes all scalar features in its group."""
-        norm = TimestepNorm(4, 2, eps=0.0)
+        norm = TimestepNorm(4, 2, eps=1e-12)
         x = jnp.asarray([[[1.0, 3.0, 2.0, 6.0], [5.0, 7.0, 10.0, 14.0]]])
 
         output, state = norm(x)
@@ -332,6 +355,25 @@ class TestTimestepNorm:
                 _, _, prefix_var = _shifted_cumsum_prefix(block_mean, block_var, initial)
                 assert bool(jnp.all(jnp.isfinite(prefix_var)))
                 assert float(jnp.min(prefix_var)) >= 0.0
+
+    def test_masked_associative_path_remains_finite_at_large_offsets(self) -> None:
+        """Masked Welford prefixes retain finite, nonnegative state and output."""
+        norm = TimestepNorm(32, 4)
+        key = jax.random.PRNGKey(47)
+        noise = jax.random.normal(key, (2, 257, 32), dtype=jnp.float32)
+        mask = (jnp.arange(257)[None, :] + jnp.arange(2)[:, None]) % 5 != 2
+
+        for values in (
+            jnp.full_like(noise, 1e7),
+            1e6 + 2.0 * noise,
+            1e4 + 2e-2 * noise,
+            (1e3 + 2.0 * noise).astype(jnp.bfloat16),
+        ):
+            output, state = norm(values, mask=mask)
+            assert bool(jnp.all(jnp.isfinite(output)))
+            assert bool(jnp.all(jnp.isfinite(state.mean)))
+            assert bool(jnp.all(jnp.isfinite(state.var)))
+            assert float(jnp.min(state.var)) >= 0.0
 
     @pytest.mark.fast
     @pytest.mark.parametrize("mode", ["plain", "masked", "packed", "continuation"])
@@ -549,7 +591,7 @@ class TestTimestepNorm:
 
     def test_masked_nonfinite_token_does_not_update_state(self) -> None:
         """Masked NaN/Inf blocks cannot contaminate later valid prefixes."""
-        norm = TimestepNorm(4, 2, eps=0.0)
+        norm = TimestepNorm(4, 2, eps=1e-12)
         x = jnp.asarray(
             [
                 [
@@ -670,6 +712,12 @@ class TestTimestepNorm:
         """
         with pytest.raises(ValueError, match="divisible by"):
             TimestepNorm(63, 8)
+
+    @pytest.mark.parametrize("eps", [0.0, -1.0, float("nan"), float("inf")])
+    def test_epsilon_must_be_finite_and_positive(self, eps: float) -> None:
+        """Zero cannot regularize an exactly constant cumulative group."""
+        with pytest.raises(ValueError, match="finite and positive"):
+            TimestepNorm(4, 2, eps=eps)
 
     def test_different_shapes(self) -> None:
         """Test TimestepNorm works with various input shapes.
