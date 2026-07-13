@@ -63,6 +63,11 @@ def _config_dict(config: MegalodonConfig) -> dict[str, Any]:
     data = dataclasses.asdict(config)
     for field in _DTYPE_FIELDS:
         data[field] = str(jnp.dtype(data[field]))
+    for field, value in data.items():
+        if isinstance(value, np.integer):
+            data[field] = int(value)
+        elif isinstance(value, np.floating):
+            data[field] = float(value)
     return data
 
 

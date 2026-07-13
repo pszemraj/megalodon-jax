@@ -697,6 +697,24 @@ class TestConversion:
         actual_logits, _ = loaded(tokens)
         np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
 
+    def test_native_roundtrip_normalizes_numpy_config_scalars(self, tmp_path: Path) -> None:
+        """Validated NumPy config scalars remain JSON-portable and reloadable."""
+        config = replace(
+            small_config(),
+            vocab_size=np.int64(64),
+            dropout=np.float32(0.1),
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        path = tmp_path / "numpy-scalars.safetensors"
+
+        save_checkpoint(model, path)
+        loaded = load_checkpoint(path, key=jax.random.PRNGKey(1))
+
+        assert type(loaded.config.vocab_size) is int
+        assert loaded.config.vocab_size == int(config.vocab_size)
+        assert type(loaded.config.dropout) is float
+        assert loaded.config.dropout == float(config.dropout)
+
     def test_metadata_free_and_legacy_files_are_rejected(self, tmp_path: Path) -> None:
         """SafeTensors without explicit v2 semantics must never be guessed."""
         from safetensors.flax import save_file
