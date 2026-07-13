@@ -622,6 +622,35 @@ class TestChunkedAttention:
         assert cache is not None and int(cache.count) == length
         np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=2e-6)
 
+    @pytest.mark.parametrize(
+        "position_ids",
+        [
+            pytest.param([[0, 0, 0, 0]], id="repeated"),
+            pytest.param([[0, 10, 20, 30]], id="gapped"),
+        ],
+    )
+    def test_sliding_window_mask_uses_token_order(
+        self,
+        position_ids: list[list[int]],
+    ) -> None:
+        """Explicit RoPE coordinates cannot change causal or window support."""
+        module = ChunkedAttention(
+            num_heads=1,
+            head_dim=2,
+            value_head_dim=1,
+            chunk_size=4,
+            attention_window=2,
+            key=jax.random.PRNGKey(0),
+        )
+        q = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
+        k = jnp.zeros_like(q)
+        v = jnp.arange(1, 5, dtype=jnp.float32).reshape(1, 4, 1, 1)
+
+        actual, _, _ = module(q, k, v, position_ids=jnp.asarray(position_ids))
+
+        expected = jnp.asarray([1.0, 1.5, 2.5, 3.5], dtype=jnp.float32).reshape(1, 4, 1, 1)
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-6)
+
     def test_cache_copy_continuation_is_identical(self, random_seed: int) -> None:
         """A reloaded array-identical cache resumes without numerical drift."""
         key = jax.random.PRNGKey(random_seed)

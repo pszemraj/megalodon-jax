@@ -516,20 +516,18 @@ class ChunkedAttention(eqx.Module):
         batch, length = q.shape[:2]
         if segment_ids is not None:
             run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
-            positions = local_positions if position_ids is None else position_ids
+            rotary_positions = local_positions if position_ids is None else position_ids
+            token_positions = local_positions
             same_run = run_ids[:, :, None] == run_ids[:, None, :]
             segment_valid = valid_segment_mask(segment_ids)
             valid_segments = segment_valid[:, :, None] & segment_valid[:, None, :]
         else:
-            positions = (
-                jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-                if position_ids is None
-                else position_ids
-            )
+            token_positions = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+            rotary_positions = token_positions if position_ids is None else position_ids
             same_run = jnp.ones((batch, length, length), dtype=jnp.bool_)
             valid_segments = same_run
 
-        age = positions[:, :, None] - positions[:, None, :]
+        age = token_positions[:, :, None] - token_positions[:, None, :]
         qk_mask = same_run & valid_segments & (age >= 0) & (age < self.attention_window)
         if mask is not None:
             qk_mask = qk_mask & mask[:, :, None] & mask[:, None, :]
@@ -537,7 +535,7 @@ class ChunkedAttention(eqx.Module):
             q,
             k,
             jnp.asarray(0, dtype=jnp.int32),
-            position_ids=positions,
+            position_ids=rotary_positions,
         )
         return attention_single_chunk(
             q_rot,
