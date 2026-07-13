@@ -53,6 +53,8 @@ The verifier writes explicit skipped results and exits nonzero when an executed 
 
 `benchmarks/benchmark_model_paths.py` measures synchronized production inference and training paths in isolated worker processes. Compilation is reported separately from runtime, and the output records repository revisions, configuration, environment, correctness checks, median, p90, and memory data.
 
+The default training matrix enables gradient checkpointing and covers batches 1/2/4, lengths 2,048/4,096, forward and forward-backward execution, and plain, all-valid-mask, and packed inputs.
+
 The cross-revision default uses tied embedding/output weights because historical `main` inferred tying for vocabulary-sized outputs. Measure the current untied production topology separately with `--config-json '{"share_emb": false}'`. Topology-sensitive cases that cannot match the requested topology are recorded as `completed_noncomparable` and excluded from cross-revision timing ratios.
 
 Run the benchmark with the default compiler configuration. Do not mix results produced with different `XLA_FLAGS` or CUDA library search paths.

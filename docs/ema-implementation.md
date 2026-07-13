@@ -9,13 +9,13 @@
 
 ## Execution paths
 
-The JAX version provides four numerically equivalent paths:
+The JAX version provides four execution paths:
 
 1. **FFT path (training / no state)** When no state is requested, ComplexEMA builds the EMA kernel and applies an FFT-based convolution (O(L log L)).
 
 2. **Pristine prefill path (FFT output + compact state recurrence)** When `h_init` is absent and `return_state=True`, outputs use FFT convolution while a state-only `jax.lax.scan` carries `(batch, dim, ndim)` complex state and emits no per-token outputs.
 
-3. **Sequential continuation path** When `h_init` is nonzero, ComplexEMA runs the recurrence with `jax.lax.scan` (O(L)) because every output depends on incoming history.
+3. **Sequential continuation path** When `h_init` is provided, ComplexEMA runs the recurrence with `jax.lax.scan` (O(L)) because every output depends on incoming history.
 
 4. **Segmented path (packed training)** When `segment_ids` is provided, the EMA state resets at every segment boundary so packed documents cannot leak into each other. The FFT path cannot express resets and is bypassed.
 

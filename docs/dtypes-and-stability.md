@@ -73,7 +73,7 @@ assert not audit_sensitive_param_dtypes(model)
 
 ## Training loop
 
-The model owns compute casting; token IDs remain `int32`, and optimizer state should be initialized from the FP32 parameter tree.
+The model owns compute casting; token IDs remain `int32`, and optimizer state should be initialized from the FP32 parameter tree. The example uses Optax, which is not a runtime dependency (`pip install optax`).
 
 ```python
 import equinox as eqx
@@ -105,7 +105,7 @@ def train_step(candidate, state, input_ids, labels, key):
 
 Native model checkpoints preserve the FP32 parameter contract and store the dtype policy in configuration metadata. Loading converts original-upstream floating tensors to FP32 parameter storage.
 
-`export_upstream_state_dict(model, dtype=torch.bfloat16)` may create a BF16 transport copy. Format versions, strict loading, partial restore, and conversion behavior are described in [JAX and PyTorch interoperability](jax-torch.md).
+`export_upstream_state_dict(model, dtype=torch.bfloat16)` casts ordinary embedding, projection, and output tensors for transport while preserving CEMA, normalization, RoPE, and other sensitive values in FP32. Format versions, strict loading, partial restore, and conversion behavior are described in [JAX and PyTorch interoperability](jax-torch.md).
 
 ## Troubleshooting
 
