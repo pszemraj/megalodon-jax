@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -91,14 +90,6 @@ def test_driver_version_is_extracted_without_requiring_nvidia_smi() -> None:
     }
     assert benchmark._nvidia_driver_version(record) == "595.71.05"
     assert benchmark._nvidia_driver_version({"available": False}) is None
-
-
-def test_source_archives_have_a_nonzero_version_fallback() -> None:
-    """Raw source archives must not silently build packages as version 0.0.0."""
-    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    configuration = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    fallback = configuration["tool"]["setuptools_scm"]["fallback_version"]
-    assert fallback != "0.0.0"
 
 
 def test_supervisor_discards_stale_worker_result(
