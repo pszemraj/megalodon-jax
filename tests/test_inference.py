@@ -582,8 +582,8 @@ class TestConversion:
 
     @pytest.mark.torch_ref
     @pytest.mark.fast
-    def test_original_upstream_manifest_is_source_transcribed(self) -> None:
-        """Check converter keys, shapes, and dtypes against a hand-authored source manifest."""
+    def test_original_upstream_manifest_is_source_transcribed(self, tmp_path: Path) -> None:
+        """Check converter schema and sharding against a hand-authored source manifest."""
         torch = pytest.importorskip("torch")
         config = MegalodonConfig(
             vocab_size=17,
@@ -603,65 +603,65 @@ class TestConversion:
         )
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 
-        # Literal dimensions below are transcribed from the constructors in
+        # Literal dimensions and partition axes below are transcribed from the constructors in
         # the released moving-average attention, CEMA, TimestepNorm, NFFN,
         # rotary, and output-layer sources. Do not derive this mapping through
         # either converter direction or through JAX parameter leaves.
-        manifest: dict[str, tuple[tuple[int, ...], torch.dtype]] = {
-            "embed.weight": ((17, 8), torch.float32),
-            "rope.freqs": ((2,), torch.float32),
-            "output.final_norm.prior_count": ((), torch.int64),
-            "output.final_norm.prior_mean": ((2,), torch.float32),
-            "output.final_norm.prior_logv": ((2,), torch.float32),
-            "output.final_norm.weight": ((8,), torch.float32),
-            "output.final_norm.bias": ((8,), torch.float32),
-            "output.output.weight": ((19, 8), torch.float32),
+        manifest: dict[str, tuple[tuple[int, ...], torch.dtype, int | None]] = {
+            "embed.weight": ((17, 8), torch.float32, 1),
+            "rope.freqs": ((2,), torch.float32, None),
+            "output.final_norm.prior_count": ((), torch.int64, None),
+            "output.final_norm.prior_mean": ((2,), torch.float32, 0),
+            "output.final_norm.prior_logv": ((2,), torch.float32, 0),
+            "output.final_norm.weight": ((8,), torch.float32, 0),
+            "output.final_norm.bias": ((8,), torch.float32, 0),
+            "output.output.weight": ((19, 8), torch.float32, 1),
         }
         for index in range(2):
             ap = f"layers.{index}.mega"
             fp = f"layers.{index}.nffn"
             manifest.update(
                 {
-                    f"{ap}.timenorm.prior_count": ((), torch.int64),
-                    f"{ap}.timenorm.prior_mean": ((2,), torch.float32),
-                    f"{ap}.timenorm.prior_logv": ((2,), torch.float32),
-                    f"{ap}.timenorm.weight": ((8,), torch.float32),
-                    f"{ap}.timenorm.bias": ((8,), torch.float32),
-                    f"{ap}.cema.alpha": ((8, 2, 1), torch.float32),
-                    f"{ap}.cema.delta": ((8, 2, 1), torch.float32),
-                    f"{ap}.cema.theta": ((8, 1, 1), torch.float32),
-                    f"{ap}.cema.gamma": ((8, 2, 2), torch.float32),
-                    f"{ap}.cema.omega": ((8, 1), torch.float32),
-                    f"{ap}.rmsnorm.weight": ((8,), torch.float32),
-                    f"{ap}.wz.weight": ((8, 8), torch.float32),
-                    f"{ap}.wz.bias": ((8,), torch.float32),
-                    f"{ap}.wv.weight": ((8, 8), torch.float32),
-                    f"{ap}.wv.bias": ((8,), torch.float32),
-                    f"{ap}.wr.weight": ((8, 8), torch.float32),
-                    f"{ap}.wr.bias": ((8,), torch.float32),
-                    f"{ap}.wh1.weight": ((8, 8), torch.float32),
-                    f"{ap}.wh1.bias": ((8,), torch.float32),
-                    f"{ap}.wh2.weight": ((8, 8), torch.float32),
-                    f"{ap}.gamma": ((2, 8), torch.float32),
-                    f"{ap}.beta": ((2, 8), torch.float32),
-                    f"{fp}.norm.weight": ((8,), torch.float32),
-                    f"{fp}.norm.bias": ((8,), torch.float32),
-                    f"{fp}.fc1.weight": ((12, 8), torch.float32),
-                    f"{fp}.fc2.weight": ((8, 12), torch.float32),
-                    f"{fp}.fc3.weight": ((12, 8), torch.float32),
-                    f"{fp}.alpha": ((8,), torch.float32),
+                    f"{ap}.timenorm.prior_count": ((), torch.int64, None),
+                    f"{ap}.timenorm.prior_mean": ((2,), torch.float32, 0),
+                    f"{ap}.timenorm.prior_logv": ((2,), torch.float32, 0),
+                    f"{ap}.timenorm.weight": ((8,), torch.float32, 0),
+                    f"{ap}.timenorm.bias": ((8,), torch.float32, 0),
+                    f"{ap}.cema.alpha": ((8, 2, 1), torch.float32, 0),
+                    f"{ap}.cema.delta": ((8, 2, 1), torch.float32, 0),
+                    f"{ap}.cema.theta": ((8, 1, 1), torch.float32, 0),
+                    f"{ap}.cema.gamma": ((8, 2, 2), torch.float32, 0),
+                    f"{ap}.cema.omega": ((8, 1), torch.float32, 0),
+                    f"{ap}.rmsnorm.weight": ((8,), torch.float32, None),
+                    f"{ap}.wz.weight": ((8, 8), torch.float32, 0),
+                    f"{ap}.wz.bias": ((8,), torch.float32, 0),
+                    f"{ap}.wv.weight": ((8, 8), torch.float32, 0),
+                    f"{ap}.wv.bias": ((8,), torch.float32, 0),
+                    f"{ap}.wr.weight": ((8, 8), torch.float32, 0),
+                    f"{ap}.wr.bias": ((8,), torch.float32, 0),
+                    f"{ap}.wh1.weight": ((8, 8), torch.float32, 0),
+                    f"{ap}.wh1.bias": ((8,), torch.float32, 0),
+                    f"{ap}.wh2.weight": ((8, 8), torch.float32, 1),
+                    f"{ap}.gamma": ((2, 8), torch.float32, 1),
+                    f"{ap}.beta": ((2, 8), torch.float32, 1),
+                    f"{fp}.norm.weight": ((8,), torch.float32, None),
+                    f"{fp}.norm.bias": ((8,), torch.float32, None),
+                    f"{fp}.fc1.weight": ((12, 8), torch.float32, 0),
+                    f"{fp}.fc2.weight": ((8, 12), torch.float32, 1),
+                    f"{fp}.fc3.weight": ((12, 8), torch.float32, 0),
+                    f"{fp}.alpha": ((8,), torch.float32, None),
                 }
             )
 
         exported = export_upstream_state_dict(model)
         assert set(exported) == set(manifest)
-        for name, (shape, dtype) in manifest.items():
+        for name, (shape, dtype, _) in manifest.items():
             assert tuple(exported[name].shape) == shape, name
             assert exported[name].dtype == dtype, name
 
         generator = torch.Generator().manual_seed(1729)
         source_state: dict[str, torch.Tensor] = {}
-        for name, (shape, dtype) in manifest.items():
+        for name, (shape, dtype, _) in manifest.items():
             if dtype == torch.int64 or name.endswith("prior_mean") or name.endswith("prior_logv"):
                 source_state[name] = torch.zeros(shape, dtype=dtype)
             elif name == "rope.freqs":
@@ -675,6 +675,33 @@ class TestConversion:
         roundtripped = export_upstream_state_dict(loaded)
         for name in manifest:
             assert torch.equal(roundtripped[name], source_state[name]), name
+
+        shards: list[dict[str, torch.Tensor]] = [{}, {}]
+        for name, value in source_state.items():
+            axis = manifest[name][2]
+            if axis is None:
+                shards[0][name] = value.clone()
+                shards[1][name] = value.clone()
+            else:
+                pieces = torch.chunk(value, 2, dim=axis)
+                assert len(pieces) == 2
+                shards[0][name] = pieces[0].clone()
+                shards[1][name] = pieces[1].clone()
+
+        (tmp_path / "consolidate_config.json").write_text(
+            '{"model_parallel_size": 2, "dtype": "fp32"}',
+            encoding="utf-8",
+        )
+        torch.save(shards[0], tmp_path / "consolidated.00.pth")
+        torch.save(shards[1], tmp_path / "consolidated.01.pth")
+        consolidated = load_upstream_checkpoint(
+            tmp_path,
+            config,
+            key=jax.random.PRNGKey(2),
+        )
+        consolidated_state = export_upstream_state_dict(consolidated)
+        for name in manifest:
+            assert torch.equal(consolidated_state[name], source_state[name]), name
 
     @pytest.mark.fast
     def test_native_v2_roundtrip_is_exact(self, tmp_path: Path) -> None:
@@ -849,50 +876,6 @@ class TestConversion:
         state["output.output.weight"][0, 0] = torch.nextafter(value, value + 1.0)
         with pytest.raises(ValueError, match="bit-identical"):
             load_upstream_state_dict(model, state)
-
-    @pytest.mark.torch_ref
-    def test_consolidated_model_parallel_shards(self, tmp_path: Path) -> None:
-        """Declared model-parallel axes merge back into a world-size-one model."""
-        torch = pytest.importorskip("torch")
-        from megalodon_jax.convert import _merge_axis
-
-        config = replace(small_config(), rescale_nffn=True)
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        state = export_upstream_state_dict(model)
-        shards: list[dict[str, torch.Tensor]] = [{}, {}]
-        for name, value in state.items():
-            axis = _merge_axis(name)
-            if name.endswith(".nffn.alpha"):
-                assert axis is None
-            if axis is None:
-                shards[0][name] = value.clone()
-                shards[1][name] = value.clone()
-            else:
-                pieces = torch.chunk(value, 2, dim=axis)
-                assert len(pieces) == 2
-                shards[0][name] = pieces[0].clone()
-                shards[1][name] = pieces[1].clone()
-
-        (tmp_path / "consolidate_config.json").write_text(
-            '{"model_parallel_size": 2, "dtype": "fp32"}',
-            encoding="utf-8",
-        )
-        torch.save(shards[0], tmp_path / "consolidated.00.pth")
-        torch.save(shards[1], tmp_path / "consolidated.01.pth")
-        loaded = load_upstream_checkpoint(
-            tmp_path,
-            config,
-            key=jax.random.PRNGKey(1),
-        )
-        tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
-        expected, _ = model(tokens)
-        actual, _ = loaded(tokens)
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-        assert loaded.model.layers[0].ffn.alpha is not None
-        np.testing.assert_array_equal(
-            np.asarray(loaded.model.layers[0].ffn.alpha),
-            np.asarray(model.model.layers[0].ffn.alpha),
-        )
 
     @pytest.mark.torch_ref
     @pytest.mark.parametrize(
