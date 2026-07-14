@@ -434,8 +434,6 @@ class ChunkedAttention(eqx.Module):
         attention_dropout_mode: AttentionDropoutMode = "post_softmax",
         accum_dtype: jnp.dtype = jnp.float32,
         softmax_dtype: jnp.dtype = jnp.float32,
-        *,
-        key: PRNGKeyArray,
     ):
         """Initialize chunked attention.
 
@@ -449,9 +447,7 @@ class ChunkedAttention(eqx.Module):
         :param AttentionDropoutMode attention_dropout_mode: Dropout placement.
         :param jnp.dtype accum_dtype: Attention matmul accumulation dtype.
         :param jnp.dtype softmax_dtype: Attention softmax dtype.
-        :param PRNGKeyArray key: Unused construction key.
         """
-        del key
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
         if attention_window is not None and attention_window <= 0:
@@ -863,7 +859,6 @@ class MegalodonAttention(eqx.Module):
 
     # Config
     model_dim: int = eqx.field(static=True)
-    z_dim: int = eqx.field(static=True)
     value_dim: int = eqx.field(static=True)
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
@@ -871,7 +866,6 @@ class MegalodonAttention(eqx.Module):
     norm_eps: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
-    param_dtype: jnp.dtype = eqx.field(static=True)
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
     use_associative_segment_scan: bool = eqx.field(static=True)
@@ -932,7 +926,6 @@ class MegalodonAttention(eqx.Module):
         _validate_dropout_rate("attention_dropout", attention_dropout)
         _validate_dropout_rate("hidden_dropout", hidden_dropout)
         self.model_dim = model_dim
-        self.z_dim = z_dim
         self.value_dim = value_dim
         self.num_heads = num_heads
         self.head_dim = z_dim // num_heads
@@ -940,7 +933,6 @@ class MegalodonAttention(eqx.Module):
         self.norm_eps = norm_eps
         self.dropout = dropout
         self.hidden_dropout = hidden_dropout
-        self.param_dtype = param_dtype
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
         self.use_associative_segment_scan = use_associative_segment_scan
@@ -967,7 +959,6 @@ class MegalodonAttention(eqx.Module):
             attention_dropout_mode=attention_dropout_mode,
             accum_dtype=accum_dtype,
             softmax_dtype=attention_softmax_dtype,
-            key=keys[1],
         )
 
         # Projections
@@ -1199,13 +1190,10 @@ class NormalizedFFN(eqx.Module):
     fc2: eqx.nn.Linear
     fc3: eqx.nn.Linear | None  # Only for SwiGLU
 
-    model_dim: int = eqx.field(static=True)
-    ffn_hidden_dim: int = eqx.field(static=True)
     swiglu: bool = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
     alpha: Float[Array, "dim"] | None
-    param_dtype: jnp.dtype = eqx.field(static=True)
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
 
@@ -1244,12 +1232,9 @@ class NormalizedFFN(eqx.Module):
         """
         _validate_dropout_rate("dropout", dropout)
         _validate_dropout_rate("hidden_dropout", hidden_dropout)
-        self.model_dim = model_dim
-        self.ffn_hidden_dim = ffn_hidden_dim
         self.swiglu = swiglu
         self.hidden_dropout = hidden_dropout
         self.dropout = dropout
-        self.param_dtype = param_dtype
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
         # Released layer scale is a trainable per-feature vector.

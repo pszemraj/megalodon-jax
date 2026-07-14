@@ -19,7 +19,7 @@ from typing import NamedTuple
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Int
 
 from megalodon_jax.layers.segments import segment_boundaries, valid_segment_mask
 from megalodon_jax.types import NormState
@@ -170,8 +170,6 @@ class TimestepNorm(eqx.Module):
         prior_count: int = 0,
         eps: float = 1e-5,
         affine: bool = True,
-        *,
-        key: PRNGKeyArray | None = None,
     ):
         """Initialize TimestepNorm.
 
@@ -182,10 +180,8 @@ class TimestepNorm(eqx.Module):
         :param float eps: Numerical epsilon added to population variance.
         :param bool affine: Compatibility argument; must be true because released
             TimestepNorm is always affine.
-        :param PRNGKeyArray | None key: Unused initialization key.
         :raises ValueError: If dimensions, prior count, epsilon, or affine mode are invalid.
         """
-        del key
         if num_features <= 0:
             raise ValueError(f"num_features must be positive, got {num_features}")
         if prior_count < 0:

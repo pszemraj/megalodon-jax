@@ -45,7 +45,6 @@ class ComplexEMA(eqx.Module):
     """Complex exponential moving average with FFT/sequential dispatch.
 
     Attributes:
-        embed_dim: Hidden dimension D of the input tensor.
         ndim: Number of EMA orders tracked per hidden unit.
         scale: Output scaling factor (1/sqrt(ndim)).
         alpha: Logit-space input coefficient parameter.
@@ -56,7 +55,6 @@ class ComplexEMA(eqx.Module):
         omega: Residual skip weight.
     """
 
-    embed_dim: int = eqx.field(static=True)
     ndim: int = eqx.field(static=True)
     scale: float = eqx.field(static=True)
 
@@ -76,7 +74,6 @@ class ComplexEMA(eqx.Module):
         :param PRNGKeyArray key: PRNG key for initialization.
         :return None: None.
         """
-        self.embed_dim = embed_dim
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 

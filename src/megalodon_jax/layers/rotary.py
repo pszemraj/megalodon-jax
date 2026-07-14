@@ -15,7 +15,7 @@
 
 import equinox as eqx
 import jax.numpy as jnp
-from jaxtyping import Array, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Float, Int
 
 
 class RotaryEmbedding(eqx.Module):
@@ -35,16 +35,14 @@ class RotaryEmbedding(eqx.Module):
     dim: int = eqx.field(static=True)
     base: float = eqx.field(static=True)
 
-    def __init__(self, dim: int, base: float = 10000.0, *, key: PRNGKeyArray | None = None):
+    def __init__(self, dim: int, base: float = 10000.0):
         """Initialize RotaryEmbedding.
 
         :param int dim: Per-head dimensionality (must be even).
         :param float base: Exponential base for frequency computation.
-        :param PRNGKeyArray | None key: PRNG key (unused).
         :raises ValueError: If dim is not even.
         :return None: None.
         """
-        del key  # unused
         if dim % 2 != 0:
             raise ValueError(f"RotaryEmbedding expects even head dimension, got {dim}")
         self.dim = dim

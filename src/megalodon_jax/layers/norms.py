@@ -16,7 +16,7 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
+from jaxtyping import Array, Float
 
 
 def _rms_normalize(x: Array, eps: float) -> Array:
@@ -39,13 +39,11 @@ class RMSNorm(eqx.Module):
     initializing gamma to zeros gives an effective scale of 1.
 
     Attributes:
-        dim: Feature dimension.
         eps: Small constant for numerical stability.
         affine: Whether to include learnable scale parameter.
         gamma: Learnable scale parameter (shape: dim), or None if affine=False.
     """
 
-    dim: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
     affine: bool = eqx.field(static=True)
     gamma: Float[Array, "dim"] | None
@@ -55,19 +53,14 @@ class RMSNorm(eqx.Module):
         dim: int,
         eps: float = 1e-6,
         affine: bool = True,
-        *,
-        key: PRNGKeyArray | None = None,
     ):
         """Initialize RMSNorm.
 
         :param int dim: Feature dimension.
         :param float eps: Numerical stability epsilon.
         :param bool affine: Whether to include learnable scale.
-        :param PRNGKeyArray | None key: PRNG key (unused).
         :return None: None.
         """
-        del key  # unused
-        self.dim = dim
         self.eps = eps
         self.affine = affine
         if affine:
@@ -98,7 +91,6 @@ class BatchedLayerNorm(eqx.Module):
     the final axis. Stored weight uses the released plus-one parameterization.
     """
 
-    dim: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
     affine: bool = eqx.field(static=True)
     weight: Float[Array, "dim"] | None
@@ -109,19 +101,14 @@ class BatchedLayerNorm(eqx.Module):
         dim: int,
         eps: float = 1e-5,
         affine: bool = True,
-        *,
-        key: PRNGKeyArray | None = None,
     ):
         """Initialize BatchedLayerNorm.
 
         :param int dim: Feature dimension for normalization.
         :param float eps: Numerical stability epsilon.
         :param bool affine: Whether to include learnable scale and bias.
-        :param PRNGKeyArray | None key: PRNG key (unused).
         :return None: None.
         """
-        del key  # unused
-        self.dim = dim
         self.eps = eps
         self.affine = affine
         if affine:

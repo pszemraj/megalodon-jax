@@ -130,7 +130,6 @@ class MegalodonBlock(eqx.Module):
 
     attn: MegalodonAttention
     ffn: NormalizedFFN
-    layer_id: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -147,7 +146,6 @@ class MegalodonBlock(eqx.Module):
         :return None: None.
         """
         k1, k2 = jax.random.split(key)
-        self.layer_id = layer_id
 
         self.attn = MegalodonAttention(
             model_dim=config.model_dim,

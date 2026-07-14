@@ -40,14 +40,13 @@ def cache_partition_errors(
     if sum(partition) != length or any(width <= 0 for width in partition):
         raise ValueError(f"partition must contain positive widths summing to {length}")
     key = jax.random.PRNGKey(seed)
-    k_module, kq, kk, kv = jax.random.split(key, 4)
+    _, kq, kk, kv = jax.random.split(key, 4)
     module = ChunkedAttention(
         num_heads=1,
         head_dim=4,
         value_head_dim=3,
         chunk_size=4,
         attention_window=attention_window,
-        key=k_module,
     )
     q = jax.random.normal(kq, (1, length, 1, 4))
     k = jax.random.normal(kk, (1, length, 1, 4))

@@ -44,7 +44,7 @@ def test_module_dropout_probability_validation(
     key = jax.random.PRNGKey(random_seed)
     with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
         if module_kind == "chunked":
-            ChunkedAttention(1, 4, 4, 4, key=key, **{field: probability})
+            ChunkedAttention(1, 4, 4, 4, **{field: probability})
         elif module_kind == "ffn":
             NormalizedFFN(8, 16, key=key, **{field: probability})
         else:
@@ -491,13 +491,12 @@ class TestChunkedAttention:
         batch, length, heads, head_dim, value_dim = 2, 11, 2, 4, 3
         chunk_size = 4
         key = jax.random.PRNGKey(random_seed)
-        k_module, kq, kk, kv = jax.random.split(key, 4)
+        _, kq, kk, kv = jax.random.split(key, 4)
         module = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k_module,
         )
         q = jax.random.normal(kq, (batch, length, heads, head_dim))
         k = jax.random.normal(kk, (batch, length, heads, head_dim))
@@ -559,14 +558,13 @@ class TestChunkedAttention:
         batch, length, heads, head_dim, value_dim = 2, 11, 2, 4, 3
         window = 4
         key = jax.random.PRNGKey(random_seed)
-        k_module, kq, kk, kv = jax.random.split(key, 4)
+        _, kq, kk, kv = jax.random.split(key, 4)
         module = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=3,
             attention_window=window,
-            key=k_module,
         )
         q = jax.random.normal(kq, (batch, length, heads, head_dim))
         k = jax.random.normal(kk, (batch, length, heads, head_dim))
@@ -640,7 +638,6 @@ class TestChunkedAttention:
             value_head_dim=1,
             chunk_size=4,
             attention_window=2,
-            key=jax.random.PRNGKey(0),
         )
         q = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
         k = jnp.zeros_like(q)
@@ -654,8 +651,8 @@ class TestChunkedAttention:
     def test_cache_copy_continuation_is_identical(self, random_seed: int) -> None:
         """A reloaded array-identical cache resumes without numerical drift."""
         key = jax.random.PRNGKey(random_seed)
-        km, kq, kk, kv = jax.random.split(key, 4)
-        module = ChunkedAttention(1, 4, 3, 4, attention_window=6, key=km)
+        _, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(1, 4, 3, 4, attention_window=6)
         q = jax.random.normal(kq, (1, 9, 1, 4))
         k = jax.random.normal(kk, (1, 9, 1, 4))
         v = jax.random.normal(kv, (1, 9, 1, 3))
@@ -678,21 +675,20 @@ class TestChunkedAttention:
         chunk_size = 16
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim))
         k = jax.random.normal(k3, (batch, seq, heads, head_dim))
         v = jax.random.normal(k4, (batch, seq, heads, value_dim))
 
-        out, cache, position = attn(q, k, v)
+        out, cache, _ = attn(q, k, v)
 
         assert out.shape == (batch, seq, heads, value_dim)
         assert cache is None  # No cache returned without return_cache=True
@@ -701,13 +697,12 @@ class TestChunkedAttention:
         """Streaming cache path should reject segment/position strict metadata."""
         heads, head_dim, value_dim, chunk_size = 2, 8, 8, 8
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
         q = jax.random.normal(k2, (1, 4, heads, head_dim))
         k = jax.random.normal(k3, (1, 4, heads, head_dim))
@@ -729,14 +724,13 @@ class TestChunkedAttention:
         seq = 3  # L < chunk_size to hit the token-wise path
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
@@ -763,7 +757,7 @@ class TestChunkedAttention:
         seq = 6  # force wraparound
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
@@ -771,7 +765,6 @@ class TestChunkedAttention:
             value_head_dim=value_dim,
             chunk_size=chunk_size,
             attention_window=cache_size,
-            key=k1,
         )
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim))
@@ -864,14 +857,13 @@ class TestChunkedAttention:
     ) -> None:
         """Zero-dropout prompt prefill stays vectorized in either execution mode."""
         key = jax.random.PRNGKey(random_seed)
-        module_key, q_key, k_key, v_key = jax.random.split(key, 4)
+        _, q_key, k_key, v_key = jax.random.split(key, 4)
         module = ChunkedAttention(
             num_heads=2,
             head_dim=8,
             value_head_dim=6,
             chunk_size=4,
             attention_window=attention_window,
-            key=module_key,
         )
         q = jax.random.normal(q_key, (1, 12, 2, 8))
         k = jax.random.normal(k_key, (1, 12, 2, 8))
@@ -1349,14 +1341,13 @@ class TestJITCompilation:
         chunk_size = 16
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         @eqx.filter_jit
@@ -1395,14 +1386,13 @@ class TestJITCompilation:
         chunk_size = 4
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2 = jax.random.split(key)
+        _, k2 = jax.random.split(key)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         @eqx.filter_jit
@@ -1503,14 +1493,13 @@ class TestStreamingEquivalence:
         seq_len = 6  # Within one chunk
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Generate full sequence Q/K/V
@@ -1553,14 +1542,13 @@ class TestStreamingEquivalence:
         chunk_size = 4
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Process tokens 0-3 (first chunk), then tokens 4-5 (second chunk)
@@ -1570,7 +1558,7 @@ class TestStreamingEquivalence:
             k = jax.random.normal(jax.random.fold_in(k3, i), (batch, 1, heads, head_dim))
             v = jax.random.normal(jax.random.fold_in(k4, i), (batch, 1, heads, value_dim))
 
-            _, cache, position = attn(q, k, v, cache=cache, return_cache=True)
+            _, cache, _ = attn(q, k, v, cache=cache, return_cache=True)
 
             # Fixed-size buffer: shape is always the configured cache capacity.
             assert cache.k.shape[1] == chunk_size, (
@@ -1589,14 +1577,13 @@ class TestStreamingEquivalence:
         chunk_size = 4
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Create a smaller-than-expected cache (2 entries, but chunk_size=4)
@@ -1620,7 +1607,6 @@ class TestStreamingEquivalence:
             head_dim=2,
             value_head_dim=2,
             chunk_size=4,
-            key=jax.random.PRNGKey(0),
         )
         q = k = v = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
         cache_k = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
@@ -1660,7 +1646,6 @@ class TestParity:
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Generate full sequence Q/K/V
@@ -1713,7 +1698,6 @@ class TestParity:
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Generate a sequence that spans chunk boundary
