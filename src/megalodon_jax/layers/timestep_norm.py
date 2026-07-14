@@ -397,6 +397,8 @@ class TimestepNorm(eqx.Module):
             )
 
         centered = moment_groups - cumulative_mean[..., None]
+        # Preserve released normalization semantics: eps is added at normalization time, with
+        # no variance floor or clamp. Incoming cache validation rejects negative state variance.
         normalized = centered * jax.lax.rsqrt(cumulative_var[..., None] + self.eps)
         scale = (self.weight + 1.0).reshape(groups, group_size)
         bias = self.bias.reshape(groups, group_size)

@@ -1,4 +1,4 @@
-"""Pure-Torch reference for the released Megalodon model equations."""
+"""Pure-Torch transcription of the released Megalodon model equations."""
 
 from __future__ import annotations
 
@@ -158,7 +158,7 @@ def _attention(
 
 
 def source_forward(tokens: Any, state: TorchStateDict, config: Any) -> Any:
-    """Run a tiny differentiable forward pass from the exact released equations.
+    """Run a tiny differentiable forward pass transcribed from the released equations.
 
     Dropout must be disabled and the sequence must fit within one attention chunk.
     These constraints avoid fused kernels while retaining every modeling equation
@@ -169,11 +169,11 @@ def source_forward(tokens: Any, state: TorchStateDict, config: Any) -> Any:
     if tokens.ndim != 2:
         raise ValueError(f"tokens must have shape (batch, length), got {tuple(tokens.shape)}")
     if tokens.shape[1] > config.chunk_size:
-        raise ValueError("source oracle supports at most one attention chunk")
+        raise ValueError("source transcription supports at most one attention chunk")
     if any((config.dropout, config.attention_dropout, config.hidden_dropout)):
-        raise ValueError("source oracle requires dropout probabilities to be zero")
+        raise ValueError("source transcription requires dropout probabilities to be zero")
     if config.attention_window is not None:
-        raise ValueError("source oracle covers released chunk-local attention only")
+        raise ValueError("source transcription covers released chunk-local attention only")
 
     x = functional.embedding(tokens, state["embed.weight"])
     if config.scale_emb:

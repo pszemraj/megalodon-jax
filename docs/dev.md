@@ -11,7 +11,7 @@ conda run --name mega-jax ruff check --fix .
 conda run --name mega-jax ruff format .
 ```
 
-The routine CPU gate covers the highest-value model, cache, conversion, and source-derived parity checks:
+The routine CPU gate covers the highest-value model, cache, conversion, and source-transcription consistency checks:
 
 ```bash
 JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= conda run --name mega-jax pytest -m fast
@@ -25,7 +25,7 @@ Run the complete suite on the selected JAX backend before merging modeling chang
 conda run --name mega-jax pytest
 ```
 
-The `torch_ref` marker selects the [source-derived PyTorch parity checks](jax-torch.md#parity-gates):
+The `torch_ref` marker selects the [source-transcribed PyTorch consistency checks](jax-torch.md#parity-gates):
 
 ```bash
 conda run --name mega-jax pytest -m torch_ref
@@ -35,7 +35,7 @@ CI runs the fast gate on Python 3.11 and 3.13 with the minimum supported JAX and
 
 ## Modeling verifier
 
-`tools/verify_modeling_correctness.py` compares the implementation with independent mathematical oracles and, when available, the exact released source. Repository-only checks run without the untracked evidence files and report source-anchoring checks as skipped. A release-quality run supplies both local evidence paths and includes the slow forward, gradient, optimizer, conversion, save/reload, and cache-partition checks:
+`tools/verify_modeling_correctness.py` compares the implementation with independent mathematical references and, when available, the exact released source. Its PyTorch transcription is a cross-implementation consistency check, not a ground-truth runtime oracle. Repository-only checks run without the untracked evidence files and report source-anchoring checks as skipped. A release-quality run supplies both local evidence paths and includes the slow forward, gradient, optimizer, conversion, save/reload, and cache-partition checks:
 
 ```bash
 conda run --name mega-jax python tools/verify_modeling_correctness.py \

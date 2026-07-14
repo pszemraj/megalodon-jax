@@ -9,7 +9,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - Packed-sequence training with full document isolation: `segment_ids` masks attention, resets EMA/norm state at boundaries, and excludes cross-document label pairs from the loss
 - JAX pytree caches for JIT-compatible streaming inference
 - Strict native SafeTensors checkpoints plus exact original-upstream PyTorch checkpoint conversion
-- Independent source-derived PyTorch/JAX forward, all-parameter gradient, and optimizer parity gates without building the fused CUDA extension
+- Source-transcribed PyTorch/JAX forward, all-parameter gradient, and optimizer consistency gates without building the fused CUDA extension
 
 ## Installation
 

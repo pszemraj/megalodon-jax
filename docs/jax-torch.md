@@ -93,4 +93,8 @@ Cache files are bound to the full configuration fingerprint and validate the exa
 
 ## Parity gates
 
-`tests/test_upstream_parity.py` uses a small differentiable Torch oracle derived from the exact released source. `tools/verify_modeling_correctness.py` additionally reads local paper and upstream source paths when they are available; without them it runs repository-only checks and reports source-anchoring checks as skipped. Neither imports another Megalodon package or builds the fused extension. The complete gate compares full logits, every trainable upstream-schema gradient, and three AdamW steps; fused CUDA is checked at source level only.
+The load-bearing core-math checks use independent NumPy references for TimestepNorm, RoPE, initialization statistics, and dense attention. They do not import `megalodon_jax` production implementations as their expected-value path.
+
+`tests/test_upstream_parity.py` uses a small differentiable Torch transcription of the released equations. It compares full logits, every trainable upstream-schema gradient, and short optimizer trajectories, but it was written alongside this JAX port and is not an independent oracle. Agreement demonstrates consistency between the two implementations; disagreement identifies a divergence that must be investigated rather than proving which side is correct.
+
+`tools/verify_modeling_correctness.py` additionally reads local paper and upstream source paths when they are available; without them it runs repository-only checks and reports source-anchoring checks as skipped. The strict conversion regression uses a hand-authored released-source manifest for keys, shapes, dtypes, literal RoPE frequencies, and model-parallel partition axes. No check imports another Megalodon package or builds the fused extension, and no released trained checkpoint is available for a ground-truth logits comparison. Fused CUDA is checked at source level only.

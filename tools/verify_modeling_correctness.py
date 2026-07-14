@@ -914,7 +914,7 @@ def main() -> int:
             expected_path=upstream,
         )
 
-    def check_torch_oracle_source_contract() -> tuple[bool, str, dict[str, Any]]:
+    def check_torch_transcription_source_contract() -> tuple[bool, str, dict[str, Any]]:
         attention_path = upstream / "megalodon" / "modules" / "moving_average_gated_attention.py"
         cema_path = upstream / "megalodon" / "modules" / "complex_exponential_moving_average.py"
         ffn_path = upstream / "megalodon" / "modules" / "normalized_feedforward_network.py"
@@ -938,7 +938,7 @@ def main() -> int:
         passed = all(facts.values())
         return (
             passed,
-            "Pure-Torch oracle is anchored to the exact released source equations",
+            "Pure-Torch transcription is anchored to the exact released source equations",
             {
                 **facts,
                 "source_sha256": {
@@ -951,12 +951,16 @@ def main() -> int:
         )
 
     if upstream_available:
-        audit.run("torch_oracle_source_contract", "INFO", check_torch_oracle_source_contract)
+        audit.run(
+            "torch_transcription_source_contract",
+            "INFO",
+            check_torch_transcription_source_contract,
+        )
     else:
         audit.skip(
-            "torch_oracle_source_contract",
+            "torch_transcription_source_contract",
             "INFO",
-            "Local upstream source is unavailable; the bundled oracle was not source-anchored",
+            "Local upstream source is unavailable; the bundled transcription was not source-anchored",
             expected_path=upstream,
         )
 
@@ -1208,7 +1212,7 @@ def main() -> int:
             passed = forward_pass and gradients_pass
             return (
                 passed,
-                "Tiny JAX logits and every trainable gradient match the source-derived Torch oracle"
+                "Tiny JAX logits and every trainable gradient match the source-derived Torch transcription"
                 if passed
                 else "Tiny source-derived Torch/JAX forward or gradient parity failed",
                 {
@@ -1221,16 +1225,18 @@ def main() -> int:
             )
 
         torch_available = importlib.util.find_spec("torch") is not None
+        # The bundled Torch path is a same-author transcription: useful consistency evidence,
+        # but not an independent ground-truth implementation.
         if torch_available:
             audit.run(
                 "source_torch_jax_forward_gradient_parity",
-                "P0",
+                "INFO",
                 check_torch_forward_and_gradients,
             )
         else:
             audit.skip(
                 "source_torch_jax_forward_gradient_parity",
-                "P0",
+                "INFO",
                 "PyTorch is unavailable; install the convert extra to run parity",
                 required_extra="convert",
             )
@@ -1338,11 +1344,11 @@ def main() -> int:
             )
 
         if torch_available:
-            audit.run("source_torch_jax_three_step_adamw", "P0", check_short_adamw_parity)
+            audit.run("source_torch_jax_three_step_adamw", "INFO", check_short_adamw_parity)
         else:
             audit.skip(
                 "source_torch_jax_three_step_adamw",
-                "P0",
+                "INFO",
                 "PyTorch is unavailable; install the convert extra to run optimizer parity",
                 required_extra="convert",
             )
@@ -1392,8 +1398,8 @@ def main() -> int:
     else:
         for name, severity in (
             ("fp32_output_logits", "P1"),
-            ("source_torch_jax_forward_gradient_parity", "P0"),
-            ("source_torch_jax_three_step_adamw", "P0"),
+            ("source_torch_jax_forward_gradient_parity", "INFO"),
+            ("source_torch_jax_three_step_adamw", "INFO"),
             ("deterministic_tiny_batch_overfit", "P0"),
             ("faithful_cache_partition_invariance", "P1"),
             ("sliding_cache_partition_invariance", "P1"),

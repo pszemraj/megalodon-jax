@@ -122,6 +122,7 @@ The segmented CEMA path and its memory/speed tradeoff are described in [EMA impl
 - An empty prompt without a cache is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token. Empty-prompt continuation with a cache is rejected because the cache does not store next-token logits; provide the final context token instead.
 - `max_new_tokens` must be a positive, non-boolean integer. Explicit BOS and EOS overrides must be integer IDs within `vocab_size`.
 - `generate()` requires the output width to equal `vocab_size` so every generated ID is valid for the next embedding lookup.
+- Batched generation is fixed-shape. After one row emits EOS, that row continues with synthetic EOS tokens until the batch completes; a returned cache matches the full rectangular result, not the row trimmed at its first EOS.
 - Cache input and cache return are deterministic inference operations. Model calls with `deterministic=False` reject both.
 
 Token IDs never imply padding. `pad_token_id` is metadata; callers must supply masks and keep unknown-token IDs distinct from padding metadata.

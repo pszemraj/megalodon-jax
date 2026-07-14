@@ -500,6 +500,9 @@ def _generate_core(
     if eos_token_id is not None:
         finished = first_token == eos_token_id
 
+    # Fixed-shape batching advances finished rows with synthetic EOS tokens. Attention uses
+    # one scalar timeline for the whole batch, so the returned cache matches the rectangular
+    # result rather than a row sliced at its first EOS.
     if needs_rng:
 
         def scan_step(

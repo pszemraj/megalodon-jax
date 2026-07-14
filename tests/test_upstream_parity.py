@@ -1,4 +1,4 @@
-"""Independent released-source parity and training-resumption gates."""
+"""Released-source-transcription consistency and training-resumption gates."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def parity_config(*, swiglu: bool = True) -> MegalodonConfig:
 @pytest.mark.fast
 @pytest.mark.parametrize("swiglu", [False, True])
 def test_tiny_forward_matches_released_source_equations(swiglu: bool) -> None:
-    """Compare complete logits against the local-source-derived Torch oracle."""
+    """Compare complete logits against the local-source-derived Torch transcription."""
     torch = pytest.importorskip("torch")
     config = parity_config(swiglu=swiglu)
     model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(101))
