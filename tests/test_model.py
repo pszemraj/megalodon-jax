@@ -2023,31 +2023,6 @@ class TestAttentionMasking:
         # Batch 1 should be non-zero (has valid keys)
         assert jnp.any(out[1] != 0), "Partially masked batch should have non-zero output"
 
-    def test_first_position_causal_mask_outputs_valid(self) -> None:
-        """First position in causal attention should attend to itself only.
-
-        :return None: None.
-        """
-        from megalodon_jax.layers.attention import attention_single_chunk
-
-        B, L, H, Dh, Dv = 1, 4, 1, 8, 8
-        key = jax.random.PRNGKey(0)
-        k1, k2, k3 = jax.random.split(key, 3)
-
-        q = jax.random.normal(k1, (B, L, H, Dh))
-        k = jax.random.normal(k2, (B, L, H, Dh))
-        v = jax.random.normal(k3, (B, L, H, Dv))
-
-        out = attention_single_chunk(q, k, v, causal=True)
-
-        # First position attends only to first key, so output should be v[0]
-        np.testing.assert_allclose(
-            np.array(out[0, 0]),
-            np.array(v[0, 0]),
-            rtol=1e-5,
-            err_msg="First causal position should output first value exactly",
-        )
-
 
 class TestPackedMetadata:
     """Tests for strict packed metadata plumbing in model forward/loss."""

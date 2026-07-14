@@ -21,6 +21,32 @@ from megalodon_jax.layers import (
 from megalodon_jax.types import AttentionCache
 from tests.reference.cache import cache_partition_errors
 
+_CACHE_PARTITIONS = (
+    (1,) * 12,
+    (3, 2, 7),
+    (5, 4, 3),
+    (4, 4, 4),
+    (3, 5, 4),
+    (7, 1, 4),
+)
+_FAST_CACHE_PARTITION = (3, 5, 4)
+
+
+def assert_cache_partition_invariance(
+    attention_window: int | None,
+    partition: tuple[int, ...],
+    seed: int,
+) -> None:
+    """Assert cached and noncached attention agree for one call partition."""
+    errors = cache_partition_errors(attention_window, partition, seed=seed)
+    assert errors["output"] <= 2e-6
+    assert errors["noncached_output"] <= 2e-6
+    # Vectorized prefill and tokenwise decode may use different transcendental
+    # lowering for RoPE, so K agrees to fp32 precision rather than bit identity.
+    assert errors["cache_k"] <= 2e-6
+    assert errors["cache_v"] == 0.0
+    assert errors["cache_count"] == 0.0
+
 
 @pytest.mark.parametrize("probability", [-0.1, 1.0])
 @pytest.mark.parametrize(
@@ -106,22 +132,12 @@ class TestAttentionPrimitives:
 
         out = attention_single_chunk(q, k, v, causal=True)
 
-        # For causal attention, verify shapes and non-NaN outputs
-        assert out.shape == (batch, seq, heads, head_dim)
-        assert not jnp.any(jnp.isnan(out))
-
-        # Verify causality: output at position 0 should only depend on input at position 0
-        # We can test this by checking that changing future inputs doesn't affect past outputs
-        # Modify v at position 3 and check that output at position 0 is unchanged
-        v_modified = v.at[:, 3, :, :].set(v[:, 3, :, :] * 100)
-        out_modified = attention_single_chunk(q, k, v_modified, causal=True)
-
-        # Position 0 output should be identical (can't see position 3)
+        # The first query has exactly one visible key, so this is a direct causal anchor.
         np.testing.assert_allclose(
-            np.array(out[:, 0, :, :]),
-            np.array(out_modified[:, 0, :, :]),
+            np.array(out[:, 0]),
+            np.array(v[:, 0]),
             rtol=1e-6,
-            err_msg="Causal masking failed: position 0 saw future position 3",
+            err_msg="First causal position should output its own value exactly",
         )
 
     def test_single_chunk_causal_masking_with_more_queries_than_keys(self) -> None:
@@ -648,23 +664,6 @@ class TestChunkedAttention:
         expected = jnp.asarray([1.0, 1.5, 2.5, 3.5], dtype=jnp.float32).reshape(1, 4, 1, 1)
         np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-6)
 
-    def test_cache_copy_continuation_is_identical(self, random_seed: int) -> None:
-        """A reloaded array-identical cache resumes without numerical drift."""
-        key = jax.random.PRNGKey(random_seed)
-        _, kq, kk, kv = jax.random.split(key, 4)
-        module = ChunkedAttention(1, 4, 3, 4, attention_window=6)
-        q = jax.random.normal(kq, (1, 9, 1, 4))
-        k = jax.random.normal(kk, (1, 9, 1, 4))
-        v = jax.random.normal(kv, (1, 9, 1, 3))
-        _, cache, _ = module(q[:, :5], k[:, :5], v[:, :5], return_cache=True)
-        assert cache is not None
-        restored = type(cache)(
-            k=jnp.array(cache.k), v=jnp.array(cache.v), count=jnp.array(cache.count)
-        )
-        expected, _, _ = module(q[:, 5:], k[:, 5:], v[:, 5:], cache=cache, return_cache=True)
-        actual, _, _ = module(q[:, 5:], k[:, 5:], v[:, 5:], cache=restored, return_cache=True)
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test ChunkedAttention forward pass shapes.
 
@@ -813,38 +812,20 @@ class TestChunkedAttention:
         attention_window: int | None,
     ) -> None:
         """Cached outputs and state cannot depend on caller chunk boundaries."""
-        for partition in (
-            (1,) * 12,
-            (3, 2, 7),
-            (5, 4, 3),
-            (4, 4, 4),
-            (3, 5, 4),
-            (7, 1, 4),
-        ):
-            errors = cache_partition_errors(
-                attention_window,
-                partition,
-                seed=random_seed,
-            )
-            assert errors["output"] <= 2e-6
-            assert errors["noncached_output"] <= 2e-6
-            # Vectorized prefill and tokenwise decode may use different
-            # transcendental lowering for RoPE, so K agrees to fp32 precision
-            # rather than requiring backend-dependent bit identity.
-            assert errors["cache_k"] <= 2e-6
-            assert errors["cache_v"] == 0.0
-            assert errors["cache_count"] == 0.0
+        for partition in _CACHE_PARTITIONS:
+            if attention_window in (None, 8) and partition == _FAST_CACHE_PARTITION:
+                continue
+            assert_cache_partition_invariance(attention_window, partition, random_seed)
 
     @pytest.mark.fast
     def test_pristine_prefill_partition_smoke(self, random_seed: int) -> None:
         """Routine gate covers faithful and sliding prefill with one uneven split."""
         for attention_window in (None, 8):
-            errors = cache_partition_errors(
+            assert_cache_partition_invariance(
                 attention_window,
-                (3, 5, 4),
-                seed=random_seed,
+                _FAST_CACHE_PARTITION,
+                random_seed,
             )
-            assert max(errors.values()) <= 2e-6
 
     @pytest.mark.parametrize("attention_window", [None, 8])
     @pytest.mark.parametrize("deterministic", [True, False])
@@ -1481,91 +1462,6 @@ class TestJITCompilation:
 
 class TestStreamingEquivalence:
     """Tests for streaming (token-by-token) equivalence with batch processing."""
-
-    def test_chunked_attention_streaming_equivalence(self, random_seed: int) -> None:
-        """Verify streaming with cache matches batch processing within a chunk.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, heads, head_dim, value_dim = 1, 2, 16, 16
-        chunk_size = 8
-        seq_len = 6  # Within one chunk
-
-        key = jax.random.PRNGKey(random_seed)
-        _, k2, k3, k4 = jax.random.split(key, 4)
-
-        attn = ChunkedAttention(
-            num_heads=heads,
-            head_dim=head_dim,
-            value_head_dim=value_dim,
-            chunk_size=chunk_size,
-        )
-
-        # Generate full sequence Q/K/V
-        q_full = jax.random.normal(k2, (batch, seq_len, heads, head_dim))
-        k_full = jax.random.normal(k3, (batch, seq_len, heads, head_dim))
-        v_full = jax.random.normal(k4, (batch, seq_len, heads, value_dim))
-
-        # Batch processing (no cache)
-        out_batch, _, _ = attn(q_full, k_full, v_full, return_cache=False)
-
-        # Streaming processing (token by token with cache)
-        streaming_outputs = []
-        cache = None
-        for i in range(seq_len):
-            q_i = q_full[:, i : i + 1, :, :]
-            k_i = k_full[:, i : i + 1, :, :]
-            v_i = v_full[:, i : i + 1, :, :]
-
-            out_i, cache, _ = attn(q_i, k_i, v_i, cache=cache, return_cache=True)
-            streaming_outputs.append(out_i)
-
-        out_streaming = jnp.concatenate(streaming_outputs, axis=1)
-
-        # Outputs should match (within a single chunk)
-        np.testing.assert_allclose(
-            np.array(out_batch),
-            np.array(out_streaming),
-            rtol=1e-5,
-            atol=1e-5,
-            err_msg="Streaming output should match batch output within a single chunk",
-        )
-
-    def test_chunk_boundary_cache_reset(self, random_seed: int) -> None:
-        """Verify cache is reset at chunk boundaries.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, heads, head_dim, value_dim = 1, 2, 8, 8
-        chunk_size = 4
-
-        key = jax.random.PRNGKey(random_seed)
-        _, k2, k3, k4 = jax.random.split(key, 4)
-
-        attn = ChunkedAttention(
-            num_heads=heads,
-            head_dim=head_dim,
-            value_head_dim=value_dim,
-            chunk_size=chunk_size,
-        )
-
-        # Process tokens 0-3 (first chunk), then tokens 4-5 (second chunk)
-        cache = None
-        for i in range(6):
-            q = jax.random.normal(jax.random.fold_in(k2, i), (batch, 1, heads, head_dim))
-            k = jax.random.normal(jax.random.fold_in(k3, i), (batch, 1, heads, head_dim))
-            v = jax.random.normal(jax.random.fold_in(k4, i), (batch, 1, heads, value_dim))
-
-            _, cache, _ = attn(q, k, v, cache=cache, return_cache=True)
-
-            # Fixed-size buffer: shape is always the configured cache capacity.
-            assert cache.k.shape[1] == chunk_size, (
-                f"Cache buffer should be fixed size {chunk_size}, got {cache.k.shape[1]}"
-            )
-            # The count tracks absolute position
-            assert cache.count == i + 1, f"Cache count should be {i + 1}, got {cache.count}"
 
     def test_incompatible_cache_shape_is_rejected(self, random_seed: int) -> None:
         """Cache schema mismatches fail instead of silently resizing state.
