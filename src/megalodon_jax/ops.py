@@ -18,7 +18,20 @@ from __future__ import annotations
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, PRNGKeyArray
+
+
+def inverted_dropout(x: Array, rate: float, key: PRNGKeyArray) -> Array:
+    """Apply inverted dropout while preserving the input dtype.
+
+    :param Array x: Activations to mask.
+    :param float rate: Probability of dropping each activation.
+    :param PRNGKeyArray key: Random key used to sample the keep mask.
+    :return Array: Masked activations rescaled by the inverse keep probability.
+    """
+    keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
+    inv_keep = jnp.asarray(1.0 / (1.0 - rate), dtype=x.dtype)
+    return jnp.where(keep, x * inv_keep, jnp.zeros((), dtype=x.dtype))
 
 
 def dot_precision(compute_dtype: jnp.dtype) -> jax.lax.Precision | None:

@@ -39,7 +39,7 @@ from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.segments import segment_runs_and_local_positions, valid_segment_mask
 from megalodon_jax.layers.timestep_norm import TimestepNorm
-from megalodon_jax.ops import dot_precision, linear_3d
+from megalodon_jax.ops import dot_precision, inverted_dropout, linear_3d
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
 
 # -----------------------------------------------------------------------------
@@ -64,19 +64,6 @@ def _validate_dropout_mode(mode: AttentionDropoutMode) -> None:
         raise ValueError(
             f"attention dropout mode must be 'post_softmax' or 'dropkey', got {mode!r}"
         )
-
-
-def _inverted_dropout(x: Array, rate: float, key: PRNGKeyArray) -> Array:
-    """Apply inverted dropout while preserving the input dtype.
-
-    :param Array x: Activations to mask.
-    :param float rate: Probability of dropping each activation.
-    :param PRNGKeyArray key: Random key used to sample the keep mask.
-    :return Array: Masked activations rescaled by the inverse keep probability.
-    """
-    keep = jax.random.bernoulli(key, 1.0 - rate, x.shape)
-    inv_keep = jnp.asarray(1.0 / (1.0 - rate), dtype=x.dtype)
-    return jnp.where(keep, x * inv_keep, jnp.zeros((), dtype=x.dtype))
 
 
 def attention_single_chunk(
@@ -197,7 +184,7 @@ def attention_single_chunk(
 
     # Dropout if not deterministic
     if not deterministic and dropout_rate > 0.0 and dropout_mode == "post_softmax":
-        attn_weights = _inverted_dropout(attn_weights, dropout_rate, key)
+        attn_weights = inverted_dropout(attn_weights, dropout_rate, key)
 
     # Apply to values: (B, H, L_q, Dv) -> (B, L_q, H, Dv)
     out = jnp.einsum(
@@ -1127,7 +1114,7 @@ class MegalodonAttention(eqx.Module):
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
         mx = self.rmsnorm(y_cema)
         if not deterministic and self.hidden_dropout > 0.0:
-            mx = _inverted_dropout(mx, self.hidden_dropout, k2)
+            mx = inverted_dropout(mx, self.hidden_dropout, k2)
 
         # Shared Z projection for Q/K
         z = linear_3d(self.wz, mx, self.compute_dtype, self.accum_dtype)  # (B, L, z_dim)
@@ -1182,7 +1169,7 @@ class MegalodonAttention(eqx.Module):
 
         # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
         if not deterministic and self.hidden_dropout > 0.0:
-            gated = _inverted_dropout(gated, self.hidden_dropout, k3)
+            gated = inverted_dropout(gated, self.hidden_dropout, k3)
 
         # Output projections
         h = linear_3d(self.wh1, mx, self.compute_dtype, self.accum_dtype) + linear_3d(
@@ -1191,7 +1178,7 @@ class MegalodonAttention(eqx.Module):
 
         # Output dropout
         if not deterministic and self.dropout > 0.0:
-            h = _inverted_dropout(h, self.dropout, k4)
+            h = inverted_dropout(h, self.dropout, k4)
 
         # Residual
         y = h + x
@@ -1356,7 +1343,7 @@ class NormalizedFFN(eqx.Module):
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
             k1, k2 = jax.random.split(key)
-            h = _inverted_dropout(h, self.hidden_dropout, k1)
+            h = inverted_dropout(h, self.hidden_dropout, k1)
         else:
             k2 = key
 
@@ -1365,7 +1352,7 @@ class NormalizedFFN(eqx.Module):
 
         # Output dropout
         if not deterministic and self.dropout > 0.0:
-            out = _inverted_dropout(out, self.dropout, k2)
+            out = inverted_dropout(out, self.dropout, k2)
 
         # Apply residual rescaling if enabled (cast to preserve bf16)
         if self.alpha is not None:

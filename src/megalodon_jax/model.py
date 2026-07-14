@@ -34,7 +34,7 @@ from megalodon_jax.cache import (
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
 from megalodon_jax.layers.segments import valid_segment_mask
-from megalodon_jax.ops import matmul_3d_weight
+from megalodon_jax.ops import inverted_dropout, matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_boundary_initializer, reinit_linear_weights
 
@@ -456,13 +456,7 @@ class MegalodonModel(eqx.Module):
             x = x.astype(self.config.compute_dtype)
         if not deterministic and self.config.dropout > 0.0:
             assert embedding_key is not None
-            keep = jax.random.bernoulli(
-                embedding_key,
-                1.0 - self.config.dropout,
-                x.shape,
-            )
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.config.dropout), dtype=x.dtype)
-            x = jnp.where(keep, x * inv_keep, jnp.zeros((), dtype=x.dtype))
+            x = inverted_dropout(x, self.config.dropout, embedding_key)
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
@@ -641,7 +635,6 @@ class MegalodonForCausalLM(eqx.Module):
         :raises ValueError: If dropout is enabled without a PRNG key.
         :return tuple[Float[Array, "batch seq vocab"], ModelCache | None]: Logits and cache.
         """
-        _require_dropout_key(self.config, deterministic, key)
         hidden, cache = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -719,7 +712,6 @@ class MegalodonForCausalLM(eqx.Module):
         :raises ValueError: If labels do not match the input shape or dropout lacks a key.
         :return Float[Array, ""]: Scalar cross-entropy loss.
         """
-        _require_dropout_key(self.config, deterministic, key)
         if labels.shape != input_ids.shape:
             raise ValueError(
                 f"labels must have the same shape as input_ids; got {labels.shape} and "
