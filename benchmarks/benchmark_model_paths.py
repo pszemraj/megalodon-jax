@@ -751,6 +751,14 @@ def _nvidia_driver_version(nvidia_smi: Mapping[str, Any]) -> str | None:
     return match.group(1) if match is not None else None
 
 
+def _device_memory_snapshot(device: Any) -> Any:
+    """Return JSON-safe allocator statistics or a diagnostic error record."""
+    try:
+        return _jsonable(device.memory_stats())
+    except Exception as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+
+
 def _environment(jax: Any, eqx: Any, np: Any) -> dict[str, Any]:
     """Capture runtime, device, and compiler-affecting environment details."""
     devices = []
@@ -762,10 +770,7 @@ def _environment(jax: Any, eqx: Any, np: Any) -> dict[str, Any]:
             "device_kind": getattr(device, "device_kind", None),
             "process_index": getattr(device, "process_index", None),
         }
-        try:
-            record["memory_stats"] = _jsonable(device.memory_stats())
-        except Exception:
-            record["memory_stats"] = None
+        record["memory_stats"] = _device_memory_snapshot(device)
         devices.append(record)
     fixed_environment = (
         "CUDA_VISIBLE_DEVICES",
@@ -813,11 +818,7 @@ def _device_memory_stats(jax: Any) -> list[dict[str, Any]]:
     """Return allocator statistics after a case when the backend exposes them."""
     records = []
     for device in jax.devices():
-        try:
-            stats = _jsonable(device.memory_stats())
-        except Exception as error:
-            stats = {"error": f"{type(error).__name__}: {error}"}
-        records.append({"device": str(device), "stats": stats})
+        records.append({"device": str(device), "stats": _device_memory_snapshot(device)})
     return records
 
 
@@ -1176,18 +1177,13 @@ def _inference_case(
         function = eqx.filter_jit(lambda candidate, tokens: candidate(tokens, return_cache=True))
         arguments = (model, prefix)
         expected_count = int(prefix.shape[1])
-    elif operation == "continuation_37":
+    elif operation in {"continuation_37", "decode_1"}:
+        continuation_tokens = continuation if operation == "continuation_37" else decode
         function = eqx.filter_jit(
             lambda candidate, tokens, state: candidate(tokens, cache=state, return_cache=True)
         )
-        arguments = (model, continuation, cache)
-        expected_count = int(prefix.shape[1] + continuation.shape[1])
-    elif operation == "decode_1":
-        function = eqx.filter_jit(
-            lambda candidate, tokens, state: candidate(tokens, cache=state, return_cache=True)
-        )
-        arguments = (model, decode, cache)
-        expected_count = int(prefix.shape[1] + decode.shape[1])
+        arguments = (model, continuation_tokens, cache)
+        expected_count = int(prefix.shape[1] + continuation_tokens.shape[1])
     elif operation == "lm_ttft":
 
         def ttft(candidate: Any, tokens: Any) -> tuple[Any, Any, Any]:
@@ -1224,12 +1220,10 @@ def _inference_case(
         if operation in {"pristine_prefill", "lm_ttft"}:
             reference_tokens = prefix
             tail = 1 if operation == "lm_ttft" else int(prefix.shape[1])
-        elif operation == "continuation_37":
-            reference_tokens = jnp.concatenate((prefix, continuation), axis=1)
-            tail = int(continuation.shape[1])
         else:
-            reference_tokens = jnp.concatenate((prefix, decode), axis=1)
-            tail = 1
+            continuation_tokens = continuation if operation == "continuation_37" else decode
+            reference_tokens = jnp.concatenate((prefix, continuation_tokens), axis=1)
+            tail = int(continuation_tokens.shape[1])
         reference_function = eqx.filter_jit(
             lambda candidate, tokens: candidate(tokens, return_cache=False)[0][:, -tail:, :]
         )
