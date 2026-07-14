@@ -484,38 +484,6 @@ class TestMegalodonForCausalLM:
         with pytest.raises(TypeError, match="labels must have integer dtype"):
             model.compute_loss(input_ids, input_ids.astype(jnp.float32))
 
-    def test_streaming_generation(self, random_seed: int) -> None:
-        """Test streaming token-by-token generation.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = small_config()
-        batch = 1
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        # Initial prompt
-        prompt = jax.random.randint(key, (batch, 8), minval=0, maxval=config.vocab_size)
-
-        # Generate 5 tokens autoregressively
-        cache = None
-        generated = []
-        current_input = prompt
-
-        for step in range(5):
-            logits, cache = model(current_input, cache=cache, return_cache=True)
-            next_token = jnp.argmax(logits[:, -1:], axis=-1)
-            generated.append(next_token)
-            current_input = next_token
-
-        # Should have generated 5 tokens
-        assert len(generated) == 5
-        # Each should be shape (batch, 1)
-        for tok in generated:
-            assert tok.shape == (batch, 1)
-
 
 # -----------------------------------------------------------------------------
 # JIT Compilation Tests
@@ -1497,7 +1465,7 @@ class TestEdgeCases:
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config = small_config(num_layers=1)
+        config = small_config(num_layers=1, compute_dtype=jnp.bfloat16)
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
@@ -1511,6 +1479,7 @@ class TestEdgeCases:
         # Should return 0.0, not NaN
         assert loss == 0.0, f"Single-token sequence loss should be 0.0, got {loss}"
         assert not jnp.isnan(loss), "Single-token sequence loss should not be NaN"
+        assert loss.dtype == config.loss_softmax_dtype
 
     def test_cache_rejects_attention_mask_metadata(self, random_seed: int) -> None:
         """Cached calls require an unmasked generation batch.
@@ -1657,61 +1626,14 @@ class TestEdgeCases:
         with pytest.raises(Exception):  # eqx.error_if raises EquinoxRuntimeError
             model.compute_loss(input_ids, bad_labels)
 
-    def test_loss_dtype_fp32_under_bf16_compute(self, random_seed: int) -> None:
-        """Test that loss stays fp32 even when compute dtype is bf16.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = small_config(num_layers=1, compute_dtype=jnp.bfloat16)
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        # Single token sequence (becomes empty after shift)
-        input_ids = jnp.array([[1]])
-        labels = jnp.array([[2]])
-
-        loss = model.compute_loss(input_ids, labels)
-
-        # Loss should stay fp32 for numerical stability
-        assert loss.dtype == config.loss_softmax_dtype, (
-            f"Expected {config.loss_softmax_dtype}, got {loss.dtype}"
-        )
-        assert loss == 0.0
-
     def test_loss_close_bf16_vs_fp32(self, random_seed: int) -> None:
         """Test bf16 compute loss stays close to fp32 loss.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
         """
-        config_fp32 = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            compute_dtype=jnp.float32,
-        )
-        config_bf16 = MegalodonConfig(
-            vocab_size=256,
-            model_dim=64,
-            num_layers=1,
-            num_heads=2,
-            z_dim=32,
-            value_dim=64,
-            ffn_hidden_dim=128,
-            cema_ndim=4,
-            chunk_size=16,
-            norm_num_groups=8,
-            compute_dtype=jnp.bfloat16,
-        )
+        config_fp32 = small_config(num_layers=1, compute_dtype=jnp.float32)
+        config_bf16 = replace(config_fp32, compute_dtype=jnp.bfloat16)
 
         key = jax.random.PRNGKey(random_seed)
         k_model, k_data = jax.random.split(key)
@@ -1731,6 +1653,7 @@ class TestEdgeCases:
 
         assert jnp.isfinite(loss_fp32)
         assert jnp.isfinite(loss_bf16)
+        assert loss_bf16.dtype == config_bf16.loss_softmax_dtype
         np.testing.assert_allclose(
             np.array(loss_fp32),
             np.array(loss_bf16),

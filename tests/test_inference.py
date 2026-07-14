@@ -259,11 +259,9 @@ class TestSamplingAndGeneration:
         assert jnp.all(out1 >= 0)
         assert jnp.all(out1 < config.vocab_size)
 
-    def test_generate_single_token_updates_cache(self) -> None:
-        """Test single-token generation updates cache counts.
-
-        :return None: None.
-        """
+    @pytest.mark.parametrize("max_new_tokens", [1, 3])
+    def test_generate_updates_cache(self, max_new_tokens: int) -> None:
+        """Generation advances cache counts by the requested number of tokens."""
         config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -271,41 +269,17 @@ class TestSamplingAndGeneration:
         out, cache, _ = generate(
             model,
             prompt,
-            max_new_tokens=1,
+            max_new_tokens=max_new_tokens,
             key=jax.random.PRNGKey(123),
             temperature=0.0,
             return_cache=True,
         )
 
-        assert out.shape == (1, 4)
+        assert out.shape == (1, prompt.shape[1] + max_new_tokens)
         assert cache is not None
         layer0 = cache.layer_caches[0]
         assert layer0 is not None and layer0.attn is not None
-        assert int(layer0.attn.count) == prompt.shape[1] + 1
-
-    def test_generate_multi_token_updates_cache(self) -> None:
-        """Test multi-token generation updates cache counts.
-
-        :return None: None.
-        """
-        config = tiny_config()
-        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-        prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
-
-        out, cache, _ = generate(
-            model,
-            prompt,
-            max_new_tokens=3,
-            key=jax.random.PRNGKey(123),
-            temperature=0.0,
-            return_cache=True,
-        )
-
-        assert out.shape == (1, 6)
-        assert cache is not None
-        layer0 = cache.layer_caches[0]
-        assert layer0 is not None and layer0.attn is not None
-        assert int(layer0.attn.count) == prompt.shape[1] + 3
+        assert int(layer0.attn.count) == prompt.shape[1] + max_new_tokens
 
     @pytest.mark.parametrize("max_new_tokens", [1, 2])
     @pytest.mark.parametrize("return_cache", [False, True])
