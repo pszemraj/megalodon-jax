@@ -17,8 +17,8 @@ Paper theory, released checkpoint semantics, and intentional JAX extensions are 
 ## Intentional JAX extensions
 
 - **Pure JAX/XLA execution.** The original uses custom CUDA kernels. JAX provides FFT, scan, and manual attention implementations. The fused extension is authoritative source evidence but is not a build or runtime prerequisite.
-- **Packed training isolation.** `segment_ids` and optional `position_ids` isolate contiguous documents across attention, CEMA, TimestepNorm, RoPE, gradients, and shifted loss pairs. The complete contract is described in [Long-context streaming](long-context-streaming.md#packed-sequence-training).
-- **Sliding attention.** `attention_window=None` preserves released chunk-local behavior. A positive `attention_window` opts into the partition-invariant sliding mode described in [Long-context streaming](long-context-streaming.md#optional-sliding-kv-window).
+- **Packed training isolation.** The extension and its complete contract are described in [Long-context streaming](long-context-streaming.md#packed-sequence-training).
+- **Sliding attention.** The optional sliding mode is described in [Long-context streaming](long-context-streaming.md#optional-sliding-kv-window).
 - **Dropout mode selection.** `attention_dropout_mode="post_softmax"` provides released unfused behavior; `"dropkey"` provides the pre-softmax compatibility option. Both require explicit PRNG keys in non-deterministic execution.
 - **Versioned native persistence.** Native model and cache SafeTensors formats include version, configuration, and manifest metadata and fail closed. See [JAX and PyTorch interoperability](jax-torch.md).
 - **No 4D chunk-parallel implementation.** Model-parallel checkpoint shards can be consolidated during conversion, but distributed chunk-parallel execution is outside this single-device implementation.

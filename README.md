@@ -120,7 +120,7 @@ grads = loss_fn(model, input_ids, labels)
 
 ### Packed-sequence training
 
-Multiple documents can share one row with full isolation - attention, EMA state, and running norm statistics all reset at document boundaries, and the loss automatically skips cross-document label pairs:
+Multiple documents can share one row by passing segment and position metadata:
 
 ```python
 # doc A (3 tokens) + doc B (4 tokens) + padding (1), packed in one row
@@ -140,7 +140,7 @@ loss = model.compute_loss(
 )
 ```
 
-Each packed document produces the same outputs and gradients as running it alone. See [Packed-sequence training](docs/long-context-streaming.md#packed-sequence-training) for boundary, padding, cache, and loss semantics.
+See [Packed-sequence training](docs/long-context-streaming.md#packed-sequence-training) for isolation, boundary, padding, cache, and loss semantics.
 
 ## Documentation
 

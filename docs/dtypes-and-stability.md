@@ -43,7 +43,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 ## Fixed precision behavior
 
 - TimestepNorm state, running moments, RMSNorm statistics, and LayerNorm statistics are FP32.
-- TimestepNorm uses shifted FP32 first/second-moment prefixes for unmasked input and associative FP32 Welford prefixes for masked or packed input. Unlike the released CUDA kernel, none of these paths stores Kahan compensation terms.
+- TimestepNorm uses shifted FP32 first/second-moment prefixes for unmasked input and associative FP32 Welford prefixes for masked or packed input. The [paper/source differences](paper-deviations.md#released-source-compatibility-choices) describe the CUDA compensation-state divergence.
 - TimestepNorm and cache position counters are int32 and guard against overflow; the released TimestepNorm count is int64, which is not enabled implicitly because JAX x64 is a global execution policy.
 - CEMA coefficients and state are FP32/complex64.
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
