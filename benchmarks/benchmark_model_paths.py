@@ -116,15 +116,6 @@ CANONICAL_CONFIG: dict[str, Any] = {
     "loss_softmax_dtype": "float32",
 }
 
-SOURCE_PATHS = (
-    "src/megalodon_jax/config.py",
-    "src/megalodon_jax/model.py",
-    "src/megalodon_jax/inference.py",
-    "src/megalodon_jax/layers/attention.py",
-    "src/megalodon_jax/layers/complex_ema.py",
-    "src/megalodon_jax/layers/timestep_norm.py",
-)
-
 CUDA_PACKAGE_CANDIDATES: dict[str, tuple[str, ...]] = {
     "jax_cuda13_plugin": ("jax-cuda13-plugin",),
     "jax_cuda13_pjrt": ("jax-cuda13-pjrt",),
@@ -235,7 +226,6 @@ def _repo_provenance(repo: Path) -> dict[str, Any]:
         for path in (repo / "src/megalodon_jax").rglob("*.py")
         if path.is_file()
     }
-    discovered.update(relative for relative in SOURCE_PATHS if (repo / relative).is_file())
     if (repo / "pyproject.toml").is_file():
         discovered.add("pyproject.toml")
     files: dict[str, Any] = {}
@@ -596,22 +586,17 @@ def _block_tree(jax: Any, tree: Any) -> None:
 
 def _timing_summary(samples_ms: Sequence[float]) -> dict[str, Any]:
     """Summarize synchronized samples while retaining every observation."""
+    import numpy as np
+
     return {
         "iterations": len(samples_ms),
         "median_ms": statistics.median(samples_ms),
-        "p90_ms": float(_worker_numpy().percentile(samples_ms, 90)),
+        "p90_ms": float(np.percentile(samples_ms, 90)),
         "mean_ms": statistics.fmean(samples_ms),
         "min_ms": min(samples_ms),
         "max_ms": max(samples_ms),
         "samples_ms": list(samples_ms),
     }
-
-
-def _worker_numpy() -> Any:
-    """Return NumPy after the worker has installed its target source path."""
-    import numpy as np
-
-    return np
 
 
 def _measure(
@@ -1009,14 +994,6 @@ def _device_inputs(
     }
 
 
-def _compile(jax: Any, lowered: Any) -> tuple[Any, float]:
-    """Compile one lowered computation and synchronize its completion boundary."""
-    started = time.perf_counter_ns()
-    compiled = lowered.compile()
-    elapsed_ms = (time.perf_counter_ns() - started) / 1e6
-    return compiled, elapsed_ms
-
-
 def _lower_compile_measure(
     jax: Any,
     function: Any,
@@ -1029,7 +1006,9 @@ def _lower_compile_measure(
     started = time.perf_counter_ns()
     lowered = function.lower(*arguments)
     lower_ms = (time.perf_counter_ns() - started) / 1e6
-    compiled, compile_ms = _compile(jax, lowered)
+    started = time.perf_counter_ns()
+    compiled = lowered.compile()
+    compile_ms = (time.perf_counter_ns() - started) / 1e6
     compiler = _compiler_metadata(lowered, compiled)
     timing, result = _measure(
         jax,
