@@ -187,16 +187,6 @@ def greedy_token(logits: Float[Array, "batch vocab"]) -> Int[Array, "batch"]:
     return jnp.argmax(logits, axis=-1).astype(jnp.int32)
 
 
-def _top_k(logits: Array, k: int) -> tuple[Array, Array]:
-    """Run ``lax.top_k`` after clamping k to the vocabulary width.
-
-    :param Array logits: Logits whose final axis is the vocabulary dimension.
-    :param int k: Requested number of leading values and indices.
-    :return tuple[Array, Array]: Top values and their indices, ordered by value.
-    """
-    return jax.lax.top_k(logits, min(k, logits.shape[-1]))
-
-
 def _apply_top_k(
     logits: Float[Array, "batch vocab"], top_k: int | None
 ) -> Float[Array, "batch vocab"]:
@@ -208,7 +198,7 @@ def _apply_top_k(
     """
     if top_k is None or top_k <= 0:
         return logits
-    values, indices = _top_k(logits, top_k)
+    values, indices = jax.lax.top_k(logits, top_k)
     filtered = jnp.full_like(logits, -jnp.inf)
     batch = jnp.arange(logits.shape[0])[:, None]
     return filtered.at[batch, indices].set(values)
@@ -231,7 +221,7 @@ def _apply_top_p(
         return logits
 
     if top_k is not None and top_k > 0:
-        sorted_logits, sorted_indices = _top_k(logits, top_k)
+        sorted_logits, sorted_indices = jax.lax.top_k(logits, top_k)
     else:
         sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
         sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
@@ -664,37 +654,22 @@ def generate(
         model.config.vocab_size,
     )
 
-    if attention_mask is None:
-        return _generate_core(
-            model,
-            prompt_ids,
-            max_new_tokens,
-            key,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            attention_mask=None,
-            cache=cache,
-            return_cache=return_cache,
-        )
-
-    attention_mask = jnp.asarray(attention_mask)
-    if attention_mask.shape != prompt_ids.shape:
-        raise ValueError(
-            "attention_mask shape must match prompt_ids shape, got "
-            f"{attention_mask.shape} and {prompt_ids.shape}"
-        )
-    has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
-    needs_cache = cache is not None or return_cache or max_new_tokens > 1
-    if has_padding and needs_cache:
-        raise ValueError(
-            "Cannot use cache with padded attention_mask. "
-            "Provide unpadded prompts for cached generation."
-        )
-    if not has_padding:
-        attention_mask = None
+    if attention_mask is not None:
+        attention_mask = jnp.asarray(attention_mask)
+        if attention_mask.shape != prompt_ids.shape:
+            raise ValueError(
+                "attention_mask shape must match prompt_ids shape, got "
+                f"{attention_mask.shape} and {prompt_ids.shape}"
+            )
+        has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
+        needs_cache = cache is not None or return_cache or max_new_tokens > 1
+        if has_padding and needs_cache:
+            raise ValueError(
+                "Cannot use cache with padded attention_mask. "
+                "Provide unpadded prompts for cached generation."
+            )
+        if not has_padding:
+            attention_mask = None
 
     return _generate_core(
         model,
