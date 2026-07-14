@@ -302,8 +302,7 @@ def attention_multi_chunk(
             mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
         if segment_ids is not None:
             segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
-        if position_ids is not None:
-            position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
 
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
@@ -652,7 +651,7 @@ class ChunkedAttention(eqx.Module):
     ) -> tuple[
         Float[Array, "batch seq heads value_dim"],
         AttentionCache | None,
-        Int[Array, ""] | None,
+        Int[Array, ""],
     ]:
         """Apply attention and optionally return continuation state."""
         if q.ndim != 4 or k.shape != q.shape:
@@ -743,86 +742,73 @@ class ChunkedAttention(eqx.Module):
                 "attention cache count must be non-negative and must not overflow int32",
             )
 
-        def run_streaming(_: None) -> tuple[Array, AttentionCache | None, Array]:
-            """Run tokenwise attention while updating the fixed-capacity ring.
+        use_rng = not deterministic and self.attention_dropout > 0.0
+        rng = key if key is not None else jax.random.PRNGKey(0)
+        slots = jnp.arange(capacity, dtype=jnp.int32)
 
-            :param None _: Unused operand supplied by ``lax.cond``.
-            :return tuple: Attention output, optional updated cache, and final position.
-            """
-            use_rng = not deterministic and self.attention_dropout > 0.0
-            rng = key if key is not None else jax.random.PRNGKey(0)
-            slots = jnp.arange(capacity, dtype=jnp.int32)
-
-            def step(
-                carry: tuple[Array, Array, Array, Array],
-                inputs: tuple[Array, Array, Array],
-            ) -> tuple[tuple[Array, Array, Array, Array], Array]:
-                """Process one token and advance the ring-buffer state.
-
-                :param tuple carry: Cached keys, cached values, position, and random key.
-                :param tuple inputs: Query, key, and value vectors for one timestep.
-                :return tuple: Updated carry and the timestep attention output.
-                """
-                current_k, current_v, position, current_rng = carry
-                q_t, k_t, v_t = inputs
-                rope_position = (
-                    position % self.chunk_size if self.attention_window is None else position
-                )
-                q_rot, k_rot = self.rotary(
-                    q_t[:, None],
-                    k_t[:, None],
-                    rope_position,
-                )
-                write_slot = position % capacity
-                current_k = current_k.at[:, write_slot].set(k_rot[:, 0])
-                current_v = current_v.at[:, write_slot].set(v_t)
-
-                slot_time = position - jnp.mod(position - slots, capacity)
-                valid = slot_time >= 0
-                if self.attention_window is None:
-                    valid = valid & (slot_time // self.chunk_size == position // self.chunk_size)
-                kv_mask = jnp.broadcast_to(valid, (batch, capacity))
-
-                if use_rng:
-                    current_rng, step_key = jax.random.split(current_rng)
-                else:
-                    step_key = None
-                output = attention_single_chunk(
-                    q_rot,
-                    current_k,
-                    current_v,
-                    kv_mask=kv_mask,
-                    accum_dtype=self.accum_dtype,
-                    softmax_dtype=self.softmax_dtype,
-                    causal=False,
-                    dropout_rate=self.attention_dropout,
-                    dropout_mode=self.attention_dropout_mode,
-                    deterministic=deterministic,
-                    key=step_key,
-                )
-                return (
-                    current_k,
-                    current_v,
-                    position + 1,
-                    current_rng,
-                ), output[:, 0]
-
-            (final_k, final_v, final_count, _), outputs = jax.lax.scan(
-                step,
-                (cache_k, cache_v, count, rng),
-                (
-                    jnp.swapaxes(q, 0, 1),
-                    jnp.swapaxes(k, 0, 1),
-                    jnp.swapaxes(v, 0, 1),
-                ),
+        def step(
+            carry: tuple[Array, Array, Array, Array],
+            inputs: tuple[Array, Array, Array],
+        ) -> tuple[tuple[Array, Array, Array, Array], Array]:
+            """Process one token and advance the ring-buffer state."""
+            current_k, current_v, position, current_rng = carry
+            q_t, k_t, v_t = inputs
+            rope_position = (
+                position % self.chunk_size if self.attention_window is None else position
             )
-            out = jnp.swapaxes(outputs, 0, 1)
-            new_cache = (
-                AttentionCache(k=final_k, v=final_v, count=final_count) if return_cache else None
+            q_rot, k_rot = self.rotary(
+                q_t[:, None],
+                k_t[:, None],
+                rope_position,
             )
-            return out, new_cache, final_count
+            write_slot = position % capacity
+            current_k = current_k.at[:, write_slot].set(k_rot[:, 0])
+            current_v = current_v.at[:, write_slot].set(v_t)
 
-        return run_streaming(None)
+            slot_time = position - jnp.mod(position - slots, capacity)
+            valid = slot_time >= 0
+            if self.attention_window is None:
+                valid = valid & (slot_time // self.chunk_size == position // self.chunk_size)
+            kv_mask = jnp.broadcast_to(valid, (batch, capacity))
+
+            if use_rng:
+                current_rng, step_key = jax.random.split(current_rng)
+            else:
+                step_key = None
+            output = attention_single_chunk(
+                q_rot,
+                current_k,
+                current_v,
+                kv_mask=kv_mask,
+                accum_dtype=self.accum_dtype,
+                softmax_dtype=self.softmax_dtype,
+                causal=False,
+                dropout_rate=self.attention_dropout,
+                dropout_mode=self.attention_dropout_mode,
+                deterministic=deterministic,
+                key=step_key,
+            )
+            return (
+                current_k,
+                current_v,
+                position + 1,
+                current_rng,
+            ), output[:, 0]
+
+        (final_k, final_v, final_count, _), outputs = jax.lax.scan(
+            step,
+            (cache_k, cache_v, count, rng),
+            (
+                jnp.swapaxes(q, 0, 1),
+                jnp.swapaxes(k, 0, 1),
+                jnp.swapaxes(v, 0, 1),
+            ),
+        )
+        out = jnp.swapaxes(outputs, 0, 1)
+        new_cache = (
+            AttentionCache(k=final_k, v=final_v, count=final_count) if return_cache else None
+        )
+        return out, new_cache, final_count
 
 
 # -----------------------------------------------------------------------------
@@ -1093,22 +1079,14 @@ class MegalodonAttention(eqx.Module):
         need_ema_state = return_cache or ema_state is not None
         cema_input = x_tn.transpose(0, 2, 1)  # (B, D, L)
 
-        def run_cema(h_init: Array | None) -> tuple[Array, Array | None]:
-            """Apply CEMA using an optional incoming recurrent state.
-
-            :param Array | None h_init: Incoming complex EMA state.
-            :return tuple[Array, Array | None]: CEMA output and optional final state.
-            """
-            return self.cema(
-                cema_input,
-                h_init=h_init,
-                return_state=need_ema_state,
-                mask=mask,
-                segment_ids=segment_ids,
-                use_associative_segment_scan=self.use_associative_segment_scan,
-            )
-
-        y_cema, h_last = run_cema(ema_state)
+        y_cema, h_last = self.cema(
+            cema_input,
+            h_init=ema_state,
+            return_state=need_ema_state,
+            mask=mask,
+            segment_ids=segment_ids,
+            use_associative_segment_scan=self.use_associative_segment_scan,
+        )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
@@ -1185,13 +1163,12 @@ class MegalodonAttention(eqx.Module):
 
         # Build output cache
         if return_cache:
+            assert h_last is not None
             new_cache = LayerCache(
                 attn=new_attn_cache,
                 norm=new_norm_state,
-                ema=EMAState(h=h_last) if h_last is not None else None,
-                position=new_position
-                if new_position is not None
-                else jnp.array(0, dtype=jnp.int32),
+                ema=EMAState(h=h_last),
+                position=new_position,
             )
         else:
             new_cache = None
