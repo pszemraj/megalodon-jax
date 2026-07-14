@@ -17,7 +17,7 @@ The routine CPU gate covers the highest-value model, cache, conversion, and sour
 JAX_PLATFORMS=cpu CUDA_VISIBLE_DEVICES= conda run --name mega-jax pytest -m fast
 ```
 
-Tests join this gate through an explicit `@pytest.mark.fast` declaration at the test site. CPU runs do not force garbage collection around every test; set `MEGALODON_TEST_AGGRESSIVE_CLEANUP=1` only when running in a constrained environment that benefits from it. Accelerator runs retain per-test cleanup to reduce cross-test device-memory pressure.
+Tests join this gate through an explicit `pytest.mark.fast` marker on the test or module. CPU runs do not force garbage collection around every test; set `MEGALODON_TEST_AGGRESSIVE_CLEANUP=1` only when running in a constrained environment that benefits from it. Accelerator runs retain per-test cleanup to reduce cross-test device-memory pressure.
 
 Run the complete suite on the selected JAX backend before merging modeling changes:
 

@@ -17,6 +17,8 @@ restored = load_checkpoint("model.safetensors", key=jax.random.PRNGKey(1))
 
 Native format v2 stores the complete configuration, a configuration fingerprint, the tensor manifest, parameter names, and dtype policy. Loading is strict. Metadata-free files, legacy layouts, missing tensors, extra tensors, changed shapes, and changed dtypes are rejected.
 
+Model and inference-cache writes use a same-directory temporary file followed by atomic replacement.
+
 Partial restore is explicit and cannot silently fall back:
 
 ```python

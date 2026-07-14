@@ -81,6 +81,8 @@ import jax
 import jax.numpy as jnp
 import optax
 
+from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
+
 config = MegalodonConfig(
     ...,
     compute_dtype=jnp.bfloat16,

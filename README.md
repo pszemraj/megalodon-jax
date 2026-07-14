@@ -97,6 +97,7 @@ tokens, cache, key = generate(
     max_new_tokens=16,
     key=key,
     temperature=1.0,
+    return_cache=True,
 )
 ```
 
@@ -156,7 +157,7 @@ src/megalodon_jax/
 ├── convert.py         # Exact original-upstream checkpoint conversion
 ├── inference.py       # Cache indexing, sampling, and generation
 ├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM
-├── ops.py             # Dtype-aware linear algebra
+├── ops.py             # Dtype-aware linear algebra and dropout
 ├── precision.py       # Sensitive-parameter dtype audit and repair
 ├── types.py           # Cache/state pytrees
 ├── utils.py           # Weight initialization
@@ -171,7 +172,7 @@ src/megalodon_jax/
 
 ## Related
 
-- [Original Megalodon](https://github.com/XuezheMax/megalodon) - Reference CUDA implementation
+- [Original Megalodon](https://github.com/XuezheMax/megalodon) - Released PyTorch/CUDA source
 
 ## Citation
 
