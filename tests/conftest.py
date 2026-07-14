@@ -12,7 +12,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 import jax
-import numpy as np
 import pytest
 
 try:
@@ -58,13 +57,10 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 @pytest.fixture
 def random_seed() -> int:
-    """Seed numpy and torch RNGs for reproducibility.
+    """Return the deterministic seed shared by randomized tests.
 
     :return int: Seed value used for the session.
     """
-    if _TORCH_AVAILABLE:
-        torch.manual_seed(42)
-    np.random.seed(42)
     return 42
 
 

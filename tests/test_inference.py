@@ -35,14 +35,6 @@ from megalodon_jax.types import AttentionCache, LayerCache, ModelCache, NormStat
 from tests.factories import tiny_config
 
 
-def small_config() -> MegalodonConfig:
-    """Create a tiny config for fast inference tests.
-
-    :return MegalodonConfig: Minimal configuration for inference tests.
-    """
-    return tiny_config()
-
-
 @pytest.mark.fast
 class TestCacheUtilities:
     """Cache initialization and batch-indexing helpers."""
@@ -52,7 +44,7 @@ class TestCacheUtilities:
 
         :return None: None.
         """
-        config = small_config()
+        config = tiny_config()
         cache = init_cache(config)
 
         assert cache.layer_caches == (None,) * config.num_layers
@@ -60,12 +52,12 @@ class TestCacheUtilities:
 
     def test_pristine_cache_is_valid(self) -> None:
         """The public sparse zero-history representation satisfies cache invariants."""
-        config = small_config()
+        config = tiny_config()
         validate_model_cache_host(init_cache(config), config)
 
     def test_noncanonical_sparse_layer_is_invalid(self) -> None:
         """Top-level sparse caches use None rather than empty LayerCache objects."""
-        config = small_config()
+        config = tiny_config()
         malformed = ModelCache(
             layer_caches=(LayerCache(), *([None] * (config.num_layers - 1))),
             final_norm=None,
@@ -79,7 +71,7 @@ class TestCacheUtilities:
 
         :return None: None.
         """
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         _, cache = model(
             jnp.asarray([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32),
@@ -131,7 +123,7 @@ class TestCacheUtilities:
 
     def test_index_cache_rejects_invalid_indices(self) -> None:
         """Beam-parent selection rejects ambiguous or out-of-range indices."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         _, cache = model(
             jnp.asarray([[1, 2], [3, 4]], dtype=jnp.int32),
@@ -164,7 +156,7 @@ class TestCacheUtilities:
 
     def test_explicit_pristine_and_none_cache_match(self) -> None:
         """The public sparse initializer is equivalent to an omitted cache."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
         pristine = init_cache(config)
@@ -241,7 +233,7 @@ class TestSamplingAndGeneration:
 
         :return None: None.
         """
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
@@ -272,7 +264,7 @@ class TestSamplingAndGeneration:
 
         :return None: None.
         """
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
@@ -296,7 +288,7 @@ class TestSamplingAndGeneration:
 
         :return None: None.
         """
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
@@ -321,7 +313,7 @@ class TestSamplingAndGeneration:
         self, max_new_tokens: int, return_cache: bool
     ) -> None:
         """An all-valid mask is exactly equivalent to omitting mask metadata."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
         expected, _, _ = generate(
@@ -346,7 +338,7 @@ class TestSamplingAndGeneration:
     @pytest.mark.parametrize("mask_shape", [(1, 1), (2, 3), (3,)])
     def test_generate_rejects_wrong_shape_all_true_mask(self, mask_shape: tuple[int, ...]) -> None:
         """Mask shape is validated before an all-valid mask is discarded."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
 
@@ -361,7 +353,7 @@ class TestSamplingAndGeneration:
 
     def test_generate_rejects_non_vocabulary_output_space(self) -> None:
         """Autoregressive output IDs must always be valid embedding IDs."""
-        config = replace(small_config(), output_size=small_config().vocab_size + 1)
+        config = replace(tiny_config(), output_size=tiny_config().vocab_size + 1)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         with pytest.raises(ValueError, match="effective_output_size.*vocab_size"):
             generate(
@@ -374,7 +366,7 @@ class TestSamplingAndGeneration:
     @pytest.mark.parametrize("max_new_tokens", [-1, 0, 1.5, True])
     def test_generate_rejects_invalid_max_new_tokens(self, max_new_tokens: object) -> None:
         """Generation lengths must be positive integer values, excluding booleans."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
@@ -393,7 +385,7 @@ class TestSamplingAndGeneration:
         self, name: str, token_id: object
     ) -> None:
         """Explicit special-token overrides must be integer vocabulary IDs."""
-        config = small_config()
+        config = tiny_config()
         assert config.vocab_size == 64
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
@@ -409,7 +401,7 @@ class TestSamplingAndGeneration:
 
     def test_generate_accepts_integer_protocol_values(self) -> None:
         """NumPy integer scalars are accepted through the integer protocol."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         output, _, _ = generate(
             model,
@@ -425,7 +417,7 @@ class TestSamplingAndGeneration:
         self,
     ) -> None:
         """Greedy generation selects logits from the last valid right-padded token."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = [[1, 2, 3, 4, 5], [6, 7, 8, 0, 0]]
         attention_mask = [
@@ -457,7 +449,7 @@ class TestSamplingAndGeneration:
 
     def test_generate_rejects_left_padding(self) -> None:
         """Physical left padding cannot silently shift chunk-local semantics."""
-        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
+        model = MegalodonForCausalLM(tiny_config(), key=jax.random.PRNGKey(0))
         with pytest.raises(Exception, match="contiguous valid prefix.*right padding"):
             generate(
                 model,
@@ -473,7 +465,7 @@ class TestSamplingAndGeneration:
         self, max_new_tokens: int, return_cache: bool
     ) -> None:
         """Empty prompts behave exactly like an explicit, unpadded BOS prompt."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         empty_prompt = jnp.empty((1, 0), dtype=jnp.int32)
         explicit_bos = jnp.asarray([[config.bos_token_id]], dtype=jnp.int32)
@@ -506,7 +498,7 @@ class TestSamplingAndGeneration:
     @pytest.mark.parametrize("advanced", [False, True])
     def test_generate_rejects_empty_prompt_continuation(self, advanced: bool) -> None:
         """An empty prompt cannot silently append BOS to an existing timeline."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         if advanced:
             _, cache = model(
@@ -531,7 +523,7 @@ class TestSamplingAndGeneration:
 
         :return None: None.
         """
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[1, 2, 3]], dtype=jnp.int32)
 
@@ -560,7 +552,7 @@ class TestSamplingAndGeneration:
         with_cache: bool,
     ) -> None:
         """Every cache-enabling mode rejects padded generation explicitly."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         prompt = jnp.array([[0, 1, 2, 3]], dtype=jnp.int32)
         cache = init_cache(config) if with_cache else None
@@ -706,7 +698,7 @@ class TestConversion:
     @pytest.mark.fast
     def test_native_v2_roundtrip_is_exact(self, tmp_path: Path) -> None:
         """Native save/reload preserves every tensor and model output."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         path = tmp_path / "model.safetensors"
 
@@ -727,7 +719,7 @@ class TestConversion:
     def test_native_roundtrip_normalizes_numpy_config_scalars(self, tmp_path: Path) -> None:
         """Validated NumPy config scalars remain JSON-portable and reloadable."""
         config = replace(
-            small_config(),
+            tiny_config(),
             vocab_size=np.int64(64),
             dropout=np.float32(0.1),
         )
@@ -769,7 +761,7 @@ class TestConversion:
         from safetensors import safe_open
         from safetensors.flax import load_file, save_file
 
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         valid = tmp_path / "valid.safetensors"
         save_checkpoint(model, valid)
@@ -783,7 +775,7 @@ class TestConversion:
 
     def test_partial_restore_requires_explicit_names(self, tmp_path: Path) -> None:
         """Partial restore reports restored and freshly initialized leaves."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         path = tmp_path / "partial.safetensors"
         save_checkpoint(model, path)
@@ -827,7 +819,7 @@ class TestConversion:
     def test_original_upstream_roundtrip_and_keyspace(self) -> None:
         """Exact released keys round-trip without transposes or schema aliases."""
         pytest.importorskip("torch")
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state = export_upstream_state_dict(model)
 
@@ -854,7 +846,7 @@ class TestConversion:
     def test_original_upstream_strict_failure(self) -> None:
         """Missing, unexpected, and Hugging-Face-shaped keys fail closed."""
         pytest.importorskip("torch")
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state = export_upstream_state_dict(model)
         state.pop("layers.0.mega.wh2.weight")
@@ -866,7 +858,7 @@ class TestConversion:
     def test_tied_output_contract(self) -> None:
         """Tied upstream copies must remain bit-identical, without tolerance."""
         torch = pytest.importorskip("torch")
-        config = replace(small_config(), share_emb=True)
+        config = replace(tiny_config(), share_emb=True)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state = export_upstream_state_dict(model)
         assert state["output.output.weight"].data_ptr() != state["embed.weight"].data_ptr()
@@ -902,7 +894,7 @@ class TestConversion:
         with pytest.raises(ValueError, match=message):
             load_upstream_checkpoint(
                 tmp_path,
-                small_config(),
+                tiny_config(),
                 key=jax.random.PRNGKey(0),
             )
 
@@ -914,7 +906,7 @@ class TestConversion:
         compute_dtype: jnp.dtype,
     ) -> None:
         """Serialized continuation state resumes exactly and rejects other configs."""
-        config = replace(small_config(), compute_dtype=compute_dtype)
+        config = replace(tiny_config(), compute_dtype=compute_dtype)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
         assert cache is not None
@@ -939,7 +931,7 @@ class TestConversion:
 
     def test_save_rejects_partial_nonzero_cache(self, tmp_path: Path) -> None:
         """Persistence cannot legitimize a destructive partial continuation."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
         assert cache is not None
@@ -983,7 +975,7 @@ class TestConversion:
 
     def test_pristine_cache_save_load_and_execute(self, tmp_path: Path) -> None:
         """Every persisted pristine cache remains executable after loading."""
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         valid = tmp_path / "sparse-zero.safetensors"
         save_inference_cache(init_cache(config), valid, config)
@@ -1003,7 +995,7 @@ class TestConversion:
         from safetensors import safe_open
         from safetensors.flax import load_file, save_file
 
-        config = small_config()
+        config = tiny_config()
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         _, cache = model(jnp.asarray([[1, 2, 3]], dtype=jnp.int32), return_cache=True)
         assert cache is not None
@@ -1045,7 +1037,7 @@ class TestConversion:
         """Atomic persistence avoids shared temp names and removes failed writes."""
         import megalodon_jax.checkpoint as checkpoint_module
 
-        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
+        model = MegalodonForCausalLM(tiny_config(), key=jax.random.PRNGKey(0))
         destination = tmp_path / "model.safetensors"
         legacy_temporary = destination.with_suffix(".safetensors.tmp")
         legacy_temporary.write_bytes(b"unrelated writer")
@@ -1088,11 +1080,11 @@ class TestConversion:
         with pytest.raises(FileNotFoundError):
             load_checkpoint(missing, key=jax.random.PRNGKey(0))
         with pytest.raises(FileNotFoundError):
-            load_inference_cache(missing, small_config())
+            load_inference_cache(missing, tiny_config())
 
     def test_ambiguous_legacy_apis_refuse(self, tmp_path: Path) -> None:
         """Historical schema-guessing entry points provide migration guidance."""
-        model = MegalodonForCausalLM(small_config(), key=jax.random.PRNGKey(0))
+        model = MegalodonForCausalLM(tiny_config(), key=jax.random.PRNGKey(0))
         with pytest.raises(RuntimeError, match="export_upstream_state_dict"):
             convert_jax_to_torch(model)
         with pytest.raises(RuntimeError, match="load_upstream_state_dict"):
