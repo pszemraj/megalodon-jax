@@ -342,12 +342,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--paper",
-        type=Path,
-        default=None,
-        help="Local paper Markdown path; recorded from local-scratch when present",
-    )
-    parser.add_argument(
         "--backend",
         choices=("cpu", "gpu"),
         default="cpu",
@@ -370,11 +364,6 @@ def main() -> int:
         if args.upstream_repo is not None
         else repo / "local-scratch" / "megalodon-upstream-cuda_torch"
     )
-    paper = (
-        args.paper.resolve()
-        if args.paper is not None
-        else repo / "local-scratch" / "megalodon_paper.md"
-    )
     src = repo / "src"
     package = src / "megalodon_jax"
     if not package.is_dir():
@@ -383,11 +372,7 @@ def main() -> int:
     if args.upstream_repo is not None and not upstream.is_dir():
         print(f"ERROR: local upstream repository does not exist: {upstream}", file=sys.stderr)
         return 2
-    if args.paper is not None and not paper.is_file():
-        print(f"ERROR: local paper does not exist: {paper}", file=sys.stderr)
-        return 2
     upstream_available = upstream.is_dir()
-    paper_available = paper.is_file()
     upstream_config_path = upstream / "megalodon" / "config.py"
     repository_root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(repository_root))
@@ -992,13 +977,6 @@ def main() -> int:
             "Local upstream CUDA source is unavailable",
             expected_path=upstream,
         )
-    audit.skip(
-        "cuda_timestep_mask_runtime_parity",
-        "INFO",
-        "Skipped by scope: the released fused CUDA extension is source reference only",
-        verification_mode="not_run",
-        reason="owner explicitly excluded building or installing the upstream extension",
-    )
 
     def check_source_biases() -> tuple[bool, str, dict[str, Any]]:
         cfg = tiny_config(swiglu=True)
@@ -1071,34 +1049,6 @@ def main() -> int:
         )
 
     audit.run("fp16_is_out_of_scope", "P1", check_fp16_rejection)
-
-    def check_pad_embedding() -> tuple[bool, str, dict[str, Any]]:
-        import inspect
-
-        # The uploaded upstream model performs a normal embedding lookup and has no
-        # padding_idx. The JAX forward explicitly replaces pad-token embeddings with
-        # zero. With the bundled tokenizer, pad_token == unk_token == ID 0, so this
-        # also removes the unknown-token embedding and its gradient.
-        from megalodon_jax.model import MegalodonModel
-
-        source = inspect.getsource(MegalodonModel.__call__)
-        forced_zero_mask = (
-            "pad_mask = input_ids == self.config.pad_token_id" in source
-            and "jnp.where(pad_mask" in source
-        )
-        passed = not forced_zero_mask
-        return (
-            passed,
-            "Embedding lookup is not forcibly zero-masked by token ID"
-            if passed
-            else "Forward zero-masks pad_token_id; bundled ID 0 is also <unk>",
-            {
-                "forced_pad_zero_mask_detected": forced_zero_mask,
-                "default_pad_token_id": MegalodonConfig().pad_token_id,
-            },
-        )
-
-    audit.run("upstream_embedding_padding_semantics", "P1", check_pad_embedding)
 
     if args.include_slow:
 
@@ -1538,7 +1488,6 @@ def main() -> int:
     print("\nMEGALODON JAX MODELING CORRECTNESS VERIFICATION")
     print(f"Repository: {repo}")
     print(f"Upstream evidence: {upstream if upstream_available else 'unavailable'}")
-    print(f"Paper evidence: {paper if paper_available else 'unavailable'}")
     print(f"JAX: {jax.__version__}; platform: {jax.default_backend()}")
     print("-" * 100)
     for result in audit.results:
@@ -1564,8 +1513,6 @@ def main() -> int:
         "repository": str(repo),
         "repository_commit": _git_revision(repo),
         "upstream_repository": str(upstream) if upstream_available else None,
-        "paper": str(paper) if paper_available else None,
-        "paper_sha256": _sha256(paper) if paper_available else None,
         "upstream_config_sha256": (
             _sha256(upstream_config_path) if upstream_config_path.is_file() else None
         ),

@@ -35,19 +35,18 @@ CI runs the fast gate on Python 3.11 and 3.13 with the minimum supported JAX and
 
 ## Modeling verifier
 
-`tools/verify_modeling_correctness.py` compares the implementation with independent mathematical references and, when available, the exact released source. Its PyTorch transcription is a cross-implementation consistency check, not a ground-truth runtime oracle. Repository-only checks run without the untracked evidence files and report source-anchoring checks as skipped. A release-quality run supplies both local evidence paths and includes the slow forward, gradient, optimizer, conversion, save/reload, and cache-partition checks:
+`tools/verify_modeling_correctness.py` compares the implementation with independent mathematical references and, when available, the exact released source. Its PyTorch transcription is a cross-implementation consistency check, not a ground-truth runtime oracle. Repository-only checks run without the untracked source checkout and report source-anchoring checks as skipped. A release-quality run supplies that source path and includes the slow forward, gradient, optimizer, conversion, save/reload, and cache-partition checks:
 
 ```bash
 conda run --name mega-jax python tools/verify_modeling_correctness.py \
   --jax-repo . \
   --upstream-repo local-scratch/megalodon-upstream-cuda_torch \
-  --paper local-scratch/megalodon_paper.md \
   --backend gpu \
   --include-slow \
   --json local-scratch/modeling-correctness-verification.json
 ```
 
-The verifier writes explicit skipped results and exits nonzero when an executed invariant fails. Its fused CUDA runtime comparison is always recorded as scope-excluded; the released CUDA code is a source reference and is not built by this workflow.
+The verifier writes explicit skipped results and exits nonzero when an executed invariant fails. The released CUDA code is a source reference and is not built by this workflow.
 
 ## Performance benchmarks
 
