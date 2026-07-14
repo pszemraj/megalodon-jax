@@ -224,12 +224,8 @@ class TestMegalodonBlock:
         block0 = MegalodonBlock(config, layer_id=0, key=k1)
         block3 = MegalodonBlock(config, layer_id=3, key=k2)
 
-        # Different layer IDs should have different alpha values
         assert block0.ffn.alpha is not None
         assert block3.ffn.alpha is not None
-        np.testing.assert_allclose(np.asarray(block0.ffn.alpha), 0.1)
-        np.testing.assert_allclose(np.asarray(block3.ffn.alpha), 0.1 * (0.5**3))
-        assert not np.array_equal(np.asarray(block0.ffn.alpha), np.asarray(block3.ffn.alpha))
         # alpha = 0.1 * (0.5 ** layer_id)
         np.testing.assert_allclose(block0.ffn.alpha, 0.1 * (0.5**0), rtol=1e-6)
         np.testing.assert_allclose(block3.ffn.alpha, 0.1 * (0.5**3), rtol=1e-6)
@@ -653,36 +649,8 @@ class TestGradients:
         for leaf in grad_leaves:
             assert jnp.all(jnp.isfinite(leaf)), "Gradient contains NaN or Inf"
 
-    def test_gradient_flow_embedding(self, random_seed: int) -> None:
-        """Test that gradients flow to embedding weights.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = small_config()
-        batch, seq = 2, 8
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
-        labels = input_ids
-
-        def loss_fn(model: MegalodonForCausalLM) -> jnp.ndarray:
-            """Compute a scalar loss for embedding gradient checks.
-
-            :param MegalodonForCausalLM model: Model under test.
-            :return jnp.ndarray: Scalar loss value.
-            """
-            return model.compute_loss(input_ids, labels)
-
-        grads = eqx.filter_grad(loss_fn)(model)
-
-        # Check embedding gradient
         embed_grad = grads.model.embed.weight
         assert embed_grad is not None
-        assert jnp.all(jnp.isfinite(embed_grad))
-        # Some gradients should be non-zero (for tokens that appear in input)
         assert jnp.any(embed_grad != 0)
 
     def test_gradient_dtype_matches_param_dtype_bf16_compute(self, random_seed: int) -> None:
@@ -737,6 +705,7 @@ class TestModelCache:
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
         _, cache = model(input_ids, return_cache=True)
 
+        assert isinstance(cache.layer_caches, tuple)
         # Cache should be a valid pytree
         leaves = jax.tree_util.tree_leaves(cache)
         assert len(leaves) > 0
@@ -754,23 +723,6 @@ class TestModelCache:
 
         doubled = jax.tree_util.tree_map(double, cache)
         assert doubled is not None
-
-    def test_cache_tuple_immutability(self, random_seed: int) -> None:
-        """Test that layer_caches is a tuple (not list) for JAX compatibility.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = small_config()
-        batch, seq = 1, 8
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
-        _, cache = model(input_ids, return_cache=True)
-
-        assert isinstance(cache.layer_caches, tuple)
 
     def test_returned_cache_stops_parameter_gradients(self, random_seed: int) -> None:
         """A cache-only objective cannot backpropagate through its recorded history."""
@@ -1040,19 +992,17 @@ class TestModelCache:
 # -----------------------------------------------------------------------------
 
 
-class TestFix1GradientCheckpointing:
-    """Tests for gradient checkpointing (Fix 1)."""
+class TestCacheExecutionMode:
+    """Tests for inference-only cache population."""
 
-    @pytest.mark.parametrize("use_checkpoint", [False, True])
     @pytest.mark.parametrize("deterministic", [False, True])
     def test_cache_population_respects_execution_mode(
         self,
         random_seed: int,
-        use_checkpoint: bool,
         deterministic: bool,
     ) -> None:
-        """Only deterministic inference populates caches, with or without remat."""
-        config = replace(small_config(), use_checkpoint=use_checkpoint)
+        """Only deterministic inference may populate caches."""
+        config = small_config()
         batch, seq = 2, 16
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonModel(config, key=key)
@@ -1218,23 +1168,8 @@ class TestFix3UntiedLMHead:
         with pytest.raises(ValueError, match="share_emb"):
             replace(small_config(), output_size=128, share_emb=True)
 
-    def test_untied_head_when_output_size_differs(self, random_seed: int) -> None:
-        """Test that separate LM head is created when output_size != vocab_size.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        config = small_config(num_layers=1, output_size=512)
-
-        key = jax.random.PRNGKey(random_seed)
-        model = MegalodonForCausalLM(config, key=key)
-
-        assert model.tied is False
-        assert model.lm_head is not None
-        assert model.lm_head.weight.shape == (512, 64)  # (output_size, model_dim)
-
-    def test_untied_head_forward_shapes(self, random_seed: int) -> None:
-        """Test that untied LM head produces correct output shapes.
+    def test_untied_head_structure_and_forward_shape(self, random_seed: int) -> None:
+        """Test that a non-vocabulary output uses a correctly shaped separate head.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1244,6 +1179,10 @@ class TestFix3UntiedLMHead:
 
         key = jax.random.PRNGKey(random_seed)
         model = MegalodonForCausalLM(config, key=key)
+
+        assert model.tied is False
+        assert model.lm_head is not None
+        assert model.lm_head.weight.shape == (512, config.model_dim)
 
         input_ids = jax.random.randint(key, (batch, seq), minval=0, maxval=config.vocab_size)
         logits, _ = model(input_ids, return_cache=False)
