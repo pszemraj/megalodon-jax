@@ -26,6 +26,15 @@ from megalodon_jax.config import InitMode
 T = TypeVar("T", bound=eqx.Module)
 
 
+def _initializer_sample_dtype(dtype: jnp.dtype) -> jnp.dtype:
+    """Use FP32 random draws when the persistent destination is BF16.
+
+    :param jnp.dtype dtype: Requested persistent parameter dtype.
+    :return jnp.dtype: Random sampling dtype.
+    """
+    return jnp.float32 if jnp.dtype(dtype) == jnp.dtype(jnp.bfloat16) else dtype
+
+
 def _is_linear(x: Any) -> bool:
     """Check if x is an Equinox Linear layer.
 
@@ -75,7 +84,8 @@ def get_initializer(
             """
             fan_in, _ = require_matrix(shape)
             std = 1.0 / jnp.sqrt(3.0 * fan_in)
-            return jax.random.normal(key, shape, dtype=dtype) * std
+            values = jax.random.normal(key, shape, dtype=_initializer_sample_dtype(dtype))
+            return (values * std).astype(dtype)
 
         return he
 
@@ -93,13 +103,14 @@ def get_initializer(
             """
             fan_in, fan_out = require_matrix(shape)
             bound = jnp.sqrt(6.0 / (fan_in + fan_out))
-            return jax.random.uniform(
+            values = jax.random.uniform(
                 key,
                 shape,
-                dtype=dtype,
+                dtype=_initializer_sample_dtype(dtype),
                 minval=-bound,
                 maxval=bound,
             )
+            return values.astype(dtype)
 
         return xavier
 
@@ -115,7 +126,8 @@ def get_initializer(
             :param jnp.dtype dtype: Output dtype.
             :return Array: Initialized array.
             """
-            return jax.random.normal(key, shape, dtype=dtype) * 0.02
+            values = jax.random.normal(key, shape, dtype=_initializer_sample_dtype(dtype))
+            return (values * 0.02).astype(dtype)
 
         return bert
 
@@ -137,9 +149,9 @@ def get_initializer(
                 lower=-3.0,
                 upper=3.0,
                 shape=shape,
-                dtype=dtype,
+                dtype=_initializer_sample_dtype(dtype),
             )
-            return values * jnp.asarray(std, dtype=dtype)
+            return (values * jnp.asarray(std, dtype=values.dtype)).astype(dtype)
 
         return gaussian
 

@@ -235,7 +235,7 @@ class TestMegalodonConfig:
             MegalodonConfig(**{field: value})
 
     def test_dtype_validation(self) -> None:
-        """Test dtype constraints reject float16.
+        """Test dtype constraints enforce the supported FP32/BF16 policy.
 
         :return None: None.
         """
@@ -249,8 +249,13 @@ class TestMegalodonConfig:
             MegalodonConfig(attention_softmax_dtype=jnp.float16)
         with pytest.raises(ValueError, match="float16"):
             MegalodonConfig(loss_softmax_dtype=jnp.float16)
-        with pytest.raises(ValueError, match="param_dtype must be float32"):
-            MegalodonConfig(param_dtype=jnp.bfloat16)
+        config = MegalodonConfig(
+            param_dtype=jnp.bfloat16,
+            compute_dtype=jnp.bfloat16,
+        )
+        assert config.param_dtype == jnp.bfloat16
+        with pytest.raises(ValueError, match="param_dtype must be float32 or bfloat16"):
+            MegalodonConfig(param_dtype=jnp.float64)
 
     def test_accum_dtype_precision_validation(self) -> None:
         """Test accum_dtype must be at least as wide as compute_dtype.

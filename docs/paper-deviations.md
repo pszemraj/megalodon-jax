@@ -25,6 +25,6 @@ Paper theory, released checkpoint semantics, and intentional JAX extensions are 
 
 ## Deliberately unsupported
 
-- Float16 compute or storage. [Supported dtype policies](dtypes-and-stability.md#supported-policies) are FP32 and BF16 compute with FP32 parameters and accumulation.
+- Float16 compute or storage. [Supported dtype policies](dtypes-and-stability.md#supported-policies) allow FP32 or BF16 ordinary parameters and compute while retaining FP32-sensitive parameters and accumulation.
 - Silent loading of pre-v2 JAX, Hugging Face-shaped, raw FSDP, or otherwise ambiguous checkpoints.
 - Cached decoding with padding masks or packed-sequence metadata because the KV cache does not store per-position validity/segment metadata.

@@ -46,7 +46,7 @@ def _torch_tensor(
     :return torch.Tensor: Writable CPU tensor.
     """
     array = np.asarray(value)
-    if np.issubdtype(array.dtype, np.floating):
+    if np.issubdtype(array.dtype, np.floating) or array.dtype == jnp.bfloat16:
         array = array.astype(np.float32, copy=False)
     if not array.flags.writeable:
         array = array.copy()
@@ -86,11 +86,15 @@ def export_upstream_state_dict(
     """Export an exact world-size-one released-source state dictionary.
 
     :param MegalodonForCausalLM model: JAX model to export.
-    :param torch.dtype | None dtype: Optional dtype for ordinary projection tensors.
-        Numerically sensitive parameters remain float32.
+    :param torch.dtype | None dtype: Optional dtype override for ordinary projection tensors.
+        The model's parameter storage dtype is used when omitted. Numerically sensitive
+        parameters remain float32.
     :return StateDict: Released-source keyspace backed by CPU PyTorch tensors.
     """
     config = model.config
+    ordinary_dtype = (
+        torch.bfloat16 if dtype is None and config.param_dtype == jnp.bfloat16 else dtype
+    )
 
     def ordinary(value: Any) -> torch.Tensor:
         """Convert an ordinary parameter using the requested export dtype.
@@ -98,7 +102,7 @@ def export_upstream_state_dict(
         :param Any value: Parameter value to convert.
         :return torch.Tensor: Converted CPU tensor.
         """
-        return _torch_tensor(value, dtype=dtype)
+        return _torch_tensor(value, dtype=ordinary_dtype)
 
     def fp32(value: Any) -> torch.Tensor:
         """Convert a numerically sensitive parameter to float32.
@@ -233,8 +237,19 @@ def load_upstream_state_dict(
     _require_exact_keys(actual, expected, context="strict original-upstream key mismatch")
 
     config = model.config
+
+    def ordinary(value: torch.Tensor, name: str) -> Array:
+        """Convert an ordinary upstream parameter to configured storage.
+
+        :param torch.Tensor value: Upstream tensor to convert.
+        :param str name: Upstream key used in validation errors.
+        :return Array: Parameter in ``config.param_dtype``.
+        """
+        return _jax_float(value, name).astype(config.param_dtype)
+
+    embed_source = _jax_float(state_dict["embed.weight"], "embed.weight")
     native: dict[str, Array] = {
-        "model.embed.weight": _jax_float(state_dict["embed.weight"], "embed.weight"),
+        "model.embed.weight": embed_source.astype(config.param_dtype),
     }
     expected_freqs = _rope_frequencies(config)
     actual_freqs = state_dict["rope.freqs"].detach().float().cpu().numpy()
@@ -280,12 +295,12 @@ def load_upstream_state_dict(
                 f"{ap}.rmsnorm.weight",
             )
         for name in ("wz", "wv", "wr", "wh1", "wh2"):
-            native[f"{jp}.{name}.weight"] = _jax_float(
+            native[f"{jp}.{name}.weight"] = ordinary(
                 state_dict[f"{ap}.{name}.weight"],
                 f"{ap}.{name}.weight",
             )
             if getattr(layer.attn, name).bias is not None:
-                native[f"{jp}.{name}.bias"] = _jax_float(
+                native[f"{jp}.{name}.bias"] = ordinary(
                     state_dict[f"{ap}.{name}.bias"],
                     f"{ap}.{name}.bias",
                 )
@@ -306,7 +321,7 @@ def load_upstream_state_dict(
         for name in ("fc1", "fc2", "fc3"):
             projection = getattr(layer.ffn, name)
             if projection is not None:
-                native[f"{jfp}.{name}.weight"] = _jax_float(
+                native[f"{jfp}.{name}.weight"] = ordinary(
                     state_dict[f"{fp}.{name}.weight"],
                     f"{fp}.{name}.weight",
                 )
@@ -325,15 +340,15 @@ def load_upstream_state_dict(
         state_dict["output.final_norm.bias"],
         "output.final_norm.bias",
     )
-    output = _jax_float(state_dict["output.output.weight"], "output.output.weight")
+    output_source = _jax_float(state_dict["output.output.weight"], "output.output.weight")
     if model.tied:
         # Released share_emb aliases one logical parameter. Although state_dict
         # serialization emits two tensors, both originate from that exact value;
         # accepting approximate equality would silently bless an untied artifact.
-        if not np.array_equal(np.asarray(output), np.asarray(native["model.embed.weight"])):
+        if not np.array_equal(np.asarray(output_source), np.asarray(embed_source)):
             raise ValueError("tied upstream output and embedding weights must be bit-identical")
     else:
-        native["lm_head.weight"] = output
+        native["lm_head.weight"] = output_source.astype(config.param_dtype)
 
     loaded, _ = _apply_parameters(model, native)
     return loaded

@@ -14,6 +14,7 @@ import pytest
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, validate_model_cache_host
 from megalodon_jax.checkpoint import (
+    BF16_DTYPE_POLICY,
     load_checkpoint,
     load_inference_cache,
     load_partial_checkpoint,
@@ -690,6 +691,34 @@ class TestConversion:
         actual_logits, _ = loaded(tokens)
         np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
 
+    @pytest.mark.fast
+    def test_native_bf16_storage_roundtrip_restores_policy(self, tmp_path: Path) -> None:
+        """BF16 ordinary storage and softmax selection reload without caller flags."""
+        from safetensors import safe_open
+
+        config = replace(
+            tiny_config(),
+            param_dtype=jnp.bfloat16,
+            compute_dtype=jnp.bfloat16,
+            attention_softmax_dtype=jnp.bfloat16,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        path = tmp_path / "model-bf16.safetensors"
+
+        save_checkpoint(model, path)
+        loaded = load_checkpoint(path, key=jax.random.PRNGKey(1))
+
+        assert loaded.config == config
+        assert loaded.model.embed.weight.dtype == jnp.bfloat16
+        assert loaded.model.layers[0].attn.cema.alpha.dtype == jnp.float32
+        with safe_open(str(path), framework="flax") as handle:
+            assert handle.metadata()["dtype_policy"] == BF16_DTYPE_POLICY
+        expected = model_state_dict(model)
+        actual = model_state_dict(loaded)
+        for name in expected:
+            assert actual[name].dtype == expected[name].dtype, name
+            np.testing.assert_array_equal(np.asarray(actual[name]), np.asarray(expected[name]))
+
     def test_native_roundtrip_normalizes_numpy_config_scalars(self, tmp_path: Path) -> None:
         """Validated NumPy config scalars remain JSON-portable and reloadable."""
         config = replace(
@@ -815,6 +844,34 @@ class TestConversion:
         expected_logits, _ = model(tokens)
         actual_logits, _ = loaded(tokens)
         np.testing.assert_array_equal(np.asarray(actual_logits), np.asarray(expected_logits))
+
+    @pytest.mark.torch_ref
+    def test_original_upstream_roundtrip_preserves_bf16_ordinary_storage(self) -> None:
+        """Upstream transport follows BF16 ordinary and FP32-sensitive storage."""
+        torch = pytest.importorskip("torch")
+        config = replace(
+            tiny_config(),
+            param_dtype=jnp.bfloat16,
+            compute_dtype=jnp.bfloat16,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+
+        state = export_upstream_state_dict(model)
+        assert state["embed.weight"].dtype == torch.bfloat16
+        assert state["layers.0.mega.wz.weight"].dtype == torch.bfloat16
+        assert state["output.output.weight"].dtype == torch.bfloat16
+        assert state["layers.0.mega.cema.alpha"].dtype == torch.float32
+        assert state["output.final_norm.weight"].dtype == torch.float32
+
+        loaded = load_upstream_state_dict(
+            MegalodonForCausalLM(config, key=jax.random.PRNGKey(1)),
+            state,
+        )
+        expected = model_state_dict(model)
+        actual = model_state_dict(loaded)
+        for name in expected:
+            assert actual[name].dtype == expected[name].dtype, name
+            np.testing.assert_array_equal(np.asarray(actual[name]), np.asarray(expected[name]))
 
     @pytest.mark.torch_ref
     def test_original_upstream_strict_failure(self) -> None:

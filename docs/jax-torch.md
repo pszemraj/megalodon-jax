@@ -72,7 +72,7 @@ state_dict = export_upstream_state_dict(model)
 torch.save(state_dict, "consolidated.pth")
 ```
 
-Weights use the original `(out_features, in_features)` layout without speculative transposes. CEMA gamma is reassembled as real/imag pairs, omega regains its singleton axis, and tied output weights are emitted as an equal clone so serialization does not depend on shared storage.
+Weights use the original `(out_features, in_features)` layout without speculative transposes. Ordinary tensors follow the model's `param_dtype` by default and may use the exporter's explicit `dtype` override; CEMA, normalization, RoPE, and other sensitive tensors remain FP32. CEMA gamma is reassembled as real/imag pairs, omega regains its singleton axis, and tied output weights are emitted as an equal clone so serialization does not depend on shared storage.
 
 ## Compatibility boundary
 

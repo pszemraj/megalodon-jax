@@ -13,10 +13,12 @@ import pytest
 
 from megalodon_jax import MegalodonBlock, MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, cache_invariant_violation
+from megalodon_jax.config import InitMode
 from megalodon_jax.inference import init_cache
 from megalodon_jax.layers import TimestepNorm
 from megalodon_jax.precision import audit_sensitive_param_dtypes, ensure_sensitive_param_dtype
 from megalodon_jax.types import EMAState, LayerCache, ModelCache, NormState
+from megalodon_jax.utils import get_initializer
 from tests.factories import floating_to_bf16, tiny_config
 
 
@@ -649,6 +651,23 @@ class TestGradients:
         assert embed_grad is not None
         assert embed_grad.dtype == jnp.float32
 
+    def test_gradient_dtype_matches_bf16_param_storage(self, random_seed: int) -> None:
+        """Ordinary gradients are BF16 while sensitive gradients remain FP32."""
+        config = replace(
+            small_config(num_layers=1),
+            param_dtype=jnp.bfloat16,
+            compute_dtype=jnp.bfloat16,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray([[1, 2, 3, 4]], dtype=jnp.int32)
+
+        grads = eqx.filter_grad(lambda candidate: candidate.compute_loss(input_ids, input_ids))(
+            model
+        )
+
+        assert grads.model.embed.weight.dtype == jnp.bfloat16
+        assert grads.model.layers[0].attn.cema.alpha.dtype == jnp.float32
+
 
 # -----------------------------------------------------------------------------
 # ModelCache Tests
@@ -1187,6 +1206,24 @@ class TestFix4CacheValidation:
 
 class TestFix6InitMode:
     """Tests for init_mode initialization (Fix 6)."""
+
+    @pytest.mark.parametrize("mode", ["gaussian", "xavier", "he", "bert"])
+    def test_bf16_initialization_is_fp32_sample_then_cast(
+        self,
+        mode: InitMode,
+        random_seed: int,
+    ) -> None:
+        """Every supported BF16 initializer retains the FP32 sampling grid."""
+        initializer = get_initializer(mode, dim=16)
+        key = jax.random.PRNGKey(random_seed)
+
+        full = initializer(key, (32, 16), jnp.float32)
+        compact = initializer(key, (32, 16), jnp.bfloat16)
+
+        np.testing.assert_array_equal(
+            np.asarray(compact),
+            np.asarray(full.astype(jnp.bfloat16)),
+        )
 
     def test_gaussian_linear_init_uses_unit_scale(self, random_seed: int) -> None:
         """Test that gaussian init for Linear layers uses std ~ 1.0 (dim=None).
@@ -1739,6 +1776,51 @@ class TestPrecisionAudit:
 
         restored = ensure_sensitive_param_dtype(model_bf16)
         assert audit_sensitive_param_dtypes(restored) == {}
+
+    def test_bf16_storage_applies_only_to_ordinary_parameters(self, random_seed: int) -> None:
+        """Compact storage keeps embeddings and projections BF16 and sensitive state FP32."""
+        config = small_config(
+            vocab_size=128,
+            num_layers=1,
+            chunk_size=8,
+            swiglu=True,
+            rescale_nffn=True,
+            param_dtype=jnp.bfloat16,
+            compute_dtype=jnp.bfloat16,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        reference = MegalodonForCausalLM(
+            replace(config, param_dtype=jnp.float32),
+            key=jax.random.PRNGKey(random_seed),
+        )
+        layer = model.model.layers[0]
+        reference_layer = reference.model.layers[0]
+        assert model.lm_head is not None
+        assert reference.lm_head is not None
+
+        ordinary_pairs = [
+            (model.model.embed.weight, reference.model.embed.weight),
+            (model.lm_head.weight, reference.lm_head.weight),
+            (layer.attn.wz.weight, reference_layer.attn.wz.weight),
+            (layer.attn.wz.bias, reference_layer.attn.wz.bias),
+            (layer.attn.wv.weight, reference_layer.attn.wv.weight),
+            (layer.attn.wv.bias, reference_layer.attn.wv.bias),
+            (layer.attn.wr.weight, reference_layer.attn.wr.weight),
+            (layer.attn.wr.bias, reference_layer.attn.wr.bias),
+            (layer.attn.wh1.weight, reference_layer.attn.wh1.weight),
+            (layer.attn.wh1.bias, reference_layer.attn.wh1.bias),
+            (layer.attn.wh2.weight, reference_layer.attn.wh2.weight),
+            (layer.ffn.fc1.weight, reference_layer.ffn.fc1.weight),
+            (layer.ffn.fc2.weight, reference_layer.ffn.fc2.weight),
+            (layer.ffn.fc3.weight, reference_layer.ffn.fc3.weight),
+        ]
+        for compact, full in ordinary_pairs:
+            assert compact is not None and full is not None
+            assert compact.dtype == jnp.bfloat16
+            np.testing.assert_array_equal(
+                np.asarray(compact), np.asarray(full.astype(jnp.bfloat16))
+            )
+        assert audit_sensitive_param_dtypes(model) == {}
 
 
 class TestComplexEMAMask:

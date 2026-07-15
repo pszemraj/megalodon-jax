@@ -45,6 +45,7 @@ NORMALIZATION_STORAGE = "plus_one"
 BIAS_SCHEMA = "upstream"
 INITIALIZER_SCHEMA = "split-boundary-internal-v1"
 DTYPE_POLICY = "fp32-params-fp32-or-bf16-compute"
+BF16_DTYPE_POLICY = "bf16-ordinary-params-fp32-sensitive"
 _DTYPE_FIELDS = (
     "param_dtype",
     "compute_dtype",
@@ -52,6 +53,20 @@ _DTYPE_FIELDS = (
     "attention_softmax_dtype",
     "loss_softmax_dtype",
 )
+
+
+def _dtype_policy(config: MegalodonConfig) -> str:
+    """Return the checkpoint policy matching ordinary parameter storage.
+
+    :param MegalodonConfig config: Configuration whose parameter dtype selects the policy.
+    :raises ValueError: If the configuration uses an unsupported parameter dtype.
+    :return str: Stable checkpoint metadata value.
+    """
+    if config.param_dtype == jnp.float32:
+        return DTYPE_POLICY
+    if config.param_dtype == jnp.bfloat16:
+        return BF16_DTYPE_POLICY
+    raise ValueError(f"unsupported checkpoint param_dtype: {config.param_dtype}")
 
 
 def _config_dict(config: MegalodonConfig) -> dict[str, Any]:
@@ -437,9 +452,9 @@ def _read_model_file(path: Path) -> tuple[dict[str, Array], dict[str, str]]:
         raise ValueError("checkpoint projection-bias schema is incompatible")
     if metadata["initializer_schema"] != INITIALIZER_SCHEMA:
         raise ValueError("checkpoint initializer schema is incompatible")
-    if metadata["dtype_policy"] != DTYPE_POLICY:
-        raise ValueError("checkpoint dtype policy is incompatible")
     checkpoint_config = _config_from_json(metadata["config_json"])
+    if metadata["dtype_policy"] != _dtype_policy(checkpoint_config):
+        raise ValueError("checkpoint dtype policy is incompatible")
     if config_fingerprint(checkpoint_config) != metadata["config_fingerprint"]:
         raise ValueError("checkpoint config fingerprint is invalid")
     expected_tying = "tied" if checkpoint_config.share_emb else "untied"
@@ -521,7 +536,7 @@ def save_checkpoint(model: MegalodonForCausalLM, path: str | Path) -> None:
         "bias_schema": BIAS_SCHEMA,
         "initializer_schema": INITIALIZER_SCHEMA,
         "tying": "tied" if model.tied else "untied",
-        "dtype_policy": DTYPE_POLICY,
+        "dtype_policy": _dtype_policy(model.config),
     }
     _save_atomic_safetensors(
         destination,

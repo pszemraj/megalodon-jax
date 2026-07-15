@@ -68,7 +68,9 @@ class MegalodonConfig:
     # (10-60x slower on GPU, O(1) extra memory). Only affects segment_ids runs.
     use_associative_segment_scan: bool = True
     output_size: int = -1  # LM head width; -1 resolves to vocab_size
-    param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
+    # Storage dtype for ordinary embedding/projection parameters. Precision-sensitive
+    # normalization, CEMA, and affine parameters remain FP32.
+    param_dtype: jnp.dtype = jnp.float32
     compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations
     accum_dtype: jnp.dtype = jnp.float32  # Accumulation dtype for GEMM/reductions
     attention_softmax_dtype: jnp.dtype = jnp.float32
@@ -193,8 +195,8 @@ class MegalodonConfig:
                 raise ValueError(f"{name} must be a floating dtype, got {dtype}")
             if dtype == jnp.float16:
                 raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
-        if self.param_dtype != jnp.float32:
-            raise ValueError("param_dtype must be float32")
+        if self.param_dtype not in (jnp.float32, jnp.bfloat16):
+            raise ValueError("param_dtype must be float32 or bfloat16")
         if self.compute_dtype not in (jnp.float32, jnp.bfloat16):
             raise ValueError("compute_dtype must be float32 or bfloat16")
         if self.accum_dtype != jnp.float32:
