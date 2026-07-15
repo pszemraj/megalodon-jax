@@ -751,7 +751,14 @@ class ChunkedAttention(eqx.Module):
             carry: tuple[Array, Array, Array, Array],
             inputs: tuple[Array, Array, Array],
         ) -> tuple[tuple[Array, Array, Array, Array], Array]:
-            """Process one token and advance the ring-buffer state."""
+            """Process one token and advance the ring-buffer state.
+
+            :param tuple[Array, Array, Array, Array] carry: Cached keys, cached values,
+                absolute position, and dropout RNG state.
+            :param tuple[Array, Array, Array] inputs: Query, key, and value slices for one token.
+            :return tuple[tuple[Array, Array, Array, Array], Array]: Updated ring-buffer carry
+                and the token's attention output.
+            """
             current_k, current_v, position, current_rng = carry
             q_t, k_t, v_t = inputs
             rope_position = (
