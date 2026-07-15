@@ -18,6 +18,7 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
+from megalodon_jax.ops import dot_precision
 from megalodon_jax.types import AttentionCache
 from tests.reference.cache import cache_partition_errors
 
@@ -170,7 +171,7 @@ class TestAttentionPrimitives:
         assert bool(jnp.any(jnp.isnan(corrupted)))
 
     def test_single_chunk_preserves_bf16_dtype(self, random_seed: int) -> None:
-        """Test that attention_single_chunk preserves bf16 dtype (no forced fp32).
+        """Test that attention_single_chunk preserves BF16 compute boundaries.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -188,6 +189,35 @@ class TestAttentionPrimitives:
 
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
+
+    def test_fp32_softmax_returns_probabilities_to_bf16_before_values(
+        self, random_seed: int
+    ) -> None:
+        """FP32 softmax probabilities are BF16 operands for the value contraction."""
+        key = jax.random.PRNGKey(random_seed)
+        q_key, k_key, v_key = jax.random.split(key, 3)
+        q = jax.random.normal(q_key, (1, 8, 2, 8), dtype=jnp.bfloat16)
+        k = jax.random.normal(k_key, (1, 8, 2, 8), dtype=jnp.bfloat16)
+        v = jax.random.normal(v_key, (1, 8, 2, 16), dtype=jnp.bfloat16)
+
+        actual = attention_single_chunk(q, k, v, causal=False)
+        scores = jnp.einsum(
+            "bqhd,bkhd->bhqk",
+            q,
+            k,
+            precision=dot_precision(q.dtype),
+            preferred_element_type=jnp.float32,
+        )
+        probabilities = jax.nn.softmax(scores, axis=-1).astype(jnp.bfloat16)
+        expected = jnp.einsum(
+            "bhqk,bkhd->bqhd",
+            probabilities,
+            v,
+            precision=dot_precision(q.dtype),
+            preferred_element_type=jnp.float32,
+        ).astype(jnp.bfloat16)
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
     def test_post_softmax_and_dropkey_semantics(self) -> None:
         """The two released attention-dropout placements remain explicit."""

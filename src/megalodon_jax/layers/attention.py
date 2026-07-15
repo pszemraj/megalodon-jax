@@ -182,6 +182,11 @@ def attention_single_chunk(
         has_valid_edge = jnp.any(valid_edges, axis=-1, keepdims=True)
         attn_weights = jnp.where(has_valid_edge, attn_weights, 0.0)
 
+    # Match the released implementation's mixed-precision boundary: evaluate
+    # softmax in its configured dtype, then return probabilities to the Q/K/V
+    # compute dtype before dropout and the value contraction.
+    attn_weights = attn_weights.astype(q.dtype)
+
     # Dropout if not deterministic
     if not deterministic and dropout_rate > 0.0 and dropout_mode == "post_softmax":
         attn_weights = inverted_dropout(attn_weights, dropout_rate, key)

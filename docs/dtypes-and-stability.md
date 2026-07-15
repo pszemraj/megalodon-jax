@@ -48,11 +48,12 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 - CEMA coefficients and state are FP32/complex64.
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
 - FP32 matrix contractions request JAX's per-operation `HIGHEST` precision, so NVIDIA GPUs do not silently substitute TensorFloat-32 products. BF16 contractions retain BF16 inputs with FP32 accumulation.
+- Attention scores and softmax are FP32 by default. The resulting probabilities return to `compute_dtype` before dropout and the value contraction, matching the released mixed-precision boundary.
 - KV cache tensors follow `compute_dtype`; norm state remains FP32 and EMA state remains complex64.
 - Returned logits are always FP32, matching the original released model.
 - Parameter gradients have the FP32 storage dtype even under BF16 compute.
 
-The two softmax fields are deliberately independent. Changing `attention_softmax_dtype` does not alter loss math, and changing `loss_softmax_dtype` does not alter attention. FP32 is recommended for both. BF16 attention softmax is an experimental JAX tradeoff, not released-source parity.
+The two softmax fields are deliberately independent. Changing `attention_softmax_dtype` does not alter loss math, and changing `loss_softmax_dtype` does not alter attention. FP32 is recommended for both. BF16 attention softmax is an experimental JAX tradeoff, not released-source parity; its probabilities still return to `compute_dtype` before the value contraction.
 
 ## Do not cast the model tree
 
