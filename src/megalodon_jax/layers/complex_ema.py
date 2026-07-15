@@ -171,9 +171,10 @@ class ComplexEMA(eqx.Module):
         boundaries in packed sequences. Composition of affine maps is
         associative, so the full trajectory is computed in log depth.
 
-        Materializes (L, B, D, N) complex64 tensors for A and b; for
-        memory-constrained cases use the sequential fallback
-        (``_forward_sequential`` with ``segment_ids``).
+        Materializes (L, B, D, N) complex64 tensors for A and b. This is the
+        production packed-training path; the sequential implementation is a
+        fallback and correctness cross-check whose autodiff memory must be
+        measured separately.
 
         :param Float[Array, "batch dim seq"] x: Input tensor (masked positions pre-zeroed).
         :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs (0 = padding).
@@ -450,7 +451,8 @@ class ComplexEMA(eqx.Module):
             (0 = padding) for packed-sequence state resets. Training-only:
             incompatible with h_init.
         :param bool use_associative_segment_scan: Use the parallel associative scan for
-            the segmented path; False selects the sequential low-memory fallback.
+            the segmented path; False selects the sequential fallback. The latter has a
+            compact forward carry but is not guaranteed to reduce compiled backward memory.
         :return tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]: Output
             and optional final state; with segment_ids the state is anchored at
             each row's last non-padding token so trailing padding does not

@@ -2,6 +2,8 @@
 
 Conversion targets the exact released Megalodon PyTorch keyspace, not a Hugging Face port or an installed package with a similar name. A local upstream checkout is used to audit that mapping but is not required to load a checkpoint. Torch is optional at runtime; install `megalodon-jax[convert]` when conversion is needed.
 
+Conversion parity, intentional JAX extensions, and historical distributed-runtime details are separate concerns. Their normative boundary is defined in [Upstream parity and production contracts](upstream-parity-contract.md).
+
 ## Native JAX checkpoints
 
 Use the versioned SafeTensors format for JAX training and inference:

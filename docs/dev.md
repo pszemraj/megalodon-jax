@@ -52,7 +52,9 @@ The verifier writes explicit skipped results and exits nonzero when an executed 
 
 `benchmarks/benchmark_model_paths.py` measures synchronized production inference and training paths in isolated worker processes. Compilation is reported separately from runtime, and the output records repository revisions, configuration, environment, correctness checks, median, p90, and memory data.
 
-The default training matrix enables gradient checkpointing and covers batches 1/2/4, lengths 2,048/4,096, forward and forward-backward execution, and plain, all-valid-mask, and packed inputs.
+The benchmark evidence rules implement the normative [upstream parity and production contracts](upstream-parity-contract.md), including the requirement that packed CEMA be both isolated and useful at downstream training shapes.
+
+The default training matrix enables gradient checkpointing and covers batches 1/2/4, lengths 2,048/4,096, forward and forward-backward execution, and plain, all-valid-mask, and packed inputs. Its canonical model is deliberately reduced and stable for cross-revision comparison: model dimension 1024, 12 layers, one attention head, vocabulary 16,000, and tied output. “Target” in this matrix refers only to requested batch and sequence dimensions; it is not the paper-7B topology and is not evidence of single-device 7B feasibility.
 
 The cross-revision default uses tied embedding/output weights because historical `main` inferred tying for vocabulary-sized outputs. Measure the current untied production topology separately with `--config-json '{"share_emb": false}'`. Topology-sensitive cases that cannot match the requested topology are recorded as `completed_noncomparable` and excluded from cross-revision timing ratios.
 
@@ -168,6 +170,31 @@ Remove the temporary worktree after preserving the reports:
 conda run --name mega-jax git worktree remove /tmp/megalodon-jax-baseline
 ```
 
+### Packed CEMA gate
+
 Use `benchmarks/benchmark_cema_reset.py` for the isolated FFT, associative packed, and sequential CEMA paths. Benchmark representative sequence shapes and masks: an all-valid `attention_mask` intentionally exercises the general masked path, while `attention_mask=None` selects the unmasked path described in [Long-context streaming](long-context-streaming.md#padding-and-generation).
+
+For a production-path change, run full forward/backward at the downstream envelope of `D=1024, L=2048` with at least `B=8, N=16` and `B=4, N=32`, then run the canonical full-model packed matrix. Record synchronized latency, compile time, compiler argument/output/alias/temporary bytes, peak device memory when available, and correctness/finiteness. Measure gradients with respect to both the CEMA parameters and input; a forward-only or input-gradient-only result can hide training costs.
+
+```bash
+conda run --name mega-jax python benchmarks/benchmark_cema_reset.py --dim 1024 --ndim 16 --lengths 2048 --batches 8 --dtype bfloat16
+conda run --name mega-jax python benchmarks/benchmark_cema_reset.py --dim 1024 --ndim 32 --lengths 2048 --batches 4 --dtype bfloat16
+conda run --name mega-jax python benchmarks/benchmark_model_paths.py --repo current=. --suite training --training-operations forward_backward --training-modes packed --training-lengths 2048,4096 --training-batches 1,2,4 --output local-scratch/model-paths-packed.json
+```
+
+The associative scan intentionally remains the default because it is the useful-throughput packed path on the representative downstream workload. The sequential implementation is a fallback and a correctness cross-check. Its compact forward recurrence does not guarantee compact autodiff temporaries, so any memory claim must include the compiled forward/backward analysis. A proposed blockwise or hierarchical replacement must demonstrate an end-to-end improvement on this gate rather than relying only on the size of one conceptual tensor.
+
+For paper-scale component evidence, additionally test `D=4096, N=16, L=4096` at the relevant local shard batch. Report the sharding policy and do not present a single-layer result as proof that the full paper-7B model, gradients, optimizer state, and compiler workspace fit on one device.
+
+#### Current decision evidence
+
+The retained default was revalidated on 2026-07-15 with JAX 0.10.2 on an RTX 5090. These numbers are a decision record, not portable performance thresholds; rerun the commands above after compiler, hardware, sharding, or model changes.
+
+| Isolated BF16-input CEMA shape | Associative forward/backward | Sequential forward/backward | Associative compiler temporary | Sequential compiler temporary |
+|---|---:|---:|---:|---:|
+| `B=8, D=1024, N=16, L=2048` | 31.40 ms | 45.68 ms | 5,302 MB | 4,901 MB |
+| `B=4, D=1024, N=32, L=2048` | 15.50 ms | 41.34 ms | 3,944 MB | 4,733 MB |
+
+Both isolated runs differentiated with respect to the CEMA parameters and input and produced finite values and gradients. The canonical 171,475,968-parameter model also passed packed `B=4, L=2048` forward/backward with gradient checkpointing, BF16 compute, FP32 parameter storage, finite gradients for every parameter, and the packed-versus-independent loss reference. Its synchronized single-iteration runtime was 541.49 ms, compiler-reported peak was 3.38 GB, and measured peak device bytes in use were 3.46 GB.
 
 Benchmark JSON records the installed JAX CUDA plugin/PJRT and CUDA library wheels, NVIDIA driver and `nvidia-smi` output, compiler-affecting paths and environment variables, and `jax.print_environment_info()`. Add `--profile-dir PATH` to capture one extra synchronized iteration per case as an XProf trace without contaminating timing samples; select a narrow operation and shape matrix when profiling.

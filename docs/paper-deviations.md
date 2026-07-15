@@ -1,6 +1,6 @@
 # Paper, released source, and intentional JAX differences
 
-Paper theory, released checkpoint semantics, and intentional JAX extensions are treated as separate compatibility targets.
+Paper theory, released checkpoint semantics, and intentional JAX extensions are treated as separate compatibility targets. [Upstream parity and production contracts](upstream-parity-contract.md) defines the normative boundary between them.
 
 ## Released-source compatibility choices
 
@@ -17,7 +17,7 @@ Paper theory, released checkpoint semantics, and intentional JAX extensions are 
 ## Intentional JAX extensions
 
 - **Pure JAX/XLA execution.** The original uses custom CUDA kernels. JAX provides FFT, scan, and manual attention implementations. The fused extension is authoritative source evidence but is not a build or runtime prerequisite.
-- **Packed training isolation.** The extension and its complete contract are described in [Long-context streaming](long-context-streaming.md#packed-sequence-training).
+- **Packed training isolation.** Packed execution must isolate every unrelated contiguous document run and remain practically trainable; a correctness-only slow path is not sufficient. The user-facing semantics are described in [Long-context streaming](long-context-streaming.md#packed-sequence-training), and the production/performance contract is normative in [Upstream parity and production contracts](upstream-parity-contract.md#packed-training-is-a-required-production-capability).
 - **Sliding attention.** The optional sliding mode is described in [Long-context streaming](long-context-streaming.md#optional-sliding-kv-window).
 - **Dropout mode selection.** `attention_dropout_mode="post_softmax"` provides released unfused behavior; `"dropkey"` provides the pre-softmax compatibility option. Both require explicit PRNG keys in non-deterministic execution.
 - **Versioned native persistence.** Model checkpoints record the complete configuration; cache files bind to its fingerprint. Both SafeTensors formats carry versioned manifests and fail closed. See [JAX and PyTorch interoperability](jax-torch.md).

@@ -158,7 +158,7 @@ See [Packed-sequence training](docs/long-context-streaming.md#packed-sequence-tr
 
 ## Documentation
 
-The [documentation index](docs/README.md) covers streaming and packed execution, precision, ComplexEMA, checkpoint interoperability, paper/source differences, tests, and benchmarks.
+The [documentation index](docs/README.md) covers the normative upstream-parity and production contracts, streaming and packed execution, precision, ComplexEMA, checkpoint interoperability, paper/source differences, tests, and benchmarks.
 
 ### Source layout
 

@@ -2,6 +2,8 @@
 
 Megalodon JAX supports FP32 and BF16 compute. Ordinary embedding and projection parameters may use FP32 or BF16 storage, while precision-sensitive parameters and accumulation remain FP32. Float16 is intentionally unsupported because the EMA, FFT, normalization, and long-context state paths are not reliable in that range.
 
+These are intentional JAX policies, not a promise to reproduce the released trainer's FairScale/FSDP1 storage mechanics. The normative distinction between released-model parity and supported precision policy is in [Upstream parity and production contracts](upstream-parity-contract.md#precision-policies).
+
 ## Supported policies
 
 `MegalodonConfig` separates the numerical roles explicitly:

@@ -2,6 +2,8 @@
 
 `ComplexEMA` in [`complex_ema.py`](../src/megalodon_jax/layers/complex_ema.py) provides FFT, recurrent, and reset-aware execution paths with the same released coefficient semantics.
 
+Packed CEMA isolation and useful accelerator throughput are required production behavior. The normative boundary and evidence gates are defined in [Upstream parity and production contracts](upstream-parity-contract.md#packed-training-is-a-required-production-capability).
+
 ## Released behavior
 
 - The original CUDA reference uses FFT-based convolution when no streaming state is required.
@@ -32,9 +34,9 @@ If a boolean `mask` is provided, masked positions are zeroed before the recurren
 
 ## Segmented path
 
-The default packed path applies `jax.lax.associative_scan` to complex affine pairs `(A, b)`, with `A = 0` at every boundary. It materializes two `(length, batch, model_dim, cema_ndim)` complex64 tensors and favors GPU throughput. Set `MegalodonConfig(use_associative_segment_scan=False)` to use the O(1)-extra-memory sequential fallback when that allocation is too large.
+The default packed path applies `jax.lax.associative_scan` to complex affine pairs `(A, b)`, with `A = 0` at every boundary. It materializes two `(length, batch, model_dim, cema_ndim)` complex64 operands and is the production throughput path. Set `MegalodonConfig(use_associative_segment_scan=False)` to use the sequential fallback when the associative allocation is unsuitable.
 
-The sequential fallback is substantially slower on GPU, so choose it from measured memory constraints rather than as a general default. [`benchmark_cema_reset.py`](../benchmarks/benchmark_cema_reset.py) isolates the FFT, associative, and sequential paths; the invocation and evidence requirements are in [Development](dev.md#performance-benchmarks).
+The sequential path has a compact forward carry, but automatic differentiation can still produce sequence-scaled compiler temporaries; it must not be described as an O(1)-memory training solution without compiled backward measurements. It is generally slower on GPU and does not by itself satisfy the efficient packed-training contract. Choose it from measured end-to-end constraints rather than as a general default. [`benchmark_cema_reset.py`](../benchmarks/benchmark_cema_reset.py) isolates the FFT, associative, and sequential paths; the invocation and evidence requirements are in [Development](dev.md#packed-cema-gate).
 
 ## Stability
 
@@ -45,4 +47,4 @@ The sequential fallback is substantially slower on GPU, so choose it from measur
 
 ## Performance
 
-Sequential continuation is slower than FFT convolution in pure JAX. Training and pristine prompt prefill use FFT outputs; only continuation from nonzero history uses sequential outputs. Packed execution adds reset semantics and should be benchmarked at the intended batch, sequence, model, and CEMA dimensions because its associative-path memory scales with their product.
+Sequential continuation is slower than FFT convolution in pure JAX. Training and pristine prompt prefill use FFT outputs; only continuation from nonzero history uses sequential outputs. Packed execution adds reset semantics and must be benchmarked at the intended batch, sequence, model, and CEMA dimensions because its associative-path memory scales with their product. The supported downstream envelope and required measurements are part of the [packed CEMA gate](dev.md#packed-cema-gate); a reduced or forward-only microbenchmark is not sufficient evidence for a production training claim.

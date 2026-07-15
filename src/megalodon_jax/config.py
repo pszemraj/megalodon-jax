@@ -63,9 +63,10 @@ class MegalodonConfig:
     eos_token_id: int = 2
     init_mode: InitMode = "he"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
-    # Segmented CEMA path for packed sequences: parallel associative scan
-    # (fast, materializes (L, B, D, N) complex64 tensors) vs sequential scan
-    # (10-60x slower on GPU, O(1) extra memory). Only affects segment_ids runs.
+    # Segmented CEMA path for packed sequences. The associative scan is the
+    # production throughput path and materializes (L, B, D, N) complex64
+    # operands. The sequential fallback has a compact forward carry, but its
+    # autodiff temporaries must still be measured. Only affects segment_ids.
     use_associative_segment_scan: bool = True
     output_size: int = -1  # LM head width; -1 resolves to vocab_size
     # Storage dtype for ordinary embedding/projection parameters. Precision-sensitive

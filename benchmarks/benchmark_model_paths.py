@@ -21,7 +21,9 @@ or OOM from destroying the rest of a long benchmark. Workers import
 the current branch and historical ``main`` can be measured with the exact same
 driver and environment.
 
-The canonical cross-revision model uses tied embedding/output weights so its
+The canonical cross-revision model is a reduced, stable comparison topology,
+not a paper-7B feasibility test. It uses model dimension 1024, 12 layers, one
+attention head, vocabulary 16,000, and tied embedding/output weights so its
 parameter topology remains comparable with historical revisions that inferred
 tying from output shape. Pass ``--config-json '{"share_emb": false}'`` to
 measure the current untied production topology separately. Configuration
