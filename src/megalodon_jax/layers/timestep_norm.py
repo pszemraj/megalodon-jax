@@ -346,17 +346,25 @@ class TimestepNorm(eqx.Module):
             x_groups if valid is None else jnp.where(valid[..., None, None], x_groups, 0.0)
         )
         block_mean, block_var = _block_moments(moment_groups)
-        if valid is None:
+        if valid is None and state is None and self.prior_count == 0:
+            # The fresh, unmasked training path is safe to reduce as shifted
+            # moments because its first token supplies a nearby anchor. An
+            # incoming or learned prior may be arbitrarily far from a long
+            # continuation, so those paths use the cancellation-resistant
+            # associative moment merge below.
             cumulative_count, cumulative_mean, cumulative_var = _shifted_cumsum_prefix(
                 block_mean,
                 block_var,
                 initial,
             )
         else:
+            summary_valid = (
+                jnp.ones((batch_size, length), dtype=jnp.bool_) if valid is None else valid
+            )
             token_summary = _MomentSummary(
-                count=valid[..., None].astype(jnp.int32),
-                mean=jnp.where(valid[..., None], block_mean, 0.0),
-                m2=jnp.where(valid[..., None], block_var, 0.0),
+                count=summary_valid[..., None].astype(jnp.int32),
+                mean=jnp.where(summary_valid[..., None], block_mean, 0.0),
+                m2=jnp.where(summary_valid[..., None], block_var, 0.0),
             )
             if boundaries is None:
                 prefix = jax.lax.associative_scan(_merge_m2, token_summary, axis=1)

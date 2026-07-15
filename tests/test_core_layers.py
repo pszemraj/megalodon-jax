@@ -312,6 +312,32 @@ class TestTimestepNorm:
                 assert bool(jnp.all(jnp.isfinite(prefix_var)))
                 assert float(jnp.min(prefix_var)) >= 0.0
 
+    def test_unmasked_continuation_uses_stable_moment_merge(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Continuation history bypasses cancellation-prone cumsum moments."""
+        norm = TimestepNorm(8, 2)
+        state = NormState(
+            count=jnp.asarray([1], dtype=jnp.int32),
+            mean=jnp.zeros((1, 2), dtype=jnp.float32),
+            var=jnp.zeros((1, 2), dtype=jnp.float32),
+        )
+        values = jnp.full((1, 257, 8), 1e7, dtype=jnp.float32)
+
+        def fail_shifted_prefix(*args: object, **kwargs: object) -> None:
+            pytest.fail("continuations must use associative moment merging")
+
+        monkeypatch.setattr(
+            "megalodon_jax.layers.timestep_norm._shifted_cumsum_prefix",
+            fail_shifted_prefix,
+        )
+        output, result = norm(values, state=state)
+
+        assert bool(jnp.all(jnp.isfinite(output)))
+        assert bool(jnp.all(jnp.isfinite(result.var)))
+        assert float(jnp.min(result.var)) >= 0.0
+
     def test_masked_associative_path_remains_finite_at_large_offsets(self) -> None:
         """Masked Welford prefixes retain finite, nonnegative state and output."""
         norm = TimestepNorm(32, 4)
