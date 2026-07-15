@@ -10,6 +10,7 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 - JAX pytree caches for JIT-compatible streaming inference
 - Strict native SafeTensors checkpoints plus exact original-upstream PyTorch checkpoint conversion
 - Source-transcribed PyTorch/JAX forward, all-parameter gradient, and optimizer consistency gates without building the fused CUDA extension
+- Official released tokenizer bundle in [assets/tokenizer](assets/tokenizer), versioned in-tree for paper and released-repository reproducibility
 
 ## Installation
 
