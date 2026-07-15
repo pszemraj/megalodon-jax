@@ -1,4 +1,4 @@
-"""Independent cache-partition references used by regression and audit gates."""
+"""Cache-partition self-consistency helpers used by regression and audit gates."""
 
 from __future__ import annotations
 

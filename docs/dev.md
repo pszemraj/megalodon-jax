@@ -31,7 +31,7 @@ The `torch_ref` marker selects the [source-transcribed PyTorch consistency check
 conda run --name mega-jax pytest -m torch_ref
 ```
 
-CI runs the fast gate on Python 3.11 and 3.13 with the minimum supported JAX and Equinox versions. The full local suite remains the merge gate for GPU, slow compilation, and integration coverage.
+Hosted CI is intentionally limited to Ruff lint/format checks and the CPU fast gate on Python 3.11 and 3.13 with the minimum supported JAX and Equinox versions. It does not run the unmarked full suite, the complete `torch_ref` parity suite, original-upstream conversion round-trips, the source-backed modeling verifier, or the GPU benchmark matrix. A few `torch_ref` tests also belong to the fast subset, but their presence does not make CI a full parity run. Run the complete local suite and the relevant manual gates before merging modeling changes; the sections below give the source-verifier and GPU benchmark commands.
 
 ## Modeling verifier
 

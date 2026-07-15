@@ -34,6 +34,59 @@ model, report = load_partial_checkpoint(
 
 The report lists restored and freshly initialized leaves plus source/target configuration fingerprints and an `exact_config_match` flag. A selection containing an unknown or unavailable name raises; intentional cross-config partial restores remain possible but cannot hide their provenance.
 
+## Training-state resume
+
+Native v2 checkpoints intentionally contain only model state. Persist an Optax state beside the model checkpoint with Equinox leaf serialization, and give the optimizer artifact a small sidecar containing the same configuration fingerprint:
+
+```python
+import json
+from pathlib import Path
+
+import equinox as eqx
+import jax
+
+from megalodon_jax import load_checkpoint, save_checkpoint
+from megalodon_jax.checkpoint import config_fingerprint
+
+step_dir = Path("checkpoints/step-000100")
+step_dir.mkdir(parents=True, exist_ok=False)
+save_checkpoint(model, step_dir / "model.safetensors")
+eqx.tree_serialise_leaves(step_dir / "optimizer.eqx", opt_state)
+(step_dir / "training-state.json").write_text(
+    json.dumps(
+        {
+            "format_version": 1,
+            "step": 100,
+            "config_fingerprint": config_fingerprint(model.config),
+        }
+    )
+    + "\n",
+    encoding="utf-8",
+)
+```
+
+On restore, load the strict model checkpoint first, verify the sidecar fingerprint, reconstruct the identical optimizer and schedule, and initialize a template state from the restored model before deserializing:
+
+```python
+metadata = json.loads((step_dir / "training-state.json").read_text(encoding="utf-8"))
+restored_model = load_checkpoint(
+    step_dir / "model.safetensors",
+    key=jax.random.PRNGKey(1),
+)
+if metadata.get("format_version") != 1:
+    raise ValueError("unsupported training-state format")
+if metadata["config_fingerprint"] != config_fingerprint(restored_model.config):
+    raise ValueError("optimizer state belongs to a different model configuration")
+
+opt_state_template = optimizer.init(eqx.filter(restored_model, eqx.is_array))
+restored_opt_state = eqx.tree_deserialise_leaves(
+    step_dir / "optimizer.eqx",
+    opt_state_template,
+)
+```
+
+The template is the optimizer-state schema, so changing the optimizer transformation, schedule, parameter filtering, shape, or dtype invalidates the artifact. Record the exact optimizer and schedule configuration with the run metadata. Write each resume point into a fresh step directory and publish it only after the model, optimizer, and sidecar writes all succeed; never overwrite one member of an existing pair independently.
+
 ## Original upstream to JAX
 
 For a world-size-one released checkpoint:

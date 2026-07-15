@@ -104,6 +104,53 @@ flowchart TD
 
 `segment_ids` isolates contiguous documents across attention, CEMA, TimestepNorm, RoPE, gradients, and shifted loss pairs. Positive values identify real tokens and zero identifies padding. Raw IDs may be reused for non-adjacent documents because boundaries are defined by changes between neighboring IDs, not by global ID equality.
 
+A minimal one-row packing recipe is below. Documents must already be tokenized and include any desired BOS/EOS tokens; packing does not manufacture boundary tokens. A production bin-packer can choose document groups for each row, then apply the same metadata construction.
+
+```python
+import jax.numpy as jnp
+
+
+def pack_row(documents, *, row_length, pad_token_id):
+    tokens = []
+    segments = []
+    for segment_id, document in enumerate(documents, start=1):
+        document = list(document)
+        if not document:
+            continue
+        if len(tokens) + len(document) > row_length:
+            raise ValueError("documents do not fit in one packed row")
+        tokens.extend(document)
+        segments.extend([segment_id] * len(document))
+
+    padding = row_length - len(tokens)
+    input_ids = jnp.asarray(
+        [tokens + [pad_token_id] * padding],
+        dtype=jnp.int32,
+    )
+    segment_ids = jnp.asarray(
+        [segments + [0] * padding],
+        dtype=jnp.int32,
+    )
+    labels = input_ids
+    return input_ids, segment_ids, labels
+
+
+input_ids, segment_ids, labels = pack_row(
+    [[101, 17, 18, 102], [101, 29, 30, 31, 102]],
+    row_length=12,
+    pad_token_id=0,
+)
+attention_mask = segment_ids > 0
+loss = model.compute_loss(
+    input_ids,
+    labels,
+    attention_mask=attention_mask,
+    segment_ids=segment_ids,
+)
+```
+
+`labels = input_ids` is correct because `compute_loss` shifts labels internally and removes cross-segment target pairs. Segment zero removes padded targets independently of the numeric `pad_token_id`; the explicit attention mask also prevents padding from entering model state. Omit `position_ids` to get document-local RoPE positions automatically.
+
 - Packed metadata is training-only. `segment_ids` and `position_ids` are rejected whenever a cache is supplied or requested.
 - When `position_ids` is omitted, RoPE positions restart automatically at each contiguous document boundary.
 - Chunk boundaries re-anchor at each document, so a document beginning partway through a physical batch chunk has the same block-diagonal attention pattern as an independent run.

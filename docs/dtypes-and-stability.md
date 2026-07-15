@@ -58,7 +58,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 ## Fixed precision behavior
 
 - TimestepNorm state, running moments, RMSNorm statistics, and LayerNorm statistics are FP32.
-- TimestepNorm uses shifted FP32 first/second-moment prefixes for unmasked input and associative FP32 Welford prefixes for masked or packed input. The [paper/source differences](paper-deviations.md#released-source-compatibility-choices) describe the CUDA compensation-state divergence.
+- TimestepNorm uses shifted FP32 first/second-moment prefixes only for fresh unmasked input with no learned prior (`prior_count=0`). Masked, packed, learned-prior, and continuation inputs use associative FP32 moment merging. The [paper/source differences](paper-deviations.md#released-source-compatibility-choices) describe the CUDA compensation-state divergence.
 - TimestepNorm and cache position counters are int32 and guard against overflow; the released TimestepNorm count is int64, which is not enabled implicitly because JAX x64 is a global execution policy.
 - CEMA coefficients and state are FP32/complex64.
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
@@ -92,6 +92,8 @@ assert not audit_sensitive_param_dtypes(model)
 
 The model owns compute casting; token IDs remain `int32`, and optimizer state should be initialized from the model's mixed parameter tree. The example uses Optax, which is not a runtime dependency (`pip install optax`).
 
+Released upstream training applies one uniform AdamW decay to the entire trainable parameter tree, with no exclusions for embeddings, biases, normalization parameters, TimestepNorm priors, CEMA parameters, or per-head affine parameters. For upstream-faithful training, set `weight_decay=0.1` explicitly and do not pass an Optax mask. The [released plus-one normalization storage](paper-deviations.md#released-source-compatibility-choices) is load-bearing under this policy: decay moves a stored scale offset toward zero, which moves its effective scale toward one rather than zero.
+
 ```python
 import equinox as eqx
 import jax
@@ -108,7 +110,7 @@ config = MegalodonConfig(
     loss_softmax_dtype=jnp.float32,
 )
 model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
-optimizer = optax.adamw(learning_rate=1e-4)
+optimizer = optax.adamw(learning_rate=1e-4, weight_decay=0.1)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
 @eqx.filter_value_and_grad
@@ -120,6 +122,43 @@ def train_step(candidate, state, input_ids, labels, key):
     updates, state = optimizer.update(grads, state, candidate)
     return eqx.apply_updates(candidate, updates), state, loss
 ```
+
+For exact gradient accumulation across packed microbatches with different numbers of valid targets, differentiate each microbatch's summed loss, add its gradients, and divide the accumulated gradients by the total valid-target count before the optimizer update. Request both quantities from the model instead of averaging microbatch means:
+
+```python
+loss_sum, valid_count = model.compute_loss(
+    input_ids,
+    labels,
+    segment_ids=segment_ids,
+    reduction="sum",
+    return_valid_count=True,
+)
+```
+
+## Single-host data parallelism
+
+JAX named sharding can split only the leading batch axis while replicating the mixed-dtype model and optimizer state. Attached shardings are honored by the filtered JIT-compiled step, and the global mean in `compute_loss` reduces across the complete sharded batch. No explicit `pmean` is needed with this global-array form.
+
+```python
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+devices = np.asarray(jax.devices())
+if input_ids.shape[0] % devices.size:
+    raise ValueError("global batch size must be divisible by the number of devices")
+
+mesh = Mesh(devices, ("data",))
+replicated = NamedSharding(mesh, P())
+batch_sharded = NamedSharding(mesh, P("data"))
+
+model, opt_state = eqx.filter_shard((model, opt_state), replicated)
+input_ids, labels = eqx.filter_shard((input_ids, labels), batch_sharded)
+key = eqx.filter_shard(key, replicated)
+
+model, opt_state, loss = train_step(model, opt_state, input_ids, labels, key)
+```
+
+`eqx.filter_shard` applies the JAX sharding only to array leaves, leaves static Python metadata alone, and preserves every leaf's configured dtype. This example assumes one host and a batch whose leading dimension divides evenly over its local devices; multi-host input assembly also needs process-aware data loading.
 
 Compact BF16 storage is intentional pure-BF16 updating for ordinary parameters: their gradients and applied updates are quantized to BF16. An optimizer may retain some or all accumulator state in FP32, but that does not create an FP32 master copy of the parameters. Use `param_dtype=jnp.float32` with BF16 compute when FP32 master-parameter update fidelity is required.
 

@@ -345,7 +345,7 @@ class TestLayerNormStorage:
 
 
 class TestRotaryEmbeddingParity:
-    """Parity tests for RotaryEmbedding against PyTorch reference."""
+    """Parity tests for RotaryEmbedding against a NumPy oracle."""
 
     def test_adjacent_pair_oracle(self) -> None:
         """RoPE rotates adjacent coordinates as released upstream does."""
