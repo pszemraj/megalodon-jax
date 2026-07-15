@@ -155,7 +155,8 @@ model, opt_state = eqx.filter_shard((model, opt_state), replicated)
 input_ids, labels = eqx.filter_shard((input_ids, labels), batch_sharded)
 key = eqx.filter_shard(key, replicated)
 
-model, opt_state, loss = train_step(model, opt_state, input_ids, labels, key)
+compiled_train_step = eqx.filter_jit(train_step)
+model, opt_state, loss = compiled_train_step(model, opt_state, input_ids, labels, key)
 ```
 
 `eqx.filter_shard` applies the JAX sharding only to array leaves, leaves static Python metadata alone, and preserves every leaf's configured dtype. This example assumes one host and a batch whose leading dimension divides evenly over its local devices; multi-host input assembly also needs process-aware data loading.
