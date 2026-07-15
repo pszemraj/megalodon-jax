@@ -643,17 +643,31 @@ class TestTimestepNorm:
         with pytest.raises(ValueError, match="overflow"):
             norm(jnp.ones((1, 1, 4), dtype=jnp.float32))
 
-    @pytest.mark.parametrize("count", [-1, int(jnp.iinfo(jnp.int32).max)])
-    def test_continuation_count_rejects_negative_and_overflow(self, count: int) -> None:
-        """Malformed or exhausted continuation counts fail before prefix work."""
+    @pytest.mark.parametrize(
+        ("count", "mean", "var"),
+        [
+            pytest.param(-1, 0.0, 1.0, id="negative-count"),
+            pytest.param(int(jnp.iinfo(jnp.int32).max), 0.0, 1.0, id="count-overflow"),
+            pytest.param(0, float("nan"), 1.0, id="nonfinite-mean"),
+            pytest.param(0, 0.0, float("inf"), id="nonfinite-variance"),
+            pytest.param(0, 0.0, -1.0, id="negative-variance"),
+        ],
+    )
+    def test_continuation_state_rejects_invalid_values(
+        self,
+        count: int,
+        mean: float,
+        var: float,
+    ) -> None:
+        """Malformed or exhausted continuation state fails before prefix work."""
         norm = TimestepNorm(4, 2)
         state = NormState(
             count=jnp.asarray([count], dtype=jnp.int32),
-            mean=jnp.zeros((1, 2), dtype=jnp.float32),
-            var=jnp.ones((1, 2), dtype=jnp.float32),
+            mean=jnp.full((1, 2), mean, dtype=jnp.float32),
+            var=jnp.full((1, 2), var, dtype=jnp.float32),
         )
 
-        with pytest.raises(Exception, match="non-negative.*overflow"):
+        with pytest.raises(Exception, match="TimestepNorm state"):
             norm(jnp.ones((1, 1, 4), dtype=jnp.float32), state=state)
 
     def test_continuation_count_boundary_and_masked_identity(self) -> None:
