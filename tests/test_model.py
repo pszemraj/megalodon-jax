@@ -485,6 +485,8 @@ class TestMegalodonForCausalLM:
             model.compute_loss(input_ids, jnp.asarray([[1, 2]], dtype=jnp.int32))
         with pytest.raises(TypeError, match="labels must have integer dtype"):
             model.compute_loss(input_ids, input_ids.astype(jnp.float32))
+        with pytest.raises(ValueError, match="reduction must be"):
+            model.compute_loss(input_ids, input_ids, reduction="median")  # type: ignore[arg-type]
 
 
 # -----------------------------------------------------------------------------
@@ -583,6 +585,61 @@ class TestJIT:
 
 class TestGradients:
     """Tests for gradient computation and flow."""
+
+    @pytest.mark.fast
+    def test_checkpointed_loss_and_gradients_match_plain(self, random_seed: int) -> None:
+        """Gradient checkpointing preserves stochastic training loss and gradients."""
+        config = MegalodonConfig(
+            vocab_size=17,
+            model_dim=8,
+            num_layers=1,
+            num_heads=2,
+            z_dim=8,
+            value_dim=8,
+            ffn_hidden_dim=12,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=2,
+            dropout=0.1,
+            attention_dropout=0.1,
+            hidden_dropout=0.1,
+        )
+        model_key = jax.random.PRNGKey(random_seed)
+        plain = MegalodonForCausalLM(config, key=model_key)
+        checkpointed = MegalodonForCausalLM(
+            replace(config, use_checkpoint=True),
+            key=model_key,
+        )
+        tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], dtype=jnp.int32)
+        dropout_key = jax.random.PRNGKey(random_seed + 1)
+
+        def loss_fn(candidate: MegalodonForCausalLM) -> jax.Array:
+            return candidate.compute_loss(
+                tokens,
+                tokens,
+                deterministic=False,
+                key=dropout_key,
+            )
+
+        plain_loss, plain_grads = eqx.filter_value_and_grad(loss_fn)(plain)
+        checkpointed_loss, checkpointed_grads = eqx.filter_value_and_grad(loss_fn)(checkpointed)
+
+        np.testing.assert_allclose(checkpointed_loss, plain_loss, rtol=1e-6, atol=1e-6)
+        plain_leaves = [
+            leaf for leaf in jax.tree_util.tree_leaves(plain_grads) if eqx.is_inexact_array(leaf)
+        ]
+        checkpointed_leaves = [
+            leaf
+            for leaf in jax.tree_util.tree_leaves(checkpointed_grads)
+            if eqx.is_inexact_array(leaf)
+        ]
+        assert plain_leaves
+        for checkpointed_grad, plain_grad in zip(
+            checkpointed_leaves,
+            plain_leaves,
+            strict=True,
+        ):
+            np.testing.assert_allclose(checkpointed_grad, plain_grad, rtol=1e-6, atol=1e-6)
 
     def test_gradient_flow_all_params(self, random_seed: int) -> None:
         """Test that gradients flow to all trainable parameters.
@@ -2381,16 +2438,42 @@ class TestPackedMetadata:
             segment_ids=segment_ids,
             position_ids=position_ids,
         )
+        token_loss = model.compute_loss(
+            input_ids,
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+            reduction="none",
+        )
+        loss_sum, valid_count = model.compute_loss(
+            input_ids,
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+            position_ids=position_ids,
+            reduction="sum",
+            return_valid_count=True,
+        )
         loss_a = model.compute_loss(ids_a, ids_a)
         loss_b = model.compute_loss(ids_b, ids_b)
 
         # 5 valid shifted pairs inside doc A, 6 inside doc B; the boundary
         # pair and padding must be excluded automatically
-        expected = (5 * np.array(loss_a) + 6 * np.array(loss_b)) / 11
+        expected_sum = 5 * np.array(loss_a) + 6 * np.array(loss_b)
+        expected = expected_sum / 11
         np.testing.assert_allclose(
             np.array(loss_packed),
             expected,
             rtol=1e-4,
             atol=1e-4,
             err_msg="Packed loss should be the valid-pair-weighted mean of per-doc losses",
+        )
+        assert token_loss.shape == (1, 15)
+        assert int(valid_count) == 11
+        np.testing.assert_allclose(np.asarray(loss_sum), expected_sum, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(np.asarray(token_loss).sum(), loss_sum, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(
+            np.asarray(token_loss)[0, [5, 12, 13, 14]],
+            np.zeros(4, dtype=np.float32),
         )

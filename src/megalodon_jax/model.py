@@ -19,7 +19,7 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import equinox as eqx
 import jax
@@ -677,7 +677,9 @@ class MegalodonForCausalLM(eqx.Module):
         ignore_index: int = -100,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
-    ) -> Float[Array, ""]:
+        reduction: Literal["mean", "sum", "none"] = "mean",
+        return_valid_count: bool = False,
+    ) -> Float[Array, "..."] | tuple[Float[Array, "..."], Int[Array, ""]]:
         """Compute causal LM loss with label shifting.
 
         Computes cross-entropy loss for next-token prediction.
@@ -695,6 +697,11 @@ class MegalodonForCausalLM(eqx.Module):
         boundary and pairs targeting padding (segment id 0) are excluded
         automatically - callers do not need to pre-mask boundary labels.
 
+        ``reduction="none"`` returns the shifted per-token loss with excluded
+        positions set to zero. ``reduction="sum"`` is useful for exact gradient
+        accumulation across microbatches; set ``return_valid_count=True`` to
+        return the corresponding valid-token denominator alongside any reduction.
+
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional target-position
@@ -706,9 +713,13 @@ class MegalodonForCausalLM(eqx.Module):
         :param int ignore_index: Label value to ignore in loss computation.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
+        :param Literal["mean", "sum", "none"] reduction: Loss reduction.
+        :param bool return_valid_count: Whether to also return the number of valid targets.
         :raises TypeError: If labels do not have an integer dtype.
-        :raises ValueError: If labels do not match the input shape or dropout lacks a key.
-        :return Float[Array, ""]: Scalar cross-entropy loss.
+        :raises ValueError: If labels do not match the input shape, reduction is invalid,
+            or dropout lacks a key.
+        :return Float[Array, "..."] | tuple[Float[Array, "..."], Int[Array, ""]]:
+            Reduced or per-token cross-entropy, optionally paired with its valid-token count.
         """
         if labels.shape != input_ids.shape:
             raise ValueError(
@@ -717,6 +728,8 @@ class MegalodonForCausalLM(eqx.Module):
             )
         if not jnp.issubdtype(labels.dtype, jnp.integer):
             raise TypeError(f"labels must have integer dtype, got {labels.dtype}")
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"reduction must be 'mean', 'sum', or 'none', got {reduction!r}")
 
         logits, _ = self(
             input_ids,
@@ -733,11 +746,7 @@ class MegalodonForCausalLM(eqx.Module):
         shift_logits = logits[:, :-1, :]  # (B, L-1, V)
         shift_labels = labels[:, 1:]  # (B, L-1)
 
-        # Guard against empty sequences (seq=0 or seq=1 after shift)
-        # jnp.mean() on empty array returns NaN, which would poison training
         softmax_dtype = self.config.loss_softmax_dtype
-        if shift_labels.shape[1] == 0:
-            return jnp.zeros((), dtype=softmax_dtype)
 
         # Build valid mask: positions that contribute to loss
         # Excludes both ignore_index labels and attention-masked positions
@@ -778,13 +787,20 @@ class MegalodonForCausalLM(eqx.Module):
         seq_idx = jnp.arange(L)[None, :]
         target_log_probs = log_probs[batch_idx, seq_idx, safe_labels]
 
-        # Apply valid mask and compute mean over valid positions only
-        target_log_probs = jnp.where(
-            valid_mask, target_log_probs, jnp.zeros((), dtype=softmax_dtype)
-        )
+        token_loss = -jnp.where(valid_mask, target_log_probs, jnp.zeros((), dtype=softmax_dtype))
+        valid_count = valid_mask.sum()
+        if reduction == "none":
+            loss = token_loss
+        elif reduction == "sum":
+            loss = token_loss.sum()
+        else:
+            # Avoid division by zero: an empty target set has zero mean loss.
+            denominator = jnp.maximum(
+                valid_count.astype(softmax_dtype),
+                jnp.array(1.0, dtype=softmax_dtype),
+            )
+            loss = token_loss.sum() / denominator
 
-        num_valid = valid_mask.sum().astype(softmax_dtype)
-        # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=softmax_dtype))
-        loss = -target_log_probs.sum() / num_valid
+        if return_valid_count:
+            return loss, valid_count
         return loss
