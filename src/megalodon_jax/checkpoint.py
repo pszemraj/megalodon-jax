@@ -147,7 +147,7 @@ def _manifest(tensors: dict[str, Array]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _require_exact_keys(
+def require_exact_keys(
     actual: Collection[str],
     expected: Collection[str],
     *,
@@ -469,7 +469,7 @@ def _read_model_file(path: Path) -> tuple[dict[str, Array], dict[str, str]]:
     return tensors, metadata
 
 
-def _apply_parameters(
+def apply_model_state_dict(
     model: MegalodonForCausalLM,
     tensors: dict[str, Array],
     *,
@@ -488,7 +488,7 @@ def _apply_parameters(
     available = set(tensors)
     selected = expected if include is None else set(include)
     if include is None:
-        _require_exact_keys(available, expected, context="strict checkpoint key mismatch")
+        require_exact_keys(available, expected, context="strict checkpoint key mismatch")
     else:
         unknown = sorted(selected - expected)
         unavailable = sorted(selected - available)
@@ -562,7 +562,7 @@ def load_checkpoint(
     tensors, metadata = _read_model_file(Path(path))
     config = _config_from_json(metadata["config_json"])
     model = MegalodonForCausalLM(config, key=key)
-    model, _ = _apply_parameters(model, tensors)
+    model, _ = apply_model_state_dict(model, tensors)
     return model
 
 
@@ -585,7 +585,7 @@ def load_partial_checkpoint(
     """
     tensors, metadata = _read_model_file(Path(path))
     model = MegalodonForCausalLM(config, key=key)
-    model, report = _apply_parameters(model, tensors, include=include)
+    model, report = apply_model_state_dict(model, tensors, include=include)
     source_fingerprint = metadata["config_fingerprint"]
     target_fingerprint = config_fingerprint(config)
     report.update(
@@ -742,7 +742,7 @@ def load_inference_cache(
             expected_tensor_keys.update({f"{prefix}.ema.real", f"{prefix}.ema.imag"})
     if "final_norm" in present:
         expected_tensor_keys.update({"final_norm.count", "final_norm.mean", "final_norm.var"})
-    _require_exact_keys(
+    require_exact_keys(
         tensors,
         expected_tensor_keys,
         context="cache tensor keys disagree with presence metadata",

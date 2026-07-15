@@ -114,9 +114,22 @@ class MegalodonConfig:
             if isinstance(value, bool):
                 raise ValueError(f"{name} must be an integer, got {value!r}")
             try:
-                operator.index(value)
+                normalized = operator.index(value)
             except TypeError as error:
                 raise ValueError(f"{name} must be an integer, got {value!r}") from error
+            object.__setattr__(self, name, int(normalized))
+
+        float_fields = (
+            "norm_eps",
+            "rope_base",
+            "dropout",
+            "attention_dropout",
+            "hidden_dropout",
+        )
+        for name in float_fields:
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, float(value))
         if self.vocab_size <= 0:
             raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
         if self.output_size < -1 or self.output_size == 0:

@@ -24,11 +24,69 @@ import numpy as np
 import torch
 from jaxtyping import Array
 
-from megalodon_jax.checkpoint import _apply_parameters, _require_exact_keys
+from megalodon_jax.checkpoint import apply_model_state_dict, require_exact_keys
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
 
 StateDict = dict[str, torch.Tensor]
+
+
+def _upstream_state_dict_keys(model: MegalodonForCausalLM) -> frozenset[str]:
+    """Return the released-source keyspace without materializing tensors.
+
+    :param MegalodonForCausalLM model: Model whose topology defines optional parameters.
+    :raises ValueError: If an affine FFN norm is missing its required bias.
+    :return frozenset[str]: Exact world-size-one released-source parameter names.
+    """
+    keys = {
+        "embed.weight",
+        "rope.freqs",
+        "output.final_norm.prior_count",
+        "output.final_norm.prior_mean",
+        "output.final_norm.prior_logv",
+        "output.final_norm.weight",
+        "output.final_norm.bias",
+        "output.output.weight",
+    }
+    for index, layer in enumerate(model.model.layers):
+        attn = layer.attn
+        ap = f"layers.{index}.mega"
+        keys.update(
+            {
+                f"{ap}.timenorm.prior_count",
+                f"{ap}.timenorm.prior_mean",
+                f"{ap}.timenorm.prior_logv",
+                f"{ap}.timenorm.weight",
+                f"{ap}.timenorm.bias",
+                f"{ap}.cema.alpha",
+                f"{ap}.cema.delta",
+                f"{ap}.cema.theta",
+                f"{ap}.cema.gamma",
+                f"{ap}.cema.omega",
+                f"{ap}.gamma",
+                f"{ap}.beta",
+            }
+        )
+        if attn.rmsnorm.gamma is not None:
+            keys.add(f"{ap}.rmsnorm.weight")
+        for name in ("wz", "wv", "wr", "wh1", "wh2"):
+            projection = getattr(attn, name)
+            keys.add(f"{ap}.{name}.weight")
+            if projection.bias is not None:
+                keys.add(f"{ap}.{name}.bias")
+
+        ffn = layer.ffn
+        fp = f"layers.{index}.nffn"
+        if ffn.norm.weight is not None:
+            if ffn.norm.bias is None:
+                raise ValueError(f"{fp}.norm has weight but no required bias")
+            keys.update({f"{fp}.norm.weight", f"{fp}.norm.bias"})
+        for name in ("fc1", "fc2", "fc3"):
+            if getattr(ffn, name) is not None:
+                keys.add(f"{fp}.{name}.weight")
+        if ffn.alpha is not None:
+            keys.add(f"{fp}.alpha")
+    return frozenset(keys)
 
 
 def _torch_tensor(
@@ -232,9 +290,9 @@ def load_upstream_state_dict(
     :raises ValueError: If keys, tensor layouts, priors, or tied weights are incompatible.
     :return MegalodonForCausalLM: Model with converted upstream parameters.
     """
-    expected = set(export_upstream_state_dict(model))
+    expected = _upstream_state_dict_keys(model)
     actual = set(state_dict)
-    _require_exact_keys(actual, expected, context="strict original-upstream key mismatch")
+    require_exact_keys(actual, expected, context="strict original-upstream key mismatch")
 
     config = model.config
 
@@ -350,7 +408,7 @@ def load_upstream_state_dict(
     else:
         native["lm_head.weight"] = output_source.astype(config.param_dtype)
 
-    loaded, _ = _apply_parameters(model, native)
+    loaded, _ = apply_model_state_dict(model, native)
     return loaded
 
 

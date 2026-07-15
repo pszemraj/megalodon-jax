@@ -720,12 +720,15 @@ class TestConversion:
             np.testing.assert_array_equal(np.asarray(actual[name]), np.asarray(expected[name]))
 
     def test_native_roundtrip_normalizes_numpy_config_scalars(self, tmp_path: Path) -> None:
-        """Validated NumPy config scalars remain JSON-portable and reloadable."""
+        """NumPy config scalars become Python metadata before model construction."""
         config = replace(
             tiny_config(),
             vocab_size=np.int64(64),
             dropout=np.float32(0.1),
         )
+        assert type(config.vocab_size) is int
+        assert type(config.dropout) is float
+
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         path = tmp_path / "numpy-scalars.safetensors"
 
@@ -819,10 +822,15 @@ class TestConversion:
             )
 
     @pytest.mark.torch_ref
-    def test_original_upstream_roundtrip_and_keyspace(self) -> None:
+    @pytest.mark.parametrize("norm_affine", [True, False])
+    def test_original_upstream_roundtrip_and_keyspace(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        norm_affine: bool,
+    ) -> None:
         """Exact released keys round-trip without transposes or schema aliases."""
         pytest.importorskip("torch")
-        config = tiny_config()
+        config = tiny_config(norm_affine=norm_affine)
         model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
         state = export_upstream_state_dict(model)
 
@@ -835,6 +843,16 @@ class TestConversion:
         assert "model.embed.weight" not in state
         assert "layers.0.mega.wh2.bias" not in state
         assert "layers.0.nffn.fc1.bias" not in state
+        assert ("layers.0.mega.rmsnorm.weight" in state) is norm_affine
+        assert ("layers.0.nffn.norm.weight" in state) is norm_affine
+
+        def fail_export(*args: object, **kwargs: object) -> None:
+            pytest.fail("strict loading must enumerate keys without exporting tensors")
+
+        monkeypatch.setattr(
+            "megalodon_jax.convert.export_upstream_state_dict",
+            fail_export,
+        )
 
         loaded = load_upstream_state_dict(
             MegalodonForCausalLM(config, key=jax.random.PRNGKey(1)),
