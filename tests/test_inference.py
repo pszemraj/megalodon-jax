@@ -16,10 +16,12 @@ from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, validate_model_cache_ho
 from megalodon_jax.checkpoint import (
     BF16_DTYPE_POLICY,
     load_checkpoint,
+    load_generation_state,
     load_inference_cache,
     load_partial_checkpoint,
     model_state_dict,
     save_checkpoint,
+    save_generation_state,
     save_inference_cache,
 )
 from megalodon_jax.convert import (
@@ -32,7 +34,13 @@ from megalodon_jax.convert import (
     save_safetensors,
 )
 from megalodon_jax.inference import generate, index_cache, init_cache, sample_token
-from megalodon_jax.types import AttentionCache, LayerCache, ModelCache, NormState
+from megalodon_jax.types import (
+    AttentionCache,
+    GenerationState,
+    LayerCache,
+    ModelCache,
+    NormState,
+)
 from tests.factories import tiny_config
 
 
@@ -282,6 +290,223 @@ class TestSamplingAndGeneration:
         assert layer0 is not None and layer0.attn is not None
         assert int(layer0.attn.count) == prompt.shape[1] + max_new_tokens
 
+    @pytest.mark.parametrize(
+        ("attention_window", "temperature"),
+        [
+            pytest.param(None, 0.0, id="chunk-greedy"),
+            pytest.param(None, 0.8, id="chunk-sampled"),
+            pytest.param(3, 0.0, id="window-greedy"),
+            pytest.param(3, 0.8, id="window-sampled"),
+        ],
+    )
+    def test_generation_state_split_matches_one_shot_across_cache_boundaries(
+        self,
+        attention_window: int | None,
+        temperature: float,
+    ) -> None:
+        """N=1 state continuation preserves tokens, RNG, and final state."""
+        config = tiny_config(chunk_size=4, attention_window=attention_window)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        empty = jnp.empty((1, 0), dtype=jnp.int32)
+        initial_key = jax.random.PRNGKey(91)
+        sampling = {
+            "temperature": temperature,
+            "top_k": 12,
+            "top_p": 0.9,
+        }
+
+        expected, expected_state, expected_key = generate(
+            model,
+            prompt,
+            max_new_tokens=6,
+            key=initial_key,
+            return_state=True,
+            **sampling,
+        )
+        prefix, prefix_state, split_key = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            key=initial_key,
+            return_state=True,
+            **sampling,
+        )
+        assert isinstance(prefix_state, GenerationState)
+        suffix, actual_state, actual_key = generate(
+            model,
+            empty,
+            max_new_tokens=5,
+            key=split_key,
+            state=prefix_state,
+            return_state=True,
+            **sampling,
+        )
+        assert isinstance(expected_state, GenerationState)
+        assert isinstance(actual_state, GenerationState)
+
+        np.testing.assert_array_equal(
+            np.asarray(jnp.concatenate((prefix, suffix), axis=1)),
+            np.asarray(expected),
+        )
+        np.testing.assert_array_equal(np.asarray(actual_key), np.asarray(expected_key))
+        prefix_layer = prefix_state.cache.layer_caches[0]
+        actual_layer = actual_state.cache.layer_caches[0]
+        assert prefix_layer is not None and actual_layer is not None
+        assert int(prefix_layer.position) == prompt.shape[1] + 1
+        assert int(actual_layer.position) == prompt.shape[1] + 6
+        assert actual_state.eos_token_id == expected_state.eos_token_id
+        for expected_leaf, actual_leaf in zip(
+            jax.tree_util.tree_leaves(expected_state),
+            jax.tree_util.tree_leaves(actual_state),
+            strict=True,
+        ):
+            if jnp.issubdtype(expected_leaf.dtype, jnp.inexact):
+                np.testing.assert_allclose(
+                    np.asarray(actual_leaf),
+                    np.asarray(expected_leaf),
+                    rtol=2e-5,
+                    atol=2e-5,
+                )
+            else:
+                np.testing.assert_array_equal(
+                    np.asarray(actual_leaf),
+                    np.asarray(expected_leaf),
+                )
+
+    def test_generation_state_preserves_mixed_batch_eos(self) -> None:
+        """Finished rows remain synthetic EOS rows across a split call."""
+        config = tiny_config(chunk_size=4)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], dtype=jnp.int32)
+        first_tokens, _, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            temperature=0.0,
+        )
+        assert int(first_tokens[0, -1]) != int(first_tokens[1, -1])
+        eos_token_id = int(first_tokens[0, -1])
+
+        expected, expected_state, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=4,
+            temperature=0.0,
+            eos_token_id=eos_token_id,
+            return_state=True,
+        )
+        prefix, state, key = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            temperature=0.0,
+            eos_token_id=eos_token_id,
+            return_state=True,
+        )
+        assert isinstance(state, GenerationState)
+        np.testing.assert_array_equal(np.asarray(state.finished), np.asarray([True, False]))
+        assert state.eos_token_id == eos_token_id
+
+        suffix, actual_state, _ = generate(
+            model,
+            jnp.empty((2, 0), dtype=jnp.int32),
+            max_new_tokens=3,
+            key=key,
+            temperature=0.0,
+            state=state,
+            return_state=True,
+        )
+        assert isinstance(expected_state, GenerationState)
+        assert isinstance(actual_state, GenerationState)
+        assert actual_state.eos_token_id == expected_state.eos_token_id == eos_token_id
+        actual = jnp.concatenate((prefix, suffix), axis=1)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        np.testing.assert_array_equal(
+            np.asarray(suffix[0]),
+            np.full((3,), eos_token_id, dtype=np.int32),
+        )
+        for expected_leaf, actual_leaf in zip(
+            jax.tree_util.tree_leaves(expected_state),
+            jax.tree_util.tree_leaves(actual_state),
+            strict=True,
+        ):
+            if jnp.issubdtype(expected_leaf.dtype, jnp.inexact):
+                np.testing.assert_allclose(
+                    np.asarray(actual_leaf),
+                    np.asarray(expected_leaf),
+                    rtol=2e-5,
+                    atol=2e-5,
+                )
+            else:
+                np.testing.assert_array_equal(
+                    np.asarray(actual_leaf),
+                    np.asarray(expected_leaf),
+                )
+
+    def test_generation_state_rejects_ambiguous_or_incompatible_inputs(self) -> None:
+        """State continuation validates ownership, batch, vocabulary, and EOS eagerly."""
+        config = tiny_config()
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        _, state, _ = generate(
+            model,
+            prompt,
+            max_new_tokens=1,
+            temperature=0.0,
+            eos_token_id=7,
+            return_state=True,
+        )
+        assert isinstance(state, GenerationState)
+        empty = jnp.empty((1, 0), dtype=jnp.int32)
+
+        with pytest.raises(ValueError, match="cache and state are mutually exclusive"):
+            generate(
+                model,
+                empty,
+                1,
+                temperature=0.0,
+                cache=state.cache,
+                state=state,
+            )
+        with pytest.raises(ValueError, match="return_cache and return_state"):
+            generate(
+                model,
+                empty,
+                1,
+                temperature=0.0,
+                state=state,
+                return_cache=True,
+                return_state=True,
+            )
+        with pytest.raises(ValueError, match="requires an empty prompt_ids"):
+            generate(model, prompt, 1, temperature=0.0, state=state)
+        with pytest.raises(ValueError, match="batch size must match generation state"):
+            generate(
+                model,
+                jnp.empty((2, 0), dtype=jnp.int32),
+                1,
+                temperature=0.0,
+                state=state,
+            )
+        with pytest.raises(ValueError, match="next_logits must have shape"):
+            generate(
+                model,
+                empty,
+                1,
+                temperature=0.0,
+                state=replace(state, next_logits=state.next_logits[:, :-1]),
+            )
+        with pytest.raises(ValueError, match="eos_token_id must match"):
+            generate(
+                model,
+                empty,
+                1,
+                temperature=0.0,
+                eos_token_id=8,
+                state=state,
+            )
+
     @pytest.mark.parametrize("max_new_tokens", [1, 2])
     @pytest.mark.parametrize("return_cache", [False, True])
     def test_generate_canonicalizes_all_true_mask(
@@ -511,12 +736,54 @@ class TestSamplingAndGeneration:
             )
 
     @pytest.mark.parametrize(
-        ("attention_mask", "max_new_tokens", "return_cache", "with_cache"),
+        (
+            "attention_mask",
+            "max_new_tokens",
+            "return_cache",
+            "return_state",
+            "with_cache",
+        ),
         [
-            pytest.param([[False, False, True, True]], 2, False, False, id="left-multistep"),
-            pytest.param([[True, True, False, False]], 2, False, False, id="right-multistep"),
-            pytest.param([[False, True, True, True]], 1, True, False, id="return-cache"),
-            pytest.param([[False, True, True, True]], 1, False, True, id="existing-cache"),
+            pytest.param(
+                [[False, False, True, True]],
+                2,
+                False,
+                False,
+                False,
+                id="left-multistep",
+            ),
+            pytest.param(
+                [[True, True, False, False]],
+                2,
+                False,
+                False,
+                False,
+                id="right-multistep",
+            ),
+            pytest.param(
+                [[False, True, True, True]],
+                1,
+                True,
+                False,
+                False,
+                id="return-cache",
+            ),
+            pytest.param(
+                [[False, True, True, True]],
+                1,
+                False,
+                True,
+                False,
+                id="return-state",
+            ),
+            pytest.param(
+                [[False, True, True, True]],
+                1,
+                False,
+                False,
+                True,
+                id="existing-cache",
+            ),
         ],
     )
     def test_generate_padded_cache_modes_raise(
@@ -524,6 +791,7 @@ class TestSamplingAndGeneration:
         attention_mask: list[list[bool]],
         max_new_tokens: int,
         return_cache: bool,
+        return_state: bool,
         with_cache: bool,
     ) -> None:
         """Every cache-enabling mode rejects padded generation explicitly."""
@@ -541,6 +809,7 @@ class TestSamplingAndGeneration:
                 attention_mask=jnp.asarray(attention_mask),
                 cache=cache,
                 return_cache=return_cache,
+                return_state=return_state,
             )
 
 
@@ -978,6 +1247,113 @@ class TestConversion:
         with pytest.raises(ValueError, match="fingerprint"):
             load_inference_cache(path, incompatible)
 
+    @pytest.mark.fast
+    def test_generation_state_roundtrip_resumes_seeded_sampling(self, tmp_path: Path) -> None:
+        """Persisted logits/cache state and the explicit RNG key resume exactly."""
+        config = tiny_config(chunk_size=4, attention_window=3)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        initial_key = jax.random.PRNGKey(29)
+        sampling = {"temperature": 0.8, "top_k": 12, "top_p": 0.9}
+
+        expected, expected_state, expected_key = generate(
+            model,
+            prompt,
+            max_new_tokens=6,
+            key=initial_key,
+            return_state=True,
+            **sampling,
+        )
+        prefix, state, continuation_key = generate(
+            model,
+            prompt,
+            max_new_tokens=2,
+            key=initial_key,
+            return_state=True,
+            **sampling,
+        )
+        assert isinstance(state, GenerationState)
+        path = tmp_path / "generation-state.safetensors"
+        save_generation_state(state, path, config)
+        restored = load_generation_state(path, config)
+
+        assert restored.eos_token_id == state.eos_token_id
+        for expected_leaf, actual_leaf in zip(
+            jax.tree_util.tree_leaves(state),
+            jax.tree_util.tree_leaves(restored),
+            strict=True,
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(actual_leaf),
+                np.asarray(expected_leaf),
+            )
+
+        suffix, actual_state, actual_key = generate(
+            model,
+            jnp.empty((1, 0), dtype=jnp.int32),
+            max_new_tokens=4,
+            key=continuation_key,
+            state=restored,
+            return_state=True,
+            **sampling,
+        )
+        assert isinstance(expected_state, GenerationState)
+        assert isinstance(actual_state, GenerationState)
+        assert actual_state.eos_token_id == expected_state.eos_token_id
+        np.testing.assert_array_equal(
+            np.asarray(jnp.concatenate((prefix, suffix), axis=1)),
+            np.asarray(expected),
+        )
+        np.testing.assert_array_equal(np.asarray(actual_key), np.asarray(expected_key))
+        for expected_leaf, actual_leaf in zip(
+            jax.tree_util.tree_leaves(expected_state),
+            jax.tree_util.tree_leaves(actual_state),
+            strict=True,
+        ):
+            if jnp.issubdtype(expected_leaf.dtype, jnp.inexact):
+                np.testing.assert_allclose(
+                    np.asarray(actual_leaf),
+                    np.asarray(expected_leaf),
+                    rtol=2e-5,
+                    atol=2e-5,
+                )
+            else:
+                np.testing.assert_array_equal(
+                    np.asarray(actual_leaf),
+                    np.asarray(expected_leaf),
+                )
+
+        with pytest.raises(ValueError, match="incompatible or legacy inference cache"):
+            load_inference_cache(path, config)
+        with pytest.raises(ValueError, match="fingerprint"):
+            load_generation_state(path, replace(config, attention_window=2))
+
+        from safetensors import safe_open
+        from safetensors.flax import load_file, save_file
+
+        import megalodon_jax.checkpoint as checkpoint_module
+
+        tensors = load_file(str(path))
+        with safe_open(str(path), framework="flax") as handle:
+            metadata = dict(handle.metadata() or {})
+        malformed_payloads = {
+            "logits-shape": {
+                **tensors,
+                "generation.next_logits": tensors["generation.next_logits"][:, :-1],
+            },
+            "finished-dtype": {
+                **tensors,
+                "generation.finished": tensors["generation.finished"].astype(jnp.int32),
+            },
+        }
+        for name, malformed in malformed_payloads.items():
+            malformed_metadata = dict(metadata)
+            malformed_metadata["tensor_manifest_sha256"] = checkpoint_module._manifest(malformed)
+            malformed_path = tmp_path / f"generation-state-{name}.safetensors"
+            save_file(malformed, str(malformed_path), metadata=malformed_metadata)
+            with pytest.raises(ValueError, match="generation state tensor"):
+                load_generation_state(malformed_path, config)
+
     def test_save_rejects_partial_nonzero_cache(self, tmp_path: Path) -> None:
         """Persistence cannot legitimize a destructive partial continuation."""
         config = tiny_config()
@@ -1130,6 +1506,8 @@ class TestConversion:
             load_checkpoint(missing, key=jax.random.PRNGKey(0))
         with pytest.raises(FileNotFoundError):
             load_inference_cache(missing, tiny_config())
+        with pytest.raises(FileNotFoundError):
+            load_generation_state(missing, tiny_config())
 
     def test_ambiguous_legacy_apis_refuse(self, tmp_path: Path) -> None:
         """Historical schema-guessing entry points provide migration guidance."""

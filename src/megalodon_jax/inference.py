@@ -26,9 +26,16 @@ import jax.numpy as jnp
 import numpy as np
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.cache import validate_generation_state_host
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
-from megalodon_jax.types import AttentionCache, LayerCache, ModelCache, NormState
+from megalodon_jax.types import (
+    AttentionCache,
+    GenerationState,
+    LayerCache,
+    ModelCache,
+    NormState,
+)
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -396,13 +403,19 @@ def _generate_core(
     eos_token_id: int | None = None,
     attention_mask: Bool[Array, "batch prompt_len"] | None = None,
     cache: ModelCache | None = None,
+    state: GenerationState | None = None,
     return_cache: bool = False,
-) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
+    return_state: bool = False,
+) -> tuple[
+    Int[Array, "batch total_len"],
+    GenerationState | ModelCache | None,
+    PRNGKeyArray | None,
+]:
     """Autoregressive generation using a fixed-shape scan.
 
-    If return_cache is True, the returned cache includes the prompt and every
-    generated token. If sampling is enabled (temperature > 0), the returned
-    key is the next key to use for subsequent sampling calls.
+    A ``GenerationState`` resumes directly from its stored next-token logits;
+    its cache already includes every previously emitted token. If sampling is
+    enabled, the returned key is the next key for a subsequent call.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
@@ -414,10 +427,12 @@ def _generate_core(
     :param int | None bos_token_id: Optional BOS token ID.
     :param int | None eos_token_id: Optional EOS token ID.
     :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
-    :param ModelCache | None cache: Optional cache state.
-    :param bool return_cache: Whether to return cache.
+    :param ModelCache | None cache: Optional model-level prefix cache.
+    :param GenerationState | None state: Complete generation continuation state.
+    :param bool return_cache: Whether to return the final model-level cache.
+    :param bool return_state: Whether to return complete resumable generation state.
     :raises ValueError: If inputs are invalid or missing required RNG.
-    :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
+    :return tuple[Int[Array, "batch total_len"], GenerationState | ModelCache | None, PRNGKeyArray | None]: Output IDs, continuation artifact, and key.
     """
 
     if model.config.effective_output_size != model.config.vocab_size:
@@ -435,60 +450,77 @@ def _generate_core(
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
 
-    if prompt_len == 0:
-        if cache is not None:
+    if state is not None:
+        if prompt_len != 0:
+            raise ValueError("state continuation requires an empty prompt_ids sequence")
+        if B != state.next_logits.shape[0]:
             raise ValueError(
-                "empty-prompt continuation with a cache is unsupported; "
-                "provide the final context token or cached logits"
+                "prompt_ids batch size must match generation state, got "
+                f"{B} and {state.next_logits.shape[0]}"
             )
-        if bos_token_id is None:
-            bos_token_id = getattr(model.config, "bos_token_id", None)
-        if bos_token_id is None:
-            raise ValueError(
-                "prompt_ids is empty; provide bos_token_id or pass at least one token."
-            )
-        prompt_ids = jnp.full((B, 1), bos_token_id, dtype=prompt_ids.dtype)
-        # The synthetic BOS is valid and unpadded. Cached calls represent the
-        # all-valid case with no mask metadata.
-        attention_mask = None
-        prompt_len = 1
-
-    needs_cache = return_cache or max_new_tokens > 1
-
-    # Prefill
-    logits, cache = model(
-        prompt_ids,
-        attention_mask=attention_mask,
-        cache=cache,
-        return_cache=needs_cache,
-        deterministic=True,
-    )
-
-    if attention_mask is not None:
-        mask = attention_mask.astype(jnp.bool_)
-        positions = jnp.arange(prompt_len, dtype=jnp.int32)
-        masked_positions = jnp.where(mask, positions, -1)
-        last_idx = masked_positions.max(axis=1)
-        has_empty = jnp.any(last_idx < 0)
-        last_idx = eqx.error_if(
-            last_idx,
-            has_empty,
-            "attention_mask must contain at least one True per batch element.",
-        )
-        gather_idx = jnp.broadcast_to(last_idx[:, None, None], (B, 1, logits.shape[-1]))
-        last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+        cache = state.cache
+        last_logits = state.next_logits
+        finished = state.finished
     else:
-        last_logits = logits[:, -1, :]
+        if prompt_len == 0 and cache is not None:
+            raise ValueError(
+                "empty-prompt continuation requires GenerationState; ModelCache does not "
+                "contain next-token logits"
+            )
+        if prompt_len == 0:
+            if bos_token_id is None:
+                bos_token_id = getattr(model.config, "bos_token_id", None)
+            if bos_token_id is None:
+                raise ValueError(
+                    "prompt_ids is empty; provide bos_token_id or pass at least one token."
+                )
+            prompt_ids = jnp.full((B, 1), bos_token_id, dtype=prompt_ids.dtype)
+            # The synthetic BOS is valid and unpadded. Cached calls represent
+            # the all-valid case with no mask metadata.
+            attention_mask = None
+            prompt_len = 1
+
+        needs_cache = return_cache or return_state or max_new_tokens > 1
+        logits, cache = model(
+            prompt_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+            return_cache=needs_cache,
+            deterministic=True,
+        )
+
+        if attention_mask is not None:
+            mask = attention_mask.astype(jnp.bool_)
+            positions = jnp.arange(prompt_len, dtype=jnp.int32)
+            masked_positions = jnp.where(mask, positions, -1)
+            last_idx = masked_positions.max(axis=1)
+            has_empty = jnp.any(last_idx < 0)
+            last_idx = eqx.error_if(
+                last_idx,
+                has_empty,
+                "attention_mask must contain at least one True per batch element.",
+            )
+            gather_idx = jnp.broadcast_to(
+                last_idx[:, None, None],
+                (B, 1, logits.shape[-1]),
+            )
+            last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+        else:
+            last_logits = logits[:, -1, :]
+        finished = jnp.zeros((B,), dtype=jnp.bool_)
 
     if needs_rng:
         key, subkey = jax.random.split(key)
     else:
         subkey = None
     first_token = sample(last_logits, subkey)
-
-    finished = jnp.zeros((B,), dtype=jnp.bool_)
     if eos_token_id is not None:
-        finished = first_token == eos_token_id
+        finished = finished | (first_token == eos_token_id)
+        first_token = jnp.where(finished, eos_token_id, first_token)
+
+    needs_final_artifact = return_cache or return_state
+    if (max_new_tokens > 1 or needs_final_artifact) and cache is None:
+        raise RuntimeError("generation cache was not initialized")
 
     # Fixed-shape batching advances finished rows with synthetic EOS tokens. Attention uses
     # one scalar timeline for the whole batch, so the returned cache matches the rectangular
@@ -561,16 +593,19 @@ def _generate_core(
             return (new_cache, next_token, done), next_token
 
     if max_new_tokens == 1:
-        if return_cache:
-            _, cache = model(
+        final_cache = None
+        next_logits = None
+        if needs_final_artifact:
+            logits_step, final_cache = model(
                 first_token[:, None],
                 cache=cache,
                 return_cache=True,
                 deterministic=True,
             )
-        final_cache = cache if return_cache else None
+            next_logits = logits_step[:, 0, :]
         generated = first_token[:, None]
         final_key = key
+        final_finished = finished
     else:
         if needs_rng:
             init_carry = (cache, first_token, key, finished)
@@ -582,6 +617,7 @@ def _generate_core(
             )
             scan_cache = final_carry[0]
             final_key = final_carry[2]
+            final_finished = final_carry[3]
         else:
             init_carry = (cache, first_token, finished)
             final_carry, tokens_scan = jax.lax.scan(
@@ -592,21 +628,37 @@ def _generate_core(
             )
             scan_cache = final_carry[0]
             final_key = key
+            final_finished = final_carry[2]
 
         generated = jnp.concatenate([first_token[:, None], tokens_scan.T], axis=1)
-        if return_cache:
+        final_cache = None
+        next_logits = None
+        if needs_final_artifact:
             last_token = generated[:, -1]
-            _, final_cache = model(
+            logits_step, final_cache = model(
                 last_token[:, None],
                 cache=scan_cache,
                 return_cache=True,
                 deterministic=True,
             )
-        else:
-            final_cache = None
+            next_logits = logits_step[:, 0, :]
+
+    continuation: GenerationState | ModelCache | None
+    if return_state:
+        assert final_cache is not None and next_logits is not None
+        continuation = GenerationState(
+            cache=final_cache,
+            next_logits=jax.lax.stop_gradient(next_logits),
+            finished=final_finished,
+            eos_token_id=eos_token_id,
+        )
+    elif return_cache:
+        continuation = final_cache
+    else:
+        continuation = None
 
     result = jnp.concatenate([prompt_ids, generated], axis=1)
-    return result, final_cache, final_key
+    return result, continuation, final_key
 
 
 def generate(
@@ -622,9 +674,20 @@ def generate(
     eos_token_id: int | None = None,
     attention_mask: Bool[Array, "batch prompt_len"] | None = None,
     cache: ModelCache | None = None,
+    state: GenerationState | None = None,
     return_cache: bool = False,
-) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
+    return_state: bool = False,
+) -> tuple[
+    Int[Array, "batch total_len"],
+    GenerationState | ModelCache | None,
+    PRNGKeyArray | None,
+]:
     """Autoregressive generation with padding-aware constraints.
+
+    Use ``state`` with an empty ``prompt_ids`` array and ``return_state=True``
+    for exact split-call continuation. A raw ``ModelCache`` is accepted and
+    returned for model-forward compatibility, but it does not contain the
+    next-token logits or EOS status required to resume ``generate()``.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
@@ -636,13 +699,21 @@ def generate(
     :param int | None bos_token_id: Optional BOS token ID.
     :param int | None eos_token_id: Optional EOS token ID.
     :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
-    :param ModelCache | None cache: Optional cache.
-    :param bool return_cache: Whether to return cache.
+    :param ModelCache | None cache: Optional model-level prefix cache.
+    :param GenerationState | None state: Complete generation continuation state.
+    :param bool return_cache: Whether to return a model-level cache. This artifact alone
+        cannot resume generation.
+    :param bool return_state: Whether to return complete resumable generation state.
     :raises ValueError: If inputs are invalid or padding constraints are violated.
-    :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
+    :return tuple[Int[Array, "batch total_len"], GenerationState | ModelCache | None, PRNGKeyArray | None]: Output IDs, continuation artifact, and key.
     """
 
     max_new_tokens = _validate_max_new_tokens(max_new_tokens)
+    if cache is not None and state is not None:
+        raise ValueError("cache and state are mutually exclusive")
+    if return_cache and return_state:
+        raise ValueError("return_cache and return_state are mutually exclusive")
+
     bos_token_id = _validate_token_id_override(
         "bos_token_id",
         bos_token_id,
@@ -653,6 +724,21 @@ def generate(
         eos_token_id,
         model.config.vocab_size,
     )
+    if state is not None:
+        # Match model-entry validation cost: check compact state and schemas on
+        # every call, while persistence performs the full K/V payload scan.
+        validate_generation_state_host(
+            state,
+            model.config,
+            check_full_payload=False,
+        )
+        if eos_token_id is None:
+            eos_token_id = state.eos_token_id
+        elif eos_token_id != state.eos_token_id:
+            raise ValueError(
+                "eos_token_id must match generation state metadata; got "
+                f"{eos_token_id} and {state.eos_token_id}"
+            )
 
     if attention_mask is not None:
         attention_mask = jnp.asarray(attention_mask)
@@ -662,7 +748,13 @@ def generate(
                 f"{attention_mask.shape} and {prompt_ids.shape}"
             )
         has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
-        needs_cache = cache is not None or return_cache or max_new_tokens > 1
+        needs_cache = (
+            cache is not None
+            or state is not None
+            or return_cache
+            or return_state
+            or max_new_tokens > 1
+        )
         if has_padding and needs_cache:
             raise ValueError(
                 "Cannot use cache with padded attention_mask. "
@@ -683,5 +775,7 @@ def generate(
         eos_token_id=eos_token_id,
         attention_mask=attention_mask,
         cache=cache,
+        state=state,
         return_cache=return_cache,
+        return_state=return_state,
     )

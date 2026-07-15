@@ -133,9 +133,9 @@ The historical `convert_jax_to_torch`, `load_weights_from_torch`, `load_from_pre
 
 Existing pre-v2 JAX checkpoints require an owner-controlled offline migration because their metadata does not identify RoPE coordinates, normalization storage, bias topology, tying intent, or preset identity. Runtime loading deliberately refuses to infer those choices. A safe migration must supply the original config and provenance, transform affected tensors, then write a v2 checkpoint and verify logits before deleting the source file.
 
-## Inference cache persistence
+## Inference state persistence
 
-Continuation state has a separate versioned format:
+Model-forward caches have a separate versioned format:
 
 ```python
 from megalodon_jax import load_inference_cache, save_inference_cache
@@ -144,7 +144,18 @@ save_inference_cache(cache, "cache.safetensors", config)
 cache = load_inference_cache("cache.safetensors", config)
 ```
 
-Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are continuation artifacts, not portable model checkpoints.
+Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are model-forward continuation artifacts, not portable model checkpoints and not complete `generate()` continuation state.
+
+Persist `GenerationState` when generation itself must resume without replaying a token:
+
+```python
+from megalodon_jax import load_generation_state, save_generation_state
+
+save_generation_state(state, "generation-state.safetensors", config)
+state = load_generation_state("generation-state.safetensors", config)
+```
+
+Generation-state files use their own fail-closed format and add exact next-logit, finished-row, and EOS schemas on top of the validated cache payload. The sampling PRNG key remains the explicit third value returned by `generate()`; persist and restore that key separately when stochastic continuation must be bit-for-bit reproducible.
 
 ## Parity gates
 

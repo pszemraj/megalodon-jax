@@ -78,7 +78,7 @@ sequenceDiagram
 
 ## Cache integrity and indexing
 
-Top-level `ModelCache` values use exactly two schemas: the sparse initializer has `None` for every layer and final normalization state, while a continuation contains every attention, TimestepNorm, CEMA, and final-normalization component. Direct `MegalodonBlock` calls separately accept either an empty `LayerCache()` or complete layer state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, invalid array schemas, non-finite normalization values, and negative variances; model entry also checks compact EMA state. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V payload as described in [Inference cache persistence](jax-torch.md#inference-cache-persistence).
+Top-level `ModelCache` values use exactly two schemas: the sparse initializer has `None` for every layer and final normalization state, while a continuation contains every attention, TimestepNorm, CEMA, and final-normalization component. Direct `MegalodonBlock` calls separately accept either an empty `LayerCache()` or complete layer state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, invalid array schemas, non-finite normalization values, and negative variances; model entry also checks compact EMA state. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V payload as described in [Inference state persistence](jax-torch.md#inference-state-persistence).
 
 `index_cache(cache, indices)` reorders or duplicates allocated batch state for beam search. Indices must be a rank-one int32 array within the allocated batch range; repeated, reordered, and empty selections are supported. A sparse cache without allocated batch state accepts only an empty selection.
 
@@ -162,14 +162,38 @@ The segmented CEMA path and its memory/speed tradeoff are described in [EMA impl
 ## Padding and generation
 
 - In this JAX implementation, cached decoding does not support padding because cache validity is not tracked per position.
-- `generate()` rejects padded `attention_mask` when cached generation is requested (`max_new_tokens > 1`, `return_cache=True`, or a cache is provided).
+- `generate()` rejects padded `attention_mask` when cached generation is requested (`max_new_tokens > 1`, `return_cache=True`, `return_state=True`, or a cache/state is provided).
 - Model calls require every `attention_mask` row to be a contiguous valid prefix followed by optional right padding. Left padding and interior masked holes are rejected because shifting physical chunk boundaries changes released chunk-local semantics. `generate()` accepts right padding only for a single uncached generated token; direct noncached model calls support right-padded training batches.
 - Batch variable-length prompts by equal unpadded length or generate them separately when a cache is required.
 - Pass `attention_mask=None` when every token is valid. `generate()` canonicalizes an all-True mask to `None`; direct model calls retain an array-valued mask and therefore use the general masked TimestepNorm path.
-- An empty prompt without a cache is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token. Empty-prompt continuation with a cache is rejected because the cache does not store next-token logits; provide the final context token instead.
+- An empty prompt without prior state is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token.
+- Exact generator continuation uses `GenerationState` with an empty `(batch, 0)` prompt. The state cache includes every emitted token, `next_logits` contains the logits produced after the final token, and `finished` plus static EOS metadata preserves fixed-shape mixed-batch stopping. The explicit PRNG key returned by `generate()` remains separate and must be passed to the resumed call for exact stochastic continuation.
+- A raw `ModelCache` is model-forward continuation state only. It deliberately remains available through `cache=` and `return_cache=True`, but it cannot resume `generate()` because it has neither next-token logits nor per-row EOS status. Replaying the final token against such a cache would duplicate that token, so empty-prompt continuation requires `GenerationState` rather than accepting a raw cache.
 - `max_new_tokens` must be a positive, non-boolean integer. Explicit BOS and EOS overrides must be integer IDs within `vocab_size`.
 - `generate()` requires the output width to equal `vocab_size` so every generated ID is valid for the next embedding lookup.
-- Batched generation is fixed-shape. After one row emits EOS, that row continues with synthetic EOS tokens until the batch completes; a returned cache matches the full rectangular result, not the row trimmed at its first EOS.
+- Batched generation is fixed-shape. After one row emits EOS, that row continues with synthetic EOS tokens until the batch completes; a returned raw cache or `GenerationState.cache` matches the full rectangular result, not the row trimmed at its first EOS.
 - Cache input and cache return are deterministic inference operations. Model calls with `deterministic=False` reject both.
+
+```python
+import jax.numpy as jnp
+
+from megalodon_jax import generate
+
+tokens, state, key = generate(
+    model,
+    prompt_ids,
+    max_new_tokens=8,
+    key=key,
+    return_state=True,
+)
+continued, state, key = generate(
+    model,
+    jnp.empty((prompt_ids.shape[0], 0), dtype=jnp.int32),
+    max_new_tokens=8,
+    key=key,
+    state=state,
+    return_state=True,
+)
+```
 
 Token IDs never imply padding. `pad_token_id` is metadata; callers must supply masks and keep unknown-token IDs distinct from padding metadata.

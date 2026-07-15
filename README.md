@@ -92,17 +92,29 @@ from megalodon_jax.inference import generate
 
 # Autoregressive generation (sampling returns the next PRNG key)
 prompt_ids = jnp.array([[1, 2, 3]], dtype=jnp.int32)
-tokens, cache, key = generate(
+tokens, state, key = generate(
     model,
     prompt_ids,
     max_new_tokens=16,
     key=key,
     temperature=1.0,
-    return_cache=True,
+    return_state=True,
+)
+
+# Resume without replaying the final token. The returned key preserves the
+# exact stochastic sampling stream across calls.
+more_tokens, state, key = generate(
+    model,
+    jnp.empty((prompt_ids.shape[0], 0), dtype=jnp.int32),
+    max_new_tokens=16,
+    key=key,
+    temperature=1.0,
+    state=state,
+    return_state=True,
 )
 ```
 
-Cached-generation constraints and cache semantics are described in [Long-context streaming](docs/long-context-streaming.md#padding-and-generation).
+`GenerationState` contains the model cache, the logits for the next sampling decision, and per-row EOS status. A raw `ModelCache` returned with `return_cache=True` remains available for model-forward continuation, but is not sufficient to resume `generate()`. Generation-state persistence and cached-generation constraints are described in [JAX and PyTorch interoperability](docs/jax-torch.md#inference-state-persistence) and [Long-context streaming](docs/long-context-streaming.md#padding-and-generation).
 
 ### Training with loss
 
@@ -154,7 +166,7 @@ The [documentation index](docs/README.md) covers streaming and packed execution,
 src/megalodon_jax/
 ├── config.py          # MegalodonConfig (frozen dataclass)
 ├── cache.py           # Cache schema and invariant checks
-├── checkpoint.py      # Strict native model/cache persistence
+├── checkpoint.py      # Strict native model/inference-state persistence
 ├── convert.py         # Exact original-upstream checkpoint conversion
 ├── inference.py       # Cache indexing, sampling, and generation
 ├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM

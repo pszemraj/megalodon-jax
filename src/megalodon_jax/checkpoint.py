@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Strict native checkpoint and inference-cache persistence."""
+"""Strict native checkpoint and inference-state persistence."""
 
 from __future__ import annotations
 
@@ -31,15 +31,28 @@ from jaxtyping import Array
 from safetensors import safe_open
 from safetensors.flax import load_file, save_file
 
-from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, validate_model_cache_host
+from megalodon_jax.cache import (
+    CACHE_INVARIANT_MESSAGE,
+    validate_generation_state_host,
+    validate_model_cache_host,
+)
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
-from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
+from megalodon_jax.types import (
+    AttentionCache,
+    EMAState,
+    GenerationState,
+    LayerCache,
+    ModelCache,
+    NormState,
+)
 
 MODEL_FORMAT = "megalodon-jax"
 MODEL_FORMAT_VERSION = "2"
 CACHE_FORMAT = "megalodon-jax-cache"
 CACHE_FORMAT_VERSION = "1"
+GENERATION_STATE_FORMAT = "megalodon-jax-generation-state"
+GENERATION_STATE_FORMAT_VERSION = "1"
 ROPE_LAYOUT = "adjacent_pair"
 NORMALIZATION_STORAGE = "plus_one"
 BIAS_SCHEMA = "upstream"
@@ -667,32 +680,19 @@ def save_inference_cache(
     )
 
 
-def load_inference_cache(
-    path: str | Path,
+def _load_cache_payload(
+    tensors: dict[str, Array],
+    metadata: dict[str, str],
     config: MegalodonConfig,
 ) -> ModelCache:
-    """Load a same-schema inference cache for an exact configuration.
+    """Reconstruct and validate a cache from already authenticated payloads.
 
-    :param str | Path path: Inference-cache SafeTensors path.
+    :param dict[str, Array] tensors: Cache-only tensor payload.
+    :param dict[str, str] metadata: Metadata containing component presence records.
     :param MegalodonConfig config: Exact configuration expected by the caller.
-    :raises ValueError: If metadata, tensors, cache structure, or configuration is invalid.
+    :raises ValueError: If metadata, tensors, or cache structure is invalid.
     :return ModelCache: Validated inference cache.
     """
-    source = Path(path)
-    metadata = _metadata(source)
-    if (
-        metadata.get("format") != CACHE_FORMAT
-        or metadata.get("format_version") != CACHE_FORMAT_VERSION
-    ):
-        raise ValueError("incompatible or legacy inference cache")
-    if metadata.get("config_fingerprint") != config_fingerprint(config):
-        raise ValueError("cache configuration fingerprint mismatch")
-    tensors = _load_manifest_tensors(
-        source,
-        metadata,
-        manifest_key="tensor_manifest_sha256",
-        error="cache tensor manifest mismatch",
-    )
     try:
         present_payload = json.loads(metadata["present_json"])
     except (KeyError, json.JSONDecodeError) as exc:
@@ -872,3 +872,143 @@ def load_inference_cache(
     cache = ModelCache(layer_caches=tuple(layers), final_norm=final_norm)
     validate_model_cache_host(cache, config)
     return cache
+
+
+def load_inference_cache(
+    path: str | Path,
+    config: MegalodonConfig,
+) -> ModelCache:
+    """Load a same-schema inference cache for an exact configuration.
+
+    :param str | Path path: Inference-cache SafeTensors path.
+    :param MegalodonConfig config: Exact configuration expected by the caller.
+    :raises ValueError: If metadata, tensors, cache structure, or configuration is invalid.
+    :return ModelCache: Validated inference cache.
+    """
+    source = Path(path)
+    metadata = _metadata(source)
+    if (
+        metadata.get("format") != CACHE_FORMAT
+        or metadata.get("format_version") != CACHE_FORMAT_VERSION
+    ):
+        raise ValueError("incompatible or legacy inference cache")
+    if metadata.get("config_fingerprint") != config_fingerprint(config):
+        raise ValueError("cache configuration fingerprint mismatch")
+    tensors = _load_manifest_tensors(
+        source,
+        metadata,
+        manifest_key="tensor_manifest_sha256",
+        error="cache tensor manifest mismatch",
+    )
+    return _load_cache_payload(tensors, metadata, config)
+
+
+def save_generation_state(
+    state: GenerationState,
+    path: str | Path,
+    config: MegalodonConfig,
+) -> None:
+    """Save complete resumable generation state for an exact configuration.
+
+    The sampling PRNG key remains an explicit value returned by ``generate``
+    and is intentionally not part of this model-derived state artifact.
+
+    :param GenerationState state: Generation state to save.
+    :param str | Path path: Destination ending in ``.safetensors``.
+    :param MegalodonConfig config: Exact configuration that owns the state.
+    :raises ValueError: If state validation or destination validation fails.
+    """
+    destination = Path(path)
+    validate_generation_state_host(state, config)
+    tensors, present = _cache_tensors(state.cache)
+    tensors.update(
+        {
+            "generation.next_logits": state.next_logits,
+            "generation.finished": state.finished,
+        }
+    )
+    metadata = {
+        "format": GENERATION_STATE_FORMAT,
+        "format_version": GENERATION_STATE_FORMAT_VERSION,
+        "config_fingerprint": config_fingerprint(config),
+        "present_json": json.dumps(present, separators=(",", ":")),
+        "eos_token_id_json": json.dumps(state.eos_token_id, separators=(",", ":")),
+        "tensor_manifest_sha256": _manifest(tensors),
+    }
+    _save_atomic_safetensors(
+        destination,
+        tensors,
+        metadata,
+        suffix_error="generation state files must use the .safetensors suffix",
+    )
+
+
+def load_generation_state(
+    path: str | Path,
+    config: MegalodonConfig,
+) -> GenerationState:
+    """Load complete resumable generation state for an exact configuration.
+
+    :param str | Path path: Generation-state SafeTensors path.
+    :param MegalodonConfig config: Exact configuration expected by the caller.
+    :raises ValueError: If metadata, tensors, state, or configuration is invalid.
+    :return GenerationState: Validated generation state.
+    """
+    source = Path(path)
+    metadata = _metadata(source)
+    if (
+        metadata.get("format") != GENERATION_STATE_FORMAT
+        or metadata.get("format_version") != GENERATION_STATE_FORMAT_VERSION
+    ):
+        raise ValueError("incompatible or legacy generation state")
+    if metadata.get("config_fingerprint") != config_fingerprint(config):
+        raise ValueError("generation state configuration fingerprint mismatch")
+    tensors = _load_manifest_tensors(
+        source,
+        metadata,
+        manifest_key="tensor_manifest_sha256",
+        error="generation state tensor manifest mismatch",
+    )
+
+    state_keys = {"generation.next_logits", "generation.finished"}
+    missing = sorted(state_keys - set(tensors))
+    if missing:
+        raise ValueError(f"generation state tensors are missing required keys: {missing}")
+    cache_tensors = {name: value for name, value in tensors.items() if name not in state_keys}
+    cache = _load_cache_payload(cache_tensors, metadata, config)
+
+    next_logits = tensors["generation.next_logits"]
+    if next_logits.ndim != 2:
+        raise ValueError("generation state next_logits must be rank 2")
+    batch_size = next_logits.shape[0]
+    next_logits = _require_tensor(
+        tensors,
+        "generation.next_logits",
+        (batch_size, config.effective_output_size),
+        jnp.float32,
+        context="generation state tensor",
+    )
+    finished = _require_tensor(
+        tensors,
+        "generation.finished",
+        (batch_size,),
+        jnp.bool_,
+        context="generation state tensor",
+    )
+    try:
+        eos_token_id = json.loads(metadata["eos_token_id_json"])
+    except (KeyError, json.JSONDecodeError) as exc:
+        raise ValueError("generation state EOS metadata is invalid") from exc
+    if eos_token_id is not None and (
+        isinstance(eos_token_id, bool) or not isinstance(eos_token_id, int)
+    ):
+        raise ValueError("generation state EOS metadata must be an integer or null")
+
+    state = GenerationState(
+        cache=cache,
+        next_logits=next_logits,
+        finished=finished,
+        eos_token_id=eos_token_id,
+    )
+    validate_generation_state_host(state, config)
+    return state

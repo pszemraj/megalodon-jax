@@ -2,9 +2,11 @@
 
 from megalodon_jax.checkpoint import (
     load_checkpoint,
+    load_generation_state,
     load_inference_cache,
     load_partial_checkpoint,
     save_checkpoint,
+    save_generation_state,
     save_inference_cache,
 )
 from megalodon_jax.config import MegalodonConfig
@@ -16,7 +18,14 @@ from megalodon_jax.inference import (
     sample_token,
 )
 from megalodon_jax.model import MegalodonBlock, MegalodonForCausalLM, MegalodonModel
-from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
+from megalodon_jax.types import (
+    AttentionCache,
+    EMAState,
+    GenerationState,
+    LayerCache,
+    ModelCache,
+    NormState,
+)
 
 __all__ = [
     # Config
@@ -27,6 +36,7 @@ __all__ = [
     "MegalodonForCausalLM",
     # Cache types
     "ModelCache",
+    "GenerationState",
     "AttentionCache",
     "EMAState",
     "LayerCache",
@@ -37,6 +47,8 @@ __all__ = [
     "load_partial_checkpoint",
     "save_inference_cache",
     "load_inference_cache",
+    "save_generation_state",
+    "load_generation_state",
     # Inference utilities
     "init_cache",
     "index_cache",

@@ -23,11 +23,15 @@ import numpy as np
 from jaxtyping import Array, Bool
 
 from megalodon_jax.config import MegalodonConfig
-from megalodon_jax.types import LayerCache, ModelCache, NormState
+from megalodon_jax.types import GenerationState, LayerCache, ModelCache, NormState
 
 CACHE_INVARIANT_MESSAGE = (
     "cache must be either a sparse zero-history initializer or a complete, "
     "timeline-aligned continuation"
+)
+GENERATION_STATE_INVARIANT_MESSAGE = (
+    "generation state must contain a complete cache, finite next-token logits, "
+    "and batch-aligned EOS status"
 )
 
 
@@ -357,3 +361,61 @@ def validate_model_cache_host(cache: ModelCache, config: MegalodonConfig) -> Non
     violation = cache_invariant_violation(cache, config, check_full_payload=True)
     if bool(np.asarray(jax.device_get(violation))):
         raise ValueError(CACHE_INVARIANT_MESSAGE)
+
+
+def validate_generation_state_host(
+    state: GenerationState,
+    config: MegalodonConfig,
+    *,
+    check_full_payload: bool = True,
+) -> None:
+    """Raise ``ValueError`` when a concrete generation state is not resumable.
+
+    :param GenerationState state: Generation state to validate.
+    :param MegalodonConfig config: Configuration defining cache and vocabulary schemas.
+    :param bool check_full_payload: Whether to scan the full attention K/V ring for finiteness.
+    :raises ValueError: If cache, logits, finished rows, or EOS metadata are invalid.
+    """
+    if classify_model_cache(state.cache, num_layers=config.num_layers) != "complete":
+        raise ValueError(GENERATION_STATE_INVARIANT_MESSAGE)
+    if state.next_logits.ndim != 2:
+        raise ValueError(
+            f"generation state next_logits must be rank 2, got {state.next_logits.shape}"
+        )
+    batch_size = state.next_logits.shape[0]
+    _require_array(
+        "generation state next_logits",
+        state.next_logits,
+        (batch_size, config.effective_output_size),
+        jnp.float32,
+    )
+    _require_array(
+        "generation state finished",
+        state.finished,
+        (batch_size,),
+        jnp.bool_,
+    )
+
+    eos_token_id = state.eos_token_id
+    if eos_token_id is not None:
+        if isinstance(eos_token_id, (bool, np.bool_)) or not isinstance(
+            eos_token_id, (int, np.integer)
+        ):
+            raise ValueError("generation state eos_token_id must be an integer token ID")
+        if not 0 <= int(eos_token_id) < config.vocab_size:
+            raise ValueError(
+                f"generation state eos_token_id must be in [0, {config.vocab_size}), "
+                f"got {eos_token_id}"
+            )
+
+    violation = cache_invariant_violation(
+        state.cache,
+        config,
+        batch_size=batch_size,
+        check_full_payload=check_full_payload,
+    )
+    violation = violation | jnp.any(~jnp.isfinite(state.next_logits))
+    if eos_token_id is None:
+        violation = violation | jnp.any(state.finished)
+    if bool(np.asarray(jax.device_get(violation))):
+        raise ValueError(GENERATION_STATE_INVARIANT_MESSAGE)

@@ -24,7 +24,7 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Complex, Float, Int
+from jaxtyping import Array, Bool, Complex, Float, Int
 
 
 @partial(
@@ -133,3 +133,25 @@ class ModelCache:
 
     layer_caches: tuple[LayerCache | None, ...]
     final_norm: NormState | None = None
+
+
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("cache", "next_logits", "finished"),
+    meta_fields=("eos_token_id",),
+)
+@dataclass
+class GenerationState:
+    """Complete state required to resume autoregressive generation.
+
+    ``cache`` includes every token emitted so far, while ``next_logits`` are
+    the logits produced by the final cached token and are therefore ready for
+    the next sampling decision. ``finished`` preserves per-row EOS status for
+    fixed-shape batched continuation. The EOS token is static metadata so a
+    resumed call cannot silently change the meaning of ``finished``.
+    """
+
+    cache: ModelCache
+    next_logits: Float[Array, "batch vocab"]
+    finished: Bool[Array, "batch"]
+    eos_token_id: int | None = None
