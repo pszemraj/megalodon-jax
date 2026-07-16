@@ -32,19 +32,46 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
-from megalodon_jax.config import InitMode
+from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, layer_cache_invariant_violation
+from megalodon_jax.config import AttentionDropoutMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
-from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm
-from megalodon_jax.layers.rotary import RotaryEmbedding
-from megalodon_jax.layers.segments import segment_runs_and_local_positions
+from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
+from megalodon_jax.layers.rotary import RotaryEmbedding, RotaryTable
+from megalodon_jax.layers.segments import (
+    SegmentMetadata,
+    derive_segment_metadata,
+)
 from megalodon_jax.layers.timestep_norm import TimestepNorm
-from megalodon_jax.ops import linear_3d
+from megalodon_jax.ops import (
+    bf16_f32_dot_precision,
+    dot_precision,
+    inverted_dropout,
+    linear_3d,
+)
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
-from megalodon_jax.utils import reinit_linear_weights
 
 # -----------------------------------------------------------------------------
 # Attention Primitives (Pure Functions)
 # -----------------------------------------------------------------------------
+
+
+def _validate_dropout_rate(name: str, value: float) -> None:
+    """Reject probabilities that make inverted dropout undefined.
+
+    :param str name: Configuration field name used in validation errors.
+    :param float value: Dropout probability to validate.
+    :raises ValueError: If value is outside the half-open interval ``[0, 1)``.
+    """
+    if not 0.0 <= value < 1.0:
+        raise ValueError(f"{name} must be in [0, 1), got {value}")
+
+
+def _validate_dropout_mode(mode: AttentionDropoutMode) -> None:
+    """Validate the supported attention dropout placement."""
+    if mode not in ("post_softmax", "dropkey"):
+        raise ValueError(
+            f"attention dropout mode must be 'post_softmax' or 'dropkey', got {mode!r}"
+        )
 
 
 def attention_single_chunk(
@@ -54,8 +81,10 @@ def attention_single_chunk(
     kv_mask: Bool[Array, "batch kv_seq"] | None = None,
     qk_mask: Bool[Array, "batch seq kv_seq"] | None = None,
     accum_dtype: jnp.dtype = jnp.float32,
+    softmax_dtype: jnp.dtype = jnp.float32,
     causal: bool = True,
     dropout_rate: float = 0.0,
+    dropout_mode: AttentionDropoutMode = "post_softmax",
     deterministic: bool = True,
     key: PRNGKeyArray | None = None,
 ) -> Float[Array, "batch seq heads value_dim"]:
@@ -71,8 +100,10 @@ def attention_single_chunk(
     :param jax.Array | None kv_mask: Optional mask where True marks valid positions.
     :param jax.Array | None qk_mask: Optional per-query/per-key boolean mask.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
+    :param jnp.dtype softmax_dtype: Dtype used to evaluate attention softmax.
     :param bool causal: Whether to apply causal masking.
     :param float dropout_rate: Attention dropout rate.
+    :param AttentionDropoutMode dropout_mode: Post-softmax dropout or DropKey.
     :param bool deterministic: If True, skip dropout.
     :param PRNGKeyArray | None key: PRNG key for dropout when deterministic is False.
     :raises ValueError: If dropout is enabled without a PRNG key.
@@ -85,6 +116,10 @@ def attention_single_chunk(
     # Handle empty sequence
     if L_q == 0 or L_kv == 0:
         return jnp.zeros((B, L_q, H, Dv), dtype=q.dtype)
+    _validate_dropout_rate("dropout_rate", dropout_rate)
+    _validate_dropout_mode(dropout_mode)
+    if not deterministic and dropout_rate > 0.0 and key is None:
+        raise ValueError("PRNG key required for attention dropout")
 
     # Compute attention scores: (B, H, L_q, L_kv)
     # NO scaling by 1/sqrt(d_k) - this is normalized attention
@@ -93,54 +128,86 @@ def attention_single_chunk(
         "bqhd,bkhd->bhqk",
         q,
         k,
+        precision=dot_precision(q.dtype),
         preferred_element_type=accum_dtype,
     )
 
     # Build attention mask
     # Use -inf so softmax(all masked) = NaN, triggering the NaN guard below
     neg_inf = -jnp.inf
-    if causal and L_q == L_kv:
-        # Standard causal mask for self-attention
-        causal_mask = jnp.tril(jnp.ones((L_q, L_kv), dtype=jnp.bool_))
-        scores = jnp.where(causal_mask, scores, neg_inf)
-    elif causal and L_q < L_kv:
-        # Cross-attention with cache: each query attends to all prior keys
-        # Query at position i can attend to keys [0, L_kv - L_q + i + 1)
+    valid_edges = None
+    if causal:
+        # Align the last query with the last key. For cached attention this lets
+        # each query see all prior keys; negative offsets correctly represent
+        # queries that precede every available key when L_q > L_kv.
         q_pos = jnp.arange(L_q)[:, None]  # (L_q, 1)
         k_pos = jnp.arange(L_kv)[None, :]  # (1, L_kv)
-        # Key position must be <= query position + offset
         offset = L_kv - L_q
         causal_mask = k_pos <= (q_pos + offset)  # (L_q, L_kv)
         scores = jnp.where(causal_mask, scores, neg_inf)
+        if L_q > L_kv:
+            valid_edges = causal_mask[None, None, :, :]
 
     # Apply key/value padding mask if provided
     if kv_mask is not None:
         # kv_mask: (B, L_kv) with True for valid positions
         kv_mask_expanded = kv_mask[:, None, None, :]  # (B, 1, 1, L_kv)
         scores = jnp.where(kv_mask_expanded, scores, neg_inf)
+        if valid_edges is None:
+            valid_edges = (
+                causal_mask[None, None, :, :]
+                if causal
+                else jnp.ones((1, 1, L_q, L_kv), dtype=jnp.bool_)
+            )
+        valid_edges = valid_edges & kv_mask_expanded
     if qk_mask is not None:
-        scores = jnp.where(qk_mask[:, None, :, :], scores, neg_inf)
+        qk_mask_expanded = qk_mask[:, None, :, :]
+        scores = jnp.where(qk_mask_expanded, scores, neg_inf)
+        if valid_edges is None:
+            valid_edges = (
+                causal_mask[None, None, :, :]
+                if causal
+                else jnp.ones((1, 1, L_q, L_kv), dtype=jnp.bool_)
+            )
+        valid_edges = valid_edges & qk_mask_expanded
 
-    # Softmax with NaN guard for fully-masked queries
-    # If all keys are masked for a query, softmax(all -inf) = NaN
-    # Detect and replace with zeros for safe behavior on padded batches
+    scores = scores.astype(softmax_dtype)
+    if not deterministic and dropout_rate > 0.0 and dropout_mode == "dropkey":
+        keep_mask = jax.random.bernoulli(key, 1.0 - dropout_rate, scores.shape)
+        scores = jnp.where(keep_mask, scores, jnp.asarray(-jnp.inf, dtype=scores.dtype))
+        if valid_edges is None:
+            valid_edges = (
+                causal_mask[None, None, :, :]
+                if causal
+                else jnp.ones((1, 1, L_q, L_kv), dtype=jnp.bool_)
+            )
+        valid_edges = valid_edges & keep_mask
+
+    # Only structurally empty rows are zeroed. NaNs from valid scores remain
+    # observable rather than being silently converted into plausible output.
     attn_weights = jax.nn.softmax(scores, axis=-1)
-    attn_weights = jnp.where(jnp.isnan(attn_weights), 0.0, attn_weights)
+    if valid_edges is not None:
+        has_valid_edge = jnp.any(valid_edges, axis=-1, keepdims=True)
+        attn_weights = jnp.where(has_valid_edge, attn_weights, 0.0)
+
+    # Match the released implementation's mixed-precision boundary: evaluate
+    # softmax in its configured dtype, then return probabilities to the Q/K/V
+    # compute dtype before dropout and the value contraction.
+    attn_weights = attn_weights.astype(q.dtype)
 
     # Dropout if not deterministic
-    if not deterministic and dropout_rate > 0.0:
-        if key is None:
-            raise ValueError("PRNG key required for dropout")
-        keep_mask = jax.random.bernoulli(key, 1.0 - dropout_rate, attn_weights.shape)
-        inv_keep = jnp.asarray(1.0 / (1.0 - dropout_rate), dtype=attn_weights.dtype)
-        attn_weights = attn_weights * keep_mask.astype(attn_weights.dtype) * inv_keep
+    if not deterministic and dropout_rate > 0.0 and dropout_mode == "post_softmax":
+        attn_weights = inverted_dropout(attn_weights, dropout_rate, key)
 
     # Apply to values: (B, H, L_q, Dv) -> (B, L_q, H, Dv)
     out = jnp.einsum(
         "bhqk,bkhd->bqhd",
         attn_weights,
         v,
-        preferred_element_type=accum_dtype,
+        precision=bf16_f32_dot_precision(q.dtype),
+        preferred_element_type=(
+            None if jnp.dtype(q.dtype) == jnp.dtype(jnp.bfloat16) else accum_dtype
+        ),
     )
 
     return out.astype(q.dtype)
@@ -157,9 +224,14 @@ def attention_multi_chunk(
     segment_ids: Int[Array, "batch seq"] | None = None,
     position_ids: Int[Array, "batch seq"] | None = None,
     accum_dtype: jnp.dtype = jnp.float32,
+    softmax_dtype: jnp.dtype = jnp.float32,
     dropout_rate: float = 0.0,
+    dropout_mode: AttentionDropoutMode = "post_softmax",
     deterministic: bool = True,
     key: PRNGKeyArray | None = None,
+    *,
+    _segment_metadata: SegmentMetadata | None = None,
+    _rotary_table: RotaryTable | None = None,
 ) -> Float[Array, "batch seq heads value_dim"]:
     """Block-diagonal chunked attention for training.
 
@@ -179,9 +251,13 @@ def attention_multi_chunk(
         When omitted with segment_ids given, per-document positions (restarting
         at each segment start) are derived automatically.
     :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
+    :param jnp.dtype softmax_dtype: Dtype used to evaluate attention softmax.
     :param float dropout_rate: Attention dropout rate.
+    :param AttentionDropoutMode dropout_mode: Post-softmax dropout or DropKey.
     :param bool deterministic: If True, skip dropout.
     :param PRNGKeyArray | None key: PRNG key for dropout.
+    :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+    :param RotaryTable | None _rotary_table: Internal per-model-call rotary factors.
     :return jax.Array: Output tensor of shape (batch, seq, heads, value_dim).
     """
     B, L, H, Dh = q.shape
@@ -191,25 +267,47 @@ def attention_multi_chunk(
     if L == 0:
         return jnp.zeros((B, L, H, Dv), dtype=q.dtype)
 
-    if segment_ids is not None and position_ids is None:
-        # RoPE must restart at each packed document: without explicit
-        # position_ids a packed row would silently keep continuous global
-        # phases across boundaries while the mask still isolates attention.
-        _, position_ids = segment_runs_and_local_positions(segment_ids)
+    if segment_ids is not None and _segment_metadata is None:
+        _segment_metadata = derive_segment_metadata(segment_ids)
+
+    if _rotary_table is None:
+        if segment_ids is not None and position_ids is None:
+            # RoPE must restart at each packed document: without explicit
+            # position_ids a packed row would silently keep continuous global
+            # phases across boundaries while the mask still isolates attention.
+            assert _segment_metadata is not None
+            position_ids = _segment_metadata.local_positions
+
+        if position_ids is None:
+            local_positions = (
+                jnp.arange(L, dtype=jnp.int32) + start_index.astype(jnp.int32)
+            ) % chunk_size
+            position_ids = jnp.broadcast_to(local_positions, (B, L))
+        else:
+            position_ids = position_ids % chunk_size
 
     if L <= chunk_size:
-        # Single chunk: apply RoPE and attention directly.
-        q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
+        # Single-chunk fast path avoids padding/chunk reshapes. Keep its RoPE,
+        # mask, and dropout semantics in lockstep with the multi-chunk path.
+        q_rot, k_rot = rotary(
+            q,
+            k,
+            start_index,
+            position_ids=position_ids,
+            table=_rotary_table,
+        )
         qk_mask = None
         if segment_ids is not None:
             # Compare contiguous runs (ids may repeat); validity from raw ids.
             # Local chunks are all 0 here (L <= chunk_size), so run equality
             # alone gives the full same-run, same-local-chunk condition.
-            seg_runs, _ = segment_runs_and_local_positions(segment_ids)
+            assert _segment_metadata is not None
+            seg_runs = _segment_metadata.run_ids
+            segment_valid = _segment_metadata.valid
             qk_mask = (
                 (seg_runs[:, :, None] == seg_runs[:, None, :])
-                & (segment_ids[:, :, None] > 0)
-                & (segment_ids[:, None, :] > 0)
+                & segment_valid[:, :, None]
+                & segment_valid[:, None, :]
             )
         return attention_single_chunk(
             q_rot,
@@ -218,8 +316,10 @@ def attention_multi_chunk(
             kv_mask=mask,
             qk_mask=qk_mask,
             accum_dtype=accum_dtype,
+            softmax_dtype=softmax_dtype,
             causal=True,
             dropout_rate=dropout_rate,
+            dropout_mode=dropout_mode,
             deterministic=deterministic,
             key=key,
         )
@@ -236,12 +336,54 @@ def attention_multi_chunk(
             segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
         if position_ids is not None:
             position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        if _segment_metadata is not None:
+            _segment_metadata = SegmentMetadata(
+                valid=jnp.pad(
+                    _segment_metadata.valid,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=False,
+                ),
+                boundaries=jnp.pad(
+                    _segment_metadata.boundaries,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=False,
+                ),
+                run_ids=jnp.pad(
+                    _segment_metadata.run_ids,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=0,
+                ),
+                local_positions=jnp.pad(
+                    _segment_metadata.local_positions,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=0,
+                ),
+            )
+        if _rotary_table is not None:
+            _rotary_table = RotaryTable(
+                cos=jnp.pad(
+                    _rotary_table.cos,
+                    ((0, 0), (0, pad_len), (0, 0), (0, 0)),
+                    constant_values=1.0,
+                ),
+                sin=jnp.pad(
+                    _rotary_table.sin,
+                    ((0, 0), (0, pad_len), (0, 0), (0, 0)),
+                    constant_values=0.0,
+                ),
+            )
 
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
 
     # Apply RoPE once with absolute positions, then reshape into chunks.
-    q_rot_full, k_rot_full = rotary(q, k, start_index, position_ids=position_ids)
+    q_rot_full, k_rot_full = rotary(
+        q,
+        k,
+        start_index,
+        position_ids=position_ids,
+        table=_rotary_table,
+    )
     q_rot = q_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     k_rot = k_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     v_chunked = v.reshape(B, num_chunks, chunk_size, H, Dv).reshape(
@@ -259,14 +401,16 @@ def attention_multi_chunk(
         # at most chunk_size consecutive positions, so keys/values from the
         # current + previous global chunk cover every allowed edge; the mask
         # keeps only same-run, same-local-chunk, valid pairs.
-        run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
+        assert _segment_metadata is not None
+        run_ids = _segment_metadata.run_ids
+        local_positions = _segment_metadata.local_positions
         local_chunks = local_positions // chunk_size
 
-        def window_keys(z: jnp.ndarray, fill_value) -> jnp.ndarray:
+        def window_keys(z: jnp.ndarray, fill_value: jax.typing.ArrayLike) -> jnp.ndarray:
             """Prepend each chunk's predecessor along the key axis.
 
             :param jnp.ndarray z: Per-token array of shape (B, L_padded, ...).
-            :param fill_value: Fill for the first chunk's missing predecessor.
+            :param jax.typing.ArrayLike fill_value: Fill for the first chunk's missing predecessor.
             :return jnp.ndarray: Windowed array of shape (B*NC, 2*chunk, ...).
             """
             zc = z.reshape(B, num_chunks, chunk_size, *z.shape[2:])
@@ -298,7 +442,9 @@ def attention_multi_chunk(
             kv_mask=window_keys(mask, False) if mask is not None else None,
             qk_mask=qk_mask_windowed,
             accum_dtype=accum_dtype,
+            softmax_dtype=softmax_dtype,
             dropout_rate=dropout_rate,
+            dropout_mode=dropout_mode,
             deterministic=deterministic,
             key=key,
         )
@@ -310,7 +456,9 @@ def attention_multi_chunk(
             kv_mask=mask_chunked,
             qk_mask=None,
             accum_dtype=accum_dtype,
+            softmax_dtype=softmax_dtype,
             dropout_rate=dropout_rate,
+            dropout_mode=dropout_mode,
             deterministic=deterministic,
             key=key,
         )
@@ -331,48 +479,24 @@ def attention_multi_chunk(
 
 
 class ChunkedAttention(eqx.Module):
-    """Inner attention module with RoPE and optional KV cache.
+    """Inner RoPE attention with exact chunk-local or sliding-window caching.
 
-    Handles both training (multi-chunk) and inference (streaming with cache).
-
-    Cache Behavior:
-        The cache behavior is controlled by cache_unbounded and max_cache_len:
-
-        1. cache_unbounded=False, max_cache_len=chunk_size (default):
-           "Faithful chunk-local" mode - resets KV at chunk boundaries,
-           enforcing block-diagonal attention structure.
-
-        2. cache_unbounded=False, max_cache_len>chunk_size:
-           Sliding window mode - no reset at chunk boundaries, keeps a fixed-size
-           window of max_cache_len entries. Cross-chunk context is preserved.
-
-        3. cache_unbounded=True:
-           No boundary resets, keeps a fixed-size window of max_cache_len entries.
-           Unlike PyTorch which allows truly unbounded growth, JAX requires
-           a static buffer size for JIT compatibility.
-
-    Attributes:
-        num_heads: Number of attention heads.
-        head_dim: Dimension per head for queries/keys.
-        value_head_dim: Dimension per head for values.
-        chunk_size: Size of attention chunks.
-        max_cache_len: Maximum cache length. None/-1 = chunk_size.
-        cache_unbounded: If True, disables chunk boundary resets (but buffer
-            is still bounded by max_cache_len for JIT compatibility).
-        attention_dropout: Dropout rate for attention weights.
-        accum_dtype: Accumulation dtype for attention matmuls.
-        rotary: RotaryEmbedding module.
+    The released mode uses independent chunks and local rotary positions.
+    Setting attention_window enables an intentional sliding-window extension
+    with absolute rotary positions. Both modes use a fixed-capacity ring whose
+    per-query validity is derived from token ages, so outputs do not depend on
+    how calls are partitioned.
     """
 
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
     value_head_dim: int = eqx.field(static=True)
     chunk_size: int = eqx.field(static=True)
-    max_cache_len: int = eqx.field(static=True)
-    cache_unbounded: bool = eqx.field(static=True)
+    attention_window: int | None = eqx.field(static=True)
     attention_dropout: float = eqx.field(static=True)
+    attention_dropout_mode: AttentionDropoutMode = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
-
+    softmax_dtype: jnp.dtype = eqx.field(static=True)
     rotary: RotaryEmbedding
 
     def __init__(
@@ -382,39 +506,225 @@ class ChunkedAttention(eqx.Module):
         value_head_dim: int,
         chunk_size: int,
         rope_base: float = 10000.0,
-        max_cache_len: int | None = None,
-        cache_unbounded: bool = False,
+        attention_window: int | None = None,
         attention_dropout: float = 0.0,
+        attention_dropout_mode: AttentionDropoutMode = "post_softmax",
         accum_dtype: jnp.dtype = jnp.float32,
-        *,
-        key: PRNGKeyArray,
+        softmax_dtype: jnp.dtype = jnp.float32,
     ):
-        """Initialize ChunkedAttention.
+        """Initialize chunked attention.
 
         :param int num_heads: Number of attention heads.
-        :param int head_dim: Dimension per head for queries/keys.
-        :param int value_head_dim: Dimension per head for values.
-        :param int chunk_size: Size of attention chunks.
-        :param float rope_base: Base for rotary embeddings.
-        :param int | None max_cache_len: Maximum cache length; None/-1 uses chunk_size; >chunk_size enables sliding window.
-        :param bool cache_unbounded: If True, disables chunk boundary resets while keeping a bounded buffer for JIT compatibility.
-        :param float attention_dropout: Dropout rate for attention weights.
-        :param jnp.dtype accum_dtype: Accumulation dtype for attention matmuls.
-        :param PRNGKeyArray key: PRNG key for initialization.
+        :param int head_dim: Query/key width per head.
+        :param int value_head_dim: Value width per head.
+        :param int chunk_size: Released local-attention chunk size.
+        :param float rope_base: Rotary frequency base.
+        :param int | None attention_window: Optional sliding-window width.
+        :param float attention_dropout: Attention dropout probability.
+        :param AttentionDropoutMode attention_dropout_mode: Dropout placement.
+        :param jnp.dtype accum_dtype: Attention matmul accumulation dtype.
+        :param jnp.dtype softmax_dtype: Attention softmax dtype.
         """
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+        if attention_window is not None and attention_window <= 0:
+            raise ValueError(
+                f"attention_window must be positive when provided, got {attention_window}"
+            )
+        _validate_dropout_rate("attention_dropout", attention_dropout)
+        _validate_dropout_mode(attention_dropout_mode)
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.value_head_dim = value_head_dim
         self.chunk_size = chunk_size
-        # Handle None/-1 as "use chunk_size"
-        if max_cache_len is None or max_cache_len < 0:
-            self.max_cache_len = chunk_size
-        else:
-            self.max_cache_len = max_cache_len
-        self.cache_unbounded = cache_unbounded
+        self.attention_window = attention_window
         self.attention_dropout = attention_dropout
+        self.attention_dropout_mode = attention_dropout_mode
         self.accum_dtype = accum_dtype
+        self.softmax_dtype = softmax_dtype
         self.rotary = RotaryEmbedding(dim=head_dim, base=rope_base)
+
+    @property
+    def cache_capacity(self) -> int:
+        """Return the fixed ring-buffer width."""
+        return self.chunk_size if self.attention_window is None else self.attention_window
+
+    def _full_sliding_attention(
+        self,
+        q: Float[Array, "batch seq heads head_dim"],
+        k: Float[Array, "batch seq heads head_dim"],
+        v: Float[Array, "batch seq heads value_dim"],
+        mask: Bool[Array, "batch seq"] | None,
+        segment_ids: Int[Array, "batch seq"] | None,
+        position_ids: Int[Array, "batch seq"] | None,
+        deterministic: bool,
+        key: PRNGKeyArray | None,
+        segment_metadata: SegmentMetadata | None = None,
+        rotary_table: RotaryTable | None = None,
+    ) -> Float[Array, "batch seq heads value_dim"]:
+        """Evaluate the optional sliding extension without a cache.
+
+        :param Float[Array, "batch seq heads head_dim"] q: Query vectors.
+        :param Float[Array, "batch seq heads head_dim"] k: Key vectors.
+        :param Float[Array, "batch seq heads value_dim"] v: Value vectors.
+        :param Bool[Array, "batch seq"] | None mask: Optional token-validity mask.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional packed-sequence IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional rotary positions.
+        :param bool deterministic: Whether attention dropout is disabled.
+        :param PRNGKeyArray | None key: Random key used by attention dropout.
+        :param SegmentMetadata | None segment_metadata: Optional shared packed metadata.
+        :param RotaryTable | None rotary_table: Optional shared rotary factors.
+        :return Float[Array, "batch seq heads value_dim"]: Sliding-attention output.
+        """
+        batch, length = q.shape[:2]
+        if segment_ids is not None:
+            if segment_metadata is None:
+                segment_metadata = derive_segment_metadata(segment_ids)
+            run_ids = segment_metadata.run_ids
+            local_positions = segment_metadata.local_positions
+            rotary_positions = (
+                None
+                if rotary_table is not None
+                else (local_positions if position_ids is None else position_ids)
+            )
+            token_positions = local_positions
+            same_run = run_ids[:, :, None] == run_ids[:, None, :]
+            segment_valid = segment_metadata.valid
+            valid_segments = segment_valid[:, :, None] & segment_valid[:, None, :]
+        else:
+            token_positions = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
+            rotary_positions = (
+                None
+                if rotary_table is not None
+                else (token_positions if position_ids is None else position_ids)
+            )
+            same_run = jnp.ones((batch, length, length), dtype=jnp.bool_)
+            valid_segments = same_run
+
+        age = token_positions[:, :, None] - token_positions[:, None, :]
+        qk_mask = same_run & valid_segments & (age >= 0) & (age < self.attention_window)
+        if mask is not None:
+            qk_mask = qk_mask & mask[:, :, None] & mask[:, None, :]
+        q_rot, k_rot = self.rotary(
+            q,
+            k,
+            jnp.asarray(0, dtype=jnp.int32),
+            position_ids=rotary_positions,
+            table=rotary_table,
+        )
+        return attention_single_chunk(
+            q_rot,
+            k_rot,
+            v,
+            qk_mask=qk_mask,
+            accum_dtype=self.accum_dtype,
+            softmax_dtype=self.softmax_dtype,
+            causal=False,
+            dropout_rate=self.attention_dropout,
+            dropout_mode=self.attention_dropout_mode,
+            deterministic=deterministic,
+            key=key,
+        )
+
+    def _prefill(
+        self,
+        q: Float[Array, "batch seq heads head_dim"],
+        k: Float[Array, "batch seq heads head_dim"],
+        v: Float[Array, "batch seq heads value_dim"],
+        deterministic: bool,
+        key: PRNGKeyArray | None,
+        rotary_table: RotaryTable | None = None,
+    ) -> tuple[
+        Float[Array, "batch seq heads value_dim"],
+        AttentionCache,
+        Int[Array, ""],
+    ]:
+        """Evaluate a pristine prompt vectorially and materialize its ring tail.
+
+        :param Float[Array, "batch seq heads head_dim"] q: Prompt query vectors.
+        :param Float[Array, "batch seq heads head_dim"] k: Prompt key vectors.
+        :param Float[Array, "batch seq heads value_dim"] v: Prompt value vectors.
+        :param bool deterministic: Whether attention dropout is disabled.
+        :param PRNGKeyArray | None key: Random key used by attention dropout.
+        :param RotaryTable | None rotary_table: Optional shared rotary factors.
+        :return tuple: Attention output, materialized ring cache, and prompt length.
+        """
+        batch, length = q.shape[:2]
+        if self.attention_window is None:
+            out = attention_multi_chunk(
+                q,
+                k,
+                v,
+                chunk_size=self.chunk_size,
+                start_index=jnp.asarray(0, dtype=jnp.int32),
+                rotary=self.rotary,
+                accum_dtype=self.accum_dtype,
+                softmax_dtype=self.softmax_dtype,
+                dropout_rate=self.attention_dropout,
+                dropout_mode=self.attention_dropout_mode,
+                deterministic=deterministic,
+                key=key,
+                _rotary_table=rotary_table,
+            )
+        else:
+            out = self._full_sliding_attention(
+                q,
+                k,
+                v,
+                None,
+                None,
+                None,
+                deterministic,
+                key,
+                rotary_table=rotary_table,
+            )
+
+        capacity = self.cache_capacity
+        keep = min(length, capacity)
+        tail_start = length - keep
+        absolute_times = jnp.arange(tail_start, length, dtype=jnp.int32)
+        rope_positions = (
+            absolute_times % self.chunk_size if self.attention_window is None else absolute_times
+        )
+
+        # Recompute only the retained tail instead of retaining all rotated keys
+        # from vectorized attention. A model-level table avoids repeating trig;
+        # standalone calls derive the same bounded tail table here.
+        tail_table = (
+            RotaryTable(
+                cos=rotary_table.cos[:, tail_start:],
+                sin=rotary_table.sin[:, tail_start:],
+            )
+            if rotary_table is not None
+            else self.rotary.table_from_positions(rope_positions)
+        )
+        _, k_tail_rot = self.rotary(
+            q[:, tail_start:],
+            k[:, tail_start:],
+            jnp.asarray(0, dtype=jnp.int32),
+            table=tail_table,
+        )
+        slots = absolute_times % capacity
+        cache_k = (
+            jnp
+            .zeros(
+                (batch, capacity, self.num_heads, self.head_dim),
+                dtype=k.dtype,
+            )
+            .at[:, slots]
+            .set(k_tail_rot)
+        )
+        cache_v = (
+            jnp
+            .zeros(
+                (batch, capacity, self.num_heads, self.value_head_dim),
+                dtype=v.dtype,
+            )
+            .at[:, slots]
+            .set(v[:, tail_start:])
+        )
+        count = jnp.asarray(length, dtype=jnp.int32)
+        return out, AttentionCache(k=cache_k, v=cache_v, count=count), count
 
     def __call__(
         self,
@@ -428,666 +738,204 @@ class ChunkedAttention(eqx.Module):
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
+        *,
+        _cache_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
+        _rotary_table: RotaryTable | None = None,
     ) -> tuple[
         Float[Array, "batch seq heads value_dim"],
         AttentionCache | None,
-        Int[Array, ""] | None,
+        Int[Array, ""],
     ]:
-        """Apply chunked attention with optional caching.
+        """Apply attention and optionally return continuation state."""
+        if q.ndim != 4 or k.shape != q.shape:
+            raise ValueError(f"q and k must share rank-4 shape, got {q.shape} and {k.shape}")
+        if v.shape[:3] != q.shape[:3]:
+            raise ValueError(f"v prefix shape must match q, got {v.shape} and {q.shape}")
+        batch, length, heads, _ = q.shape
+        if heads != self.num_heads:
+            raise ValueError(f"expected {self.num_heads} heads, got {heads}")
+        streaming = cache is not None or return_cache
+        if streaming and (segment_ids is not None or position_ids is not None):
+            raise ValueError("segment_ids/position_ids are unsupported with cached attention")
+        if streaming and mask is not None:
+            raise ValueError("attention masks are unsupported with cached attention")
+        if not deterministic and self.attention_dropout > 0.0 and key is None:
+            raise ValueError("PRNG key required for attention dropout")
 
-        :param jax.Array q: Query tensor (batch, seq, heads, head_dim).
-        :param jax.Array k: Key tensor (batch, seq, heads, head_dim).
-        :param jax.Array v: Value tensor (batch, seq, heads, value_dim).
-        :param AttentionCache | None cache: Optional cached K/V from previous tokens.
-        :param jax.Array | None mask: Optional mask where True marks valid positions.
-        :param jax.Array | None segment_ids: Optional segment IDs for strict attention blocking.
-        :param jax.Array | None position_ids: Optional explicit per-token positions for RoPE.
-            When omitted with segment_ids given, document-local positions are derived.
-        :param bool return_cache: Whether to return updated cache.
-        :param bool deterministic: If True, skip dropout.
-        :param PRNGKeyArray | None key: PRNG key for dropout.
-        :return tuple[jax.Array, AttentionCache | None, jax.Array | None]: Output, updated cache, and new position counter.
-        """
-        B, L, H, _ = q.shape
-        strict_metadata = segment_ids is not None or position_ids is not None
+        if not streaming:
+            if self.attention_window is None:
+                out = attention_multi_chunk(
+                    q,
+                    k,
+                    v,
+                    chunk_size=self.chunk_size,
+                    start_index=jnp.asarray(0, dtype=jnp.int32),
+                    rotary=self.rotary,
+                    mask=mask,
+                    segment_ids=segment_ids,
+                    position_ids=position_ids,
+                    accum_dtype=self.accum_dtype,
+                    softmax_dtype=self.softmax_dtype,
+                    dropout_rate=self.attention_dropout,
+                    dropout_mode=self.attention_dropout_mode,
+                    deterministic=deterministic,
+                    key=key,
+                    _segment_metadata=_segment_metadata,
+                    _rotary_table=_rotary_table,
+                )
+            else:
+                out = self._full_sliding_attention(
+                    q,
+                    k,
+                    v,
+                    mask,
+                    segment_ids,
+                    position_ids,
+                    deterministic,
+                    key,
+                    segment_metadata=_segment_metadata,
+                    rotary_table=_rotary_table,
+                )
+            return out, None, jnp.asarray(length, dtype=jnp.int32)
 
-        # Determine current position
+        # Pristine prefill has no history-dependent input. When attention
+        # dropout is inactive, its outputs are the normal vectorized result;
+        # only the fixed-capacity ring state needs to be materialized.
+        attention_dropout_active = not deterministic and self.attention_dropout > 0.0
+        if cache is None and return_cache and not attention_dropout_active and length > 0:
+            return self._prefill(q, k, v, deterministic, key, _rotary_table)
+
+        capacity = self.cache_capacity
         if cache is None:
-            position = jnp.array(0, dtype=jnp.int32)
+            cache_k = jnp.zeros(
+                (batch, capacity, self.num_heads, self.head_dim),
+                dtype=q.dtype,
+            )
+            cache_v = jnp.zeros(
+                (batch, capacity, self.num_heads, self.value_head_dim),
+                dtype=v.dtype,
+            )
+            count = jnp.asarray(0, dtype=jnp.int32)
         else:
-            position = cache.count
+            expected_k = (batch, capacity, self.num_heads, self.head_dim)
+            expected_v = (batch, capacity, self.num_heads, self.value_head_dim)
+            if cache.k.shape != expected_k or cache.v.shape != expected_v:
+                raise ValueError(
+                    f"cache shapes must be {expected_k} and {expected_v}, "
+                    f"got {cache.k.shape} and {cache.v.shape}"
+                )
+            cache_k = cache.k
+            cache_v = cache.v
+            count = cache.count.astype(jnp.int32)
 
-        # Training path: no cache, use multi-chunk attention
-        if cache is None and not return_cache:
-            out = attention_multi_chunk(
-                q,
-                k,
-                v,
-                chunk_size=self.chunk_size,
-                start_index=position,
-                rotary=self.rotary,
-                mask=mask,
-                segment_ids=segment_ids,
-                position_ids=position_ids,
+        if length == 0:
+            new_cache = AttentionCache(k=cache_k, v=cache_v, count=count) if return_cache else None
+            return v, new_cache, count
+
+        if cache is not None and not _cache_validated:
+            count = eqx.error_if(
+                count,
+                (count < 0) | (count > jnp.iinfo(jnp.int32).max - length),
+                "attention cache count must be non-negative and must not overflow int32",
+            )
+
+        use_rng = not deterministic and self.attention_dropout > 0.0
+        rng = key if key is not None else jax.random.PRNGKey(0)
+        slots = jnp.arange(capacity, dtype=jnp.int32)
+
+        def step(
+            carry: tuple[Array, Array, Array, Array],
+            inputs: tuple[Array, ...],
+        ) -> tuple[tuple[Array, Array, Array, Array], Array]:
+            """Process one token and advance the ring-buffer state.
+
+            :param tuple[Array, Array, Array, Array] carry: Cached keys, cached values,
+                absolute position, and dropout RNG state.
+            :param tuple[Array, ...] inputs: Query, key, value, and optional rotary factors.
+            :return tuple[tuple[Array, Array, Array, Array], Array]: Updated ring-buffer carry
+                and the token's attention output.
+            """
+            current_k, current_v, position, current_rng = carry
+            q_t, k_t, v_t = inputs[:3]
+            if _rotary_table is None:
+                rope_position = (
+                    position % self.chunk_size if self.attention_window is None else position
+                )
+                q_rot, k_rot = self.rotary(
+                    q_t[:, None],
+                    k_t[:, None],
+                    rope_position,
+                )
+            else:
+                cos_t, sin_t = inputs[3:]
+                q_rot, k_rot = self.rotary(
+                    q_t[:, None],
+                    k_t[:, None],
+                    position,
+                    table=RotaryTable(
+                        cos=cos_t[:, None, :, :],
+                        sin=sin_t[:, None, :, :],
+                    ),
+                )
+            write_slot = position % capacity
+            current_k = current_k.at[:, write_slot].set(k_rot[:, 0])
+            current_v = current_v.at[:, write_slot].set(v_t)
+
+            slot_time = position - jnp.mod(position - slots, capacity)
+            valid = slot_time >= 0
+            if self.attention_window is None:
+                valid = valid & (slot_time // self.chunk_size == position // self.chunk_size)
+            kv_mask = jnp.broadcast_to(valid, (batch, capacity))
+
+            if use_rng:
+                current_rng, step_key = jax.random.split(current_rng)
+            else:
+                step_key = None
+            output = attention_single_chunk(
+                q_rot,
+                current_k,
+                current_v,
+                kv_mask=kv_mask,
                 accum_dtype=self.accum_dtype,
+                softmax_dtype=self.softmax_dtype,
+                causal=False,
                 dropout_rate=self.attention_dropout,
+                dropout_mode=self.attention_dropout_mode,
                 deterministic=deterministic,
-                key=key,
+                key=step_key,
             )
-            return out, None, position + L
+            return (
+                current_k,
+                current_v,
+                position + 1,
+                current_rng,
+            ), output[:, 0]
 
-        if strict_metadata:
-            raise ValueError(
-                "segment_ids/position_ids are only supported for non-cached training calls. "
-                "Disable cache/return_cache for strict packed attention."
-            )
-
-        Dv = v.shape[-1]
-        cache_size = self.max_cache_len
-
-        # Determine cache reset behavior (matching PyTorch faithful_chunk_local)
-        faithful_chunk_local = (not self.cache_unbounded) and (
-            self.max_cache_len == self.chunk_size
+        scan_inputs: tuple[Array, ...] = (
+            jnp.swapaxes(q, 0, 1),
+            jnp.swapaxes(k, 0, 1),
+            jnp.swapaxes(v, 0, 1),
         )
-
-        # Streaming path: chunk-wise processing with fixed-size cache.
-        # Full chunks use a single attention matmul; partial chunks fall back
-        # to token-wise updates to avoid dynamic slice sizes.
-        #
-        # Cache behavior is controlled by cache_unbounded and max_cache_len:
-        # - cache_unbounded=False, max_cache_len=chunk_size: "faithful_chunk_local" mode,
-        #   resets KV at chunk boundaries (block-diagonal attention)
-        # - cache_unbounded=False, max_cache_len>chunk_size: sliding window mode
-        # - cache_unbounded=True: same as sliding window but no boundary resets
-        #
-        # Buffer model: circular ring buffer with masked validity.
-        # Ordered cache views are materialized only when causal chunk attention
-        # requires chronological K/V layout.
-        #
-        # Mask semantics:
-        # - Cached prefix keys are always valid for the current chunk.
-        # - Masked tokens in the current chunk are excluded from attention in that chunk,
-        #   but their keys are still cached for future chunks.
-
-        # Initialize or extract fixed-size cache buffers (ring order)
-        if cache is None:
-            cache_k = jnp.zeros((B, cache_size, H, self.head_dim), dtype=q.dtype)
-            cache_v = jnp.zeros((B, cache_size, H, Dv), dtype=v.dtype)
-        else:
-            existing_len = cache.k.shape[1]
-            if existing_len == cache_size:
-                cache_k = cache.k
-                cache_v = cache.v
-            elif existing_len < cache_size:
-                pad_len = cache_size - existing_len
-                cache_k = jnp.pad(cache.k, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
-                cache_v = jnp.pad(cache.v, ((0, 0), (0, pad_len), (0, 0), (0, 0)))
-            else:
-                # Keep the most recent entries
-                cache_k = cache.k[:, -cache_size:]
-                cache_v = cache.v[:, -cache_size:]
-
-        has_input_mask = mask is not None
-        cache_indices = jnp.arange(cache_size, dtype=jnp.int32)
-
-        def current_valid_len(cur_pos: Int[Array, ""]) -> Int[Array, ""]:
-            """Return the valid cache length at the current position.
-
-            :param jax.Array cur_pos: Current streaming position.
-            :return jax.Array: Valid cache length for the current step.
-            """
-            if faithful_chunk_local:
-                return jnp.minimum(cur_pos % self.chunk_size, cache_size)
-            return jnp.minimum(cur_pos, cache_size)
-
-        def cache_start(cur_pos: Int[Array, ""], valid_len: Int[Array, ""]) -> Int[Array, ""]:
-            """Compute the oldest cache index for the current window.
-
-            :param jax.Array cur_pos: Current streaming position.
-            :param jax.Array valid_len: Number of valid cache entries.
-            :return jax.Array: Start index in the ring buffer.
-            """
-            return jnp.mod(cur_pos - valid_len, cache_size)
-
-        def ordered_cache(
-            c_k: Float[Array, "batch cache_size heads head_dim"],
-            c_v: Float[Array, "batch cache_size heads value_dim"],
-            cur_pos: Int[Array, ""],
-            valid_len: Int[Array, ""],
-        ) -> tuple[
-            Float[Array, "batch cache_size heads head_dim"],
-            Float[Array, "batch cache_size heads value_dim"],
-        ]:
-            """Return cache K/V in chronological order for causal attention.
-
-            :param jax.Array c_k: Cache keys in ring order.
-            :param jax.Array c_v: Cache values in ring order.
-            :param jax.Array cur_pos: Current streaming position.
-            :param jax.Array valid_len: Number of valid cache entries.
-            :return tuple[jax.Array, jax.Array]: Ordered (k, v) for attention.
-            """
-            start = cache_start(cur_pos, valid_len)
-            order = jnp.mod(start + cache_indices, cache_size)
-            return jnp.take(c_k, order, axis=1), jnp.take(c_v, order, axis=1)
-
-        def cache_mask_for(valid_len: Int[Array, ""]) -> Bool[Array, "batch cache_size"]:
-            """Build a broadcasted cache validity mask.
-
-            :param jax.Array valid_len: Number of valid cache entries.
-            :return jax.Array: Boolean mask with shape (batch, cache_size).
-            """
-            mask_vec = cache_indices < valid_len
-            return jnp.broadcast_to(mask_vec, (B, cache_size))
-
-        def cache_mask_ring(
-            cur_pos: Int[Array, ""], valid_len: Int[Array, ""]
-        ) -> Bool[Array, "batch cache_size"]:
-            """Build a cache validity mask for ring-ordered buffers.
-
-            :param jax.Array cur_pos: Current streaming position.
-            :param jax.Array valid_len: Number of valid cache entries.
-            :return jax.Array: Boolean mask with shape (batch, cache_size).
-            """
-            start = cache_start(cur_pos, valid_len)
-            age = jnp.mod(cache_indices - start, cache_size)
-            mask_vec = age < valid_len
-            return jnp.broadcast_to(mask_vec, (B, cache_size))
-
-        def append_token(
-            c_k: Float[Array, "batch cache_size heads head_dim"],
-            c_v: Float[Array, "batch cache_size heads value_dim"],
-            k_tok: Float[Array, "batch 1 heads head_dim"],
-            v_tok: Float[Array, "batch 1 heads value_dim"],
-            cur_pos: Int[Array, ""],
-            valid_len: Int[Array, ""],
-        ) -> tuple[
-            Float[Array, "batch cache_size heads head_dim"],
-            Float[Array, "batch cache_size heads value_dim"],
-            Int[Array, ""],
-            Int[Array, ""],
-        ]:
-            """Append a single token to the ring buffer.
-
-            :param jax.Array c_k: Cache keys in ring order.
-            :param jax.Array c_v: Cache values in ring order.
-            :param jax.Array k_tok: New key token of shape (batch, 1, heads, head_dim).
-            :param jax.Array v_tok: New value token of shape (batch, 1, heads, value_dim).
-            :param jax.Array cur_pos: Current streaming position.
-            :param jax.Array valid_len: Number of valid cache entries.
-            :return tuple[jax.Array, jax.Array, jax.Array, jax.Array]: Updated cache, write position, and new valid length.
-            """
-            write_pos = jnp.mod(cur_pos, cache_size).astype(jnp.int32)
-            new_k = c_k.at[:, write_pos].set(k_tok[:, 0])
-            new_v = c_v.at[:, write_pos].set(v_tok[:, 0])
-            new_valid_len = jnp.minimum(valid_len + 1, cache_size)
-            return new_k, new_v, write_pos, new_valid_len
-
-        if L < self.chunk_size:
-            # Small-L fast path: avoid padding to chunk_size and trace only token updates.
-            out_buffer = jnp.zeros((B, L, H, Dv), dtype=v.dtype)
-
-            def token_body(
-                i: Int[Array, ""],
-                state: tuple[
-                    Float[Array, "batch seq heads value_dim"],
-                    Float[Array, "batch cache_size heads head_dim"],
-                    Float[Array, "batch cache_size heads value_dim"],
-                    Int[Array, ""],
-                    PRNGKeyArray | None,
-                ],
-            ) -> tuple[
-                Float[Array, "batch seq heads value_dim"],
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                PRNGKeyArray | None,
-            ]:
-                """Process one token in the small-L streaming path.
-
-                :param jax.Array i: Token index within the sequence.
-                :param tuple state: Streaming state tuple.
-                :return tuple: Updated streaming state tuple.
-                """
-                out_step, c_k_step, c_v_step, pos_step, rng_step = state
-
-                q_i = jax.lax.dynamic_slice(q, (0, i, 0, 0), (B, 1, H, self.head_dim))
-                k_i = jax.lax.dynamic_slice(k, (0, i, 0, 0), (B, 1, H, self.head_dim))
-                v_i = jax.lax.dynamic_slice(v, (0, i, 0, 0), (B, 1, H, Dv))
-
-                q_rot, k_rot = self.rotary(q_i, k_i, pos_step)
-
-                valid_len = current_valid_len(pos_step)
-                c_k_step, c_v_step, write_pos, valid_len_new = append_token(
-                    c_k_step, c_v_step, k_rot, v_i, pos_step, valid_len
-                )
-                cache_mask = cache_mask_ring(pos_step + 1, valid_len_new)
-                if has_input_mask:
-                    mask_i = jax.lax.dynamic_slice(mask, (0, i), (B, 1))[:, 0]
-                    write_slot = cache_indices == write_pos
-                    current_invalid = ~mask_i[:, None] & write_slot[None, :]
-                    kv_mask = cache_mask & ~current_invalid
-                else:
-                    kv_mask = cache_mask
-
-                if rng_step is not None:
-                    rng_step, step_rng = jax.random.split(rng_step)
-                else:
-                    step_rng = None
-
-                out_i = attention_single_chunk(
-                    q_rot,
-                    c_k_step,
-                    c_v_step,
-                    kv_mask=kv_mask,
-                    accum_dtype=self.accum_dtype,
-                    causal=False,
-                    dropout_rate=self.attention_dropout,
-                    deterministic=deterministic,
-                    key=step_rng,
-                )
-
-                out_step = jax.lax.dynamic_update_slice(out_step, out_i, (0, i, 0, 0))
-                return out_step, c_k_step, c_v_step, pos_step + 1, rng_step
-
-            init_state = (out_buffer, cache_k, cache_v, position, key)
-            out_buffer, final_k, final_v, final_pos, _ = jax.lax.fori_loop(
-                0, L, token_body, init_state
+        if _rotary_table is not None:
+            scan_inputs = scan_inputs + (
+                jnp.moveaxis(_rotary_table.cos, 1, 0),
+                jnp.moveaxis(_rotary_table.sin, 1, 0),
             )
-
-            new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
-            if not return_cache:
-                new_cache = None
-
-            return out_buffer, new_cache, final_pos
-
-        q_full = q
-        k_full = k
-        v_full = v
-        mask_full = mask
-
-        buffer_len = q_full.shape[1]
-        out_buffer = jnp.zeros((B, buffer_len, H, Dv), dtype=v.dtype)
-        full_chunk_mask = jnp.ones((B, self.chunk_size), dtype=jnp.bool_)
-
-        if cache_size < self.chunk_size:
-
-            def append_full_chunk(
-                c_k: Float[Array, "batch cache_size heads head_dim"],
-                c_v: Float[Array, "batch cache_size heads value_dim"],
-                k_blk: Float[Array, "batch chunk_size heads head_dim"],
-                v_blk: Float[Array, "batch chunk_size heads value_dim"],
-                cur_pos: Int[Array, ""],
-            ) -> tuple[
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-            ]:
-                """Append a full chunk, keeping only the most recent cache_size tokens.
-
-                :param jax.Array c_k: Cache keys in ring order.
-                :param jax.Array c_v: Cache values in ring order.
-                :param jax.Array k_blk: Chunk keys of shape (batch, chunk_size, heads, head_dim).
-                :param jax.Array v_blk: Chunk values of shape (batch, chunk_size, heads, value_dim).
-                :param jax.Array cur_pos: Current streaming position.
-                :return tuple[jax.Array, jax.Array]: Updated cache buffers.
-                """
-                tail_offset = self.chunk_size - cache_size
-                k_keep = k_blk[:, tail_offset:]
-                v_keep = v_blk[:, tail_offset:]
-                start_pos = cur_pos + tail_offset
-                write_idx = jnp.mod(start_pos + cache_indices, cache_size)
-                new_k = c_k.at[:, write_idx].set(k_keep)
-                new_v = c_v.at[:, write_idx].set(v_keep)
-                return new_k, new_v
-
-        else:
-
-            def append_full_chunk(
-                c_k: Float[Array, "batch cache_size heads head_dim"],
-                c_v: Float[Array, "batch cache_size heads value_dim"],
-                k_blk: Float[Array, "batch chunk_size heads head_dim"],
-                v_blk: Float[Array, "batch chunk_size heads value_dim"],
-                cur_pos: Int[Array, ""],
-            ) -> tuple[
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-            ]:
-                """Append a full chunk to the ring buffer.
-
-                :param jax.Array c_k: Cache keys in ring order.
-                :param jax.Array c_v: Cache values in ring order.
-                :param jax.Array k_blk: Chunk keys of shape (batch, chunk_size, heads, head_dim).
-                :param jax.Array v_blk: Chunk values of shape (batch, chunk_size, heads, value_dim).
-                :param jax.Array cur_pos: Current streaming position.
-                :return tuple[jax.Array, jax.Array]: Updated cache buffers.
-                """
-                write_pos = jnp.mod(cur_pos, cache_size)
-                offsets = cache_indices[: self.chunk_size]
-                write_idx = jnp.mod(write_pos + offsets, cache_size)
-                new_k = c_k.at[:, write_idx].set(k_blk)
-                new_v = c_v.at[:, write_idx].set(v_blk)
-                return new_k, new_v
-
-        def process_full_chunk(
-            offset: Int[Array, ""],
-            out_buf: Float[Array, "batch seq heads value_dim"],
-            c_k: Float[Array, "batch cache_size heads head_dim"],
-            c_v: Float[Array, "batch cache_size heads value_dim"],
-            cur_pos: Int[Array, ""],
-            rng: PRNGKeyArray | None,
-        ) -> tuple[
-            Float[Array, "batch seq heads value_dim"],
-            Float[Array, "batch cache_size heads head_dim"],
-            Float[Array, "batch cache_size heads value_dim"],
-            Int[Array, ""],
-            PRNGKeyArray | None,
-        ]:
-            """Process a full chunk with cache and update the streaming state.
-
-            :param jax.Array offset: Starting index for the chunk.
-            :param jax.Array out_buf: Output buffer to update in-place.
-            :param jax.Array c_k: Cache keys in ring order.
-            :param jax.Array c_v: Cache values in ring order.
-            :param jax.Array cur_pos: Current streaming position.
-            :param PRNGKeyArray | None rng: PRNG key for dropout.
-            :return tuple: Updated (out_buf, cache_k, cache_v, position, rng).
-            """
-            q_blk = jax.lax.dynamic_slice(
-                q_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
-            )
-            k_blk = jax.lax.dynamic_slice(
-                k_full, (0, offset, 0, 0), (B, self.chunk_size, H, self.head_dim)
-            )
-            v_blk = jax.lax.dynamic_slice(v_full, (0, offset, 0, 0), (B, self.chunk_size, H, Dv))
-
-            q_rot, k_rot = self.rotary(q_blk, k_blk, cur_pos)
-
-            valid_len = current_valid_len(cur_pos)
-            cache_mask = cache_mask_for(valid_len)
-            mask_blk = None
-            if has_input_mask:
-                mask_blk = jax.lax.dynamic_slice(mask_full, (0, offset), (B, self.chunk_size))
-
-            if mask_blk is not None:
-                kv_mask = jnp.concatenate([cache_mask, mask_blk], axis=1)
-            else:
-                kv_mask = jnp.concatenate([cache_mask, full_chunk_mask], axis=1)
-
-            if rng is not None:
-                rng, step_rng = jax.random.split(rng)
-            else:
-                step_rng = None
-
-            def attend_with_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
-                """Attend with cache concatenated to the current chunk.
-
-                :param None _: Unused placeholder for ``jax.lax.cond``.
-                :return jax.Array: Attention output for the current chunk.
-                """
-                ordered_k, ordered_v = ordered_cache(c_k, c_v, cur_pos, valid_len)
-                k_cat = jnp.concatenate([ordered_k, k_rot], axis=1)
-                v_cat = jnp.concatenate([ordered_v, v_blk], axis=1)
-                return attention_single_chunk(
-                    q_rot,
-                    k_cat,
-                    v_cat,
-                    kv_mask=kv_mask,
-                    accum_dtype=self.accum_dtype,
-                    causal=True,
-                    dropout_rate=self.attention_dropout,
-                    deterministic=deterministic,
-                    key=step_rng,
-                )
-
-            def attend_no_cache(_: None) -> Float[Array, "batch chunk_size heads value_dim"]:
-                """Attend within the current chunk only.
-
-                :param None _: Unused placeholder for ``jax.lax.cond``.
-                :return jax.Array: Attention output for the current chunk.
-                """
-                return attention_single_chunk(
-                    q_rot,
-                    k_rot,
-                    v_blk,
-                    kv_mask=mask_blk if mask_blk is not None else None,
-                    accum_dtype=self.accum_dtype,
-                    causal=True,
-                    dropout_rate=self.attention_dropout,
-                    deterministic=deterministic,
-                    key=step_rng,
-                )
-
-            if faithful_chunk_local:
-                out_blk = jax.lax.cond(valid_len > 0, attend_with_cache, attend_no_cache, None)
-            else:
-                out_blk = attend_with_cache(None)
-
-            out_buf = jax.lax.dynamic_update_slice(out_buf, out_blk, (0, offset, 0, 0))
-
-            c_k, c_v = append_full_chunk(c_k, c_v, k_rot, v_blk, cur_pos)
-            cur_pos = cur_pos + self.chunk_size
-
-            return out_buf, c_k, c_v, cur_pos, rng
-
-        def process_partial_chunk(
-            offset: Int[Array, ""],
-            chunk_len: Int[Array, ""],
-            out_buf: Float[Array, "batch seq heads value_dim"],
-            c_k: Float[Array, "batch cache_size heads head_dim"],
-            c_v: Float[Array, "batch cache_size heads value_dim"],
-            cur_pos: Int[Array, ""],
-            rng: PRNGKeyArray | None,
-        ) -> tuple[
-            Float[Array, "batch seq heads value_dim"],
-            Float[Array, "batch cache_size heads head_dim"],
-            Float[Array, "batch cache_size heads value_dim"],
-            Int[Array, ""],
-            PRNGKeyArray | None,
-        ]:
-            """Process a partial chunk token-by-token.
-
-            :param jax.Array offset: Starting index for the partial chunk.
-            :param jax.Array chunk_len: Length of the partial chunk.
-            :param jax.Array out_buf: Output buffer to update in-place.
-            :param jax.Array c_k: Cache keys in ring order.
-            :param jax.Array c_v: Cache values in ring order.
-            :param jax.Array cur_pos: Current streaming position.
-            :param PRNGKeyArray | None rng: PRNG key for dropout.
-            :return tuple: Updated (out_buf, cache_k, cache_v, position, rng).
-            """
-
-            def token_body(
-                i: Int[Array, ""],
-                state: tuple[
-                    Float[Array, "batch seq heads value_dim"],
-                    Float[Array, "batch cache_size heads head_dim"],
-                    Float[Array, "batch cache_size heads value_dim"],
-                    Int[Array, ""],
-                    PRNGKeyArray | None,
-                ],
-            ) -> tuple[
-                Float[Array, "batch seq heads value_dim"],
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                PRNGKeyArray | None,
-            ]:
-                """Process one token in a partial chunk.
-
-                :param jax.Array i: Token index within the partial chunk.
-                :param tuple state: Streaming state tuple.
-                :return tuple: Updated streaming state tuple.
-                """
-                out_step, c_k_step, c_v_step, pos_step, rng_step = state
-                idx = offset + i
-
-                q_i = jax.lax.dynamic_slice(q_full, (0, idx, 0, 0), (B, 1, H, self.head_dim))
-                k_i = jax.lax.dynamic_slice(k_full, (0, idx, 0, 0), (B, 1, H, self.head_dim))
-                v_i = jax.lax.dynamic_slice(v_full, (0, idx, 0, 0), (B, 1, H, Dv))
-
-                q_rot, k_rot = self.rotary(q_i, k_i, pos_step)
-
-                valid_len = current_valid_len(pos_step)
-                c_k_step, c_v_step, write_pos, valid_len_new = append_token(
-                    c_k_step, c_v_step, k_rot, v_i, pos_step, valid_len
-                )
-                cache_mask = cache_mask_ring(pos_step + 1, valid_len_new)
-                if has_input_mask:
-                    mask_i = jax.lax.dynamic_slice(mask_full, (0, idx), (B, 1))[:, 0]
-                    write_slot = cache_indices == write_pos
-                    current_invalid = ~mask_i[:, None] & write_slot[None, :]
-                    kv_mask = cache_mask & ~current_invalid
-                else:
-                    kv_mask = cache_mask
-
-                if rng_step is not None:
-                    rng_step, step_rng = jax.random.split(rng_step)
-                else:
-                    step_rng = None
-
-                out_i = attention_single_chunk(
-                    q_rot,
-                    c_k_step,
-                    c_v_step,
-                    kv_mask=kv_mask,
-                    accum_dtype=self.accum_dtype,
-                    causal=False,
-                    dropout_rate=self.attention_dropout,
-                    deterministic=deterministic,
-                    key=step_rng,
-                )
-
-                out_step = jax.lax.dynamic_update_slice(out_step, out_i, (0, idx, 0, 0))
-                return out_step, c_k_step, c_v_step, pos_step + 1, rng_step
-
-            init_state = (out_buf, c_k, c_v, cur_pos, rng)
-            out_buf, c_k, c_v, cur_pos, rng = jax.lax.fori_loop(
-                0, chunk_len, token_body, init_state
-            )
-            return out_buf, c_k, c_v, cur_pos, rng
-
-        def loop_cond(
-            state: tuple[Int[Array, ""], Array, Array, Array, Int[Array, ""], PRNGKeyArray | None],
-        ) -> Bool[Array, ""]:
-            """Continue streaming loop while offset is within sequence length.
-
-            :param tuple state: Streaming loop state tuple.
-            :return jax.Array: Boolean flag to continue the loop.
-            """
-            offset = state[0]
-            return offset < L
-
-        def loop_body(
-            state: tuple[
-                Int[Array, ""],
-                Float[Array, "batch seq heads value_dim"],
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                PRNGKeyArray | None,
-            ],
-        ) -> tuple[
-            Int[Array, ""],
-            Float[Array, "batch seq heads value_dim"],
-            Float[Array, "batch cache_size heads head_dim"],
-            Float[Array, "batch cache_size heads value_dim"],
-            Int[Array, ""],
-            PRNGKeyArray | None,
-        ]:
-            """Streaming loop body that dispatches full vs partial chunk processing.
-
-            :param tuple state: Streaming loop state tuple.
-            :return tuple: Updated streaming loop state tuple.
-            """
-            offset, out_buf, c_k, c_v, cur_pos, rng = state
-            remaining = L - offset
-            if faithful_chunk_local:
-                pos_in_chunk = cur_pos % self.chunk_size
-                chunk_len = jnp.minimum(
-                    remaining,
-                    jnp.where(pos_in_chunk == 0, self.chunk_size, self.chunk_size - pos_in_chunk),
-                )
-            else:
-                chunk_len = jnp.minimum(remaining, self.chunk_size)
-
-            def full_branch(
-                branch_state: tuple[
-                    Int[Array, ""],
-                    Float[Array, "batch seq heads value_dim"],
-                    Float[Array, "batch cache_size heads head_dim"],
-                    Float[Array, "batch cache_size heads value_dim"],
-                    Int[Array, ""],
-                    PRNGKeyArray | None,
-                ],
-            ) -> tuple[
-                Int[Array, ""],
-                Float[Array, "batch seq heads value_dim"],
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                PRNGKeyArray | None,
-            ]:
-                """Branch for processing a full chunk.
-
-                :param tuple branch_state: Current branch state tuple.
-                :return tuple: Updated branch state tuple.
-                """
-                offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
-                out_b, k_b, v_b, pos_b, rng_b = process_full_chunk(
-                    offset_b, out_b, k_b, v_b, pos_b, rng_b
-                )
-                offset_b = offset_b + self.chunk_size
-                return offset_b, out_b, k_b, v_b, pos_b, rng_b
-
-            def partial_branch(
-                branch_state: tuple[
-                    Int[Array, ""],
-                    Float[Array, "batch seq heads value_dim"],
-                    Float[Array, "batch cache_size heads head_dim"],
-                    Float[Array, "batch cache_size heads value_dim"],
-                    Int[Array, ""],
-                    PRNGKeyArray | None,
-                ],
-            ) -> tuple[
-                Int[Array, ""],
-                Float[Array, "batch seq heads value_dim"],
-                Float[Array, "batch cache_size heads head_dim"],
-                Float[Array, "batch cache_size heads value_dim"],
-                Int[Array, ""],
-                PRNGKeyArray | None,
-            ]:
-                """Branch for processing a partial chunk.
-
-                :param tuple branch_state: Current branch state tuple.
-                :return tuple: Updated branch state tuple.
-                """
-                offset_b, out_b, k_b, v_b, pos_b, rng_b = branch_state
-                out_b, k_b, v_b, pos_b, rng_b = process_partial_chunk(
-                    offset_b, chunk_len, out_b, k_b, v_b, pos_b, rng_b
-                )
-                offset_b = offset_b + chunk_len
-                return offset_b, out_b, k_b, v_b, pos_b, rng_b
-
-            do_full = chunk_len == self.chunk_size
-            return jax.lax.cond(do_full, full_branch, partial_branch, state)
-
-        init_offset = jnp.array(0, dtype=jnp.int32)
-        init_state = (init_offset, out_buffer, cache_k, cache_v, position, key)
-        _, out_buffer, final_k, final_v, final_pos, _ = jax.lax.while_loop(
-            loop_cond, loop_body, init_state
+        (final_k, final_v, final_count, _), outputs = jax.lax.scan(
+            step,
+            (cache_k, cache_v, count, rng),
+            scan_inputs,
         )
-
-        if buffer_len > L:
-            out_buffer = out_buffer[:, :L, :, :]
-
-        new_cache = AttentionCache(k=final_k, v=final_v, count=final_pos)
-        if not return_cache:
-            new_cache = None
-
-        return out_buffer, new_cache, final_pos
+        out = jnp.swapaxes(outputs, 0, 1)
+        new_cache = (
+            AttentionCache(k=final_k, v=final_v, count=final_count) if return_cache else None
+        )
+        return out, new_cache, final_count
 
 
 # -----------------------------------------------------------------------------
-# MegalodonAttention Block
+# Complete Megalodon Attention Block
 # -----------------------------------------------------------------------------
 
 
@@ -1138,7 +986,6 @@ class MegalodonAttention(eqx.Module):
 
     # Config
     model_dim: int = eqx.field(static=True)
-    z_dim: int = eqx.field(static=True)
     value_dim: int = eqx.field(static=True)
     num_heads: int = eqx.field(static=True)
     head_dim: int = eqx.field(static=True)
@@ -1146,10 +993,8 @@ class MegalodonAttention(eqx.Module):
     norm_eps: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
-    param_dtype: jnp.dtype = eqx.field(static=True)
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
-    gemm_backend: str = eqx.field(static=True)
     use_associative_segment_scan: bool = eqx.field(static=True)
 
     def __init__(
@@ -1164,15 +1009,15 @@ class MegalodonAttention(eqx.Module):
         norm_eps: float = 1e-5,
         norm_affine: bool = True,
         rope_base: float = 10000.0,
-        max_cache_len: int | None = None,
-        cache_unbounded: bool = False,
+        attention_window: int | None = None,
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
+        attention_dropout_mode: AttentionDropoutMode = "post_softmax",
         hidden_dropout: float = 0.0,
         param_dtype: jnp.dtype = jnp.float32,
         compute_dtype: jnp.dtype = jnp.float32,
         accum_dtype: jnp.dtype = jnp.float32,
-        gemm_backend: str = "default",
+        attention_softmax_dtype: jnp.dtype = jnp.float32,
         use_associative_segment_scan: bool = True,
         *,
         key: PRNGKeyArray,
@@ -1187,24 +1032,27 @@ class MegalodonAttention(eqx.Module):
         :param int chunk_size: Attention chunk size.
         :param int norm_num_groups: Number of groups for TimestepNorm.
         :param float norm_eps: Epsilon for normalization.
-        :param bool norm_affine: Whether normalization layers include affine parameters.
+        :param bool norm_affine: Whether RMSNorm includes an affine scale. TimestepNorm is always
+            affine for released-source compatibility.
         :param float rope_base: Base for rotary embeddings.
-        :param int | None max_cache_len: Max KV cache length. None/-1 = chunk_size.
-        :param bool cache_unbounded: If True, never clamp cache length.
+        :param int | None attention_window: Optional sliding-window width.
         :param float dropout: Output dropout rate.
         :param float attention_dropout: Attention weight dropout rate.
+        :param AttentionDropoutMode attention_dropout_mode: Post-softmax dropout or DropKey.
         :param float hidden_dropout: Hidden layer dropout rate.
         :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
         :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
         :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
-        :param str gemm_backend: GEMM backend selector.
+        :param jnp.dtype attention_softmax_dtype: Attention softmax evaluation dtype.
         :param bool use_associative_segment_scan: Segmented CEMA implementation for
             packed sequences: parallel associative scan (default) or the
             sequential low-memory fallback.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
+        _validate_dropout_rate("dropout", dropout)
+        _validate_dropout_rate("attention_dropout", attention_dropout)
+        _validate_dropout_rate("hidden_dropout", hidden_dropout)
         self.model_dim = model_dim
-        self.z_dim = z_dim
         self.value_dim = value_dim
         self.num_heads = num_heads
         self.head_dim = z_dim // num_heads
@@ -1212,10 +1060,8 @@ class MegalodonAttention(eqx.Module):
         self.norm_eps = norm_eps
         self.dropout = dropout
         self.hidden_dropout = hidden_dropout
-        self.param_dtype = param_dtype
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
-        self.gemm_backend = gemm_backend
         self.use_associative_segment_scan = use_associative_segment_scan
 
         # Split keys
@@ -1223,7 +1069,9 @@ class MegalodonAttention(eqx.Module):
 
         # Sub-modules
         self.timenorm = TimestepNorm(
-            num_features=model_dim, num_groups=norm_num_groups, eps=norm_eps, affine=norm_affine
+            num_features=model_dim,
+            num_groups=norm_num_groups,
+            eps=norm_eps,
         )
         self.cema = ComplexEMA(embed_dim=model_dim, ndim=cema_ndim, key=keys[0])
         self.rmsnorm = RMSNorm(dim=model_dim, eps=norm_eps, affine=norm_affine)
@@ -1233,11 +1081,11 @@ class MegalodonAttention(eqx.Module):
             value_head_dim=self.value_head_dim,
             chunk_size=chunk_size,
             rope_base=rope_base,
-            max_cache_len=max_cache_len,
-            cache_unbounded=cache_unbounded,
+            attention_window=attention_window,
             attention_dropout=attention_dropout,
+            attention_dropout_mode=attention_dropout_mode,
             accum_dtype=accum_dtype,
-            key=keys[1],
+            softmax_dtype=attention_softmax_dtype,
         )
 
         # Projections
@@ -1245,7 +1093,13 @@ class MegalodonAttention(eqx.Module):
         self.wv = eqx.nn.Linear(model_dim, value_dim, dtype=param_dtype, key=keys[3])
         self.wr = eqx.nn.Linear(model_dim, value_dim, dtype=param_dtype, key=keys[4])
         self.wh1 = eqx.nn.Linear(model_dim, model_dim, dtype=param_dtype, key=keys[5])
-        self.wh2 = eqx.nn.Linear(value_dim, model_dim, dtype=param_dtype, key=keys[6])
+        self.wh2 = eqx.nn.Linear(
+            value_dim,
+            model_dim,
+            use_bias=False,
+            dtype=param_dtype,
+            key=keys[6],
+        )
 
         # Per-head affine parameters (gamma+1 parameterization, init zeros)
         self.gamma = jnp.zeros((2, z_dim), dtype=jnp.float32)
@@ -1261,6 +1115,10 @@ class MegalodonAttention(eqx.Module):
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
+        *,
+        _cache_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
+        _rotary_table: RotaryTable | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Forward pass through the attention block.
 
@@ -1273,12 +1131,47 @@ class MegalodonAttention(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
+        :param bool _cache_validated: Internal signal that model cache counts were checked.
+        :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+        :param RotaryTable | None _rotary_table: Internal per-model-call rotary factors.
         :return tuple[jax.Array, LayerCache | None]: Output tensor and updated cache.
         """
+        if (
+            not deterministic
+            and key is None
+            and any(
+                rate > 0.0
+                for rate in (self.dropout, self.inner.attention_dropout, self.hidden_dropout)
+            )
+        ):
+            raise ValueError("PRNG key required when deterministic=False and dropout is enabled")
         B, L, D = x.shape
         H = self.num_heads
         Dh = self.head_dim
         Dv = self.value_head_dim
+
+        if cache is not None and not _cache_validated:
+            x = eqx.error_if(
+                x,
+                layer_cache_invariant_violation(
+                    cache,
+                    batch_size=B,
+                    cache_capacity=self.inner.cache_capacity,
+                    num_heads=H,
+                    head_dim=Dh,
+                    value_head_dim=Dv,
+                    model_dim=self.model_dim,
+                    cema_ndim=self.cema.ndim,
+                    norm_num_groups=self.timenorm.num_groups,
+                    compute_dtype=self.compute_dtype,
+                    increment=L,
+                ),
+                CACHE_INVARIANT_MESSAGE,
+            )
+            if cache.attn is None and cache.norm is None and cache.ema is None:
+                # Canonicalize the sparse zero-history public representation.
+                cache = None
+            _cache_validated = True
 
         x = x.astype(self.compute_dtype)
 
@@ -1295,40 +1188,42 @@ class MegalodonAttention(eqx.Module):
 
         # TimestepNorm (segment_ids resets running stats at packed-doc boundaries)
         x_tn, new_norm_state = self.timenorm(
-            x, state=norm_state, mask=mask, segment_ids=segment_ids
+            x,
+            state=norm_state,
+            mask=mask,
+            segment_ids=segment_ids,
+            _state_validated=_cache_validated,
+            _segment_metadata=_segment_metadata,
         )
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
         # Pass mask to prevent EMA state contamination from padded positions;
         # segment_ids resets the EMA state at packed-doc boundaries
         need_ema_state = return_cache or ema_state is not None
+        cema_input = x_tn.transpose(0, 2, 1)  # (B, D, L)
+
         y_cema, h_last = self.cema(
-            x_tn.transpose(0, 2, 1),  # (B, D, L)
+            cema_input,
             h_init=ema_state,
             return_state=need_ema_state,
-            mask=mask,  # (B, L) - zeros masked positions to prevent state contamination
+            mask=mask,
             segment_ids=segment_ids,
             use_associative_segment_scan=self.use_associative_segment_scan,
+            _segment_metadata=_segment_metadata,
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
         # RMSNorm on CEMA output, then hidden_dropout (matching PyTorch reference line 1370)
         mx = self.rmsnorm(y_cema)
-        if not deterministic and self.hidden_dropout > 0.0 and k2 is not None:
-            keep = jax.random.bernoulli(k2, 1.0 - self.hidden_dropout, mx.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=mx.dtype)
-            mx = jnp.where(keep, mx * inv_keep, jnp.zeros((), dtype=mx.dtype))
+        if not deterministic and self.hidden_dropout > 0.0:
+            mx = inverted_dropout(mx, self.hidden_dropout, k2)
 
         # Shared Z projection for Q/K
-        z = linear_3d(
-            self.wz, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend
-        )  # (B, L, z_dim)
+        z = linear_3d(self.wz, mx, self.compute_dtype, self.accum_dtype)  # (B, L, z_dim)
         z = z.reshape(B, L, H, Dh)
 
         # Per-head RMS normalization (in fp32 for stability)
-        z_f32 = z.astype(jnp.float32)
-        rms = jnp.sqrt(jnp.mean(z_f32**2, axis=-1, keepdims=True) + self.norm_eps)
-        z_normed = z_f32 / rms
+        z_normed = _rms_normalize(z, self.norm_eps)
 
         # Affine transform to Q and K in fp32 for stability
         # gamma, beta: (2, z_dim) -> (2, H, Dh)
@@ -1342,16 +1237,18 @@ class MegalodonAttention(eqx.Module):
 
         # Value projection with SiLU
         v = jax.nn.silu(
-            linear_3d(self.wv, x_tn, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            linear_3d(self.wv, x_tn, self.compute_dtype, self.accum_dtype)
         )  # (B, L, value_dim)
         v = v.reshape(B, L, H, Dv)
 
         # Gate projection with SiLU
         r = jax.nn.silu(
-            linear_3d(self.wr, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+            linear_3d(self.wr, mx, self.compute_dtype, self.accum_dtype)
         )  # (B, L, value_dim)
 
         # Inner attention
+        if cache is not None and attn_cache is None:
+            raise ValueError(CACHE_INVARIANT_MESSAGE)
         out, new_attn_cache, new_position = self.inner(
             q,
             k,
@@ -1363,6 +1260,9 @@ class MegalodonAttention(eqx.Module):
             return_cache=return_cache,
             deterministic=deterministic,
             key=k1,
+            _cache_validated=_cache_validated,
+            _segment_metadata=_segment_metadata,
+            _rotary_table=_rotary_table,
         )
 
         # Reshape attention output: (B, L, H, Dv) -> (B, L, value_dim)
@@ -1372,122 +1272,34 @@ class MegalodonAttention(eqx.Module):
         gated = out * r
 
         # Hidden dropout on gated attention output (matching PyTorch reference line 1418)
-        if not deterministic and self.hidden_dropout > 0.0 and k3 is not None:
-            keep = jax.random.bernoulli(k3, 1.0 - self.hidden_dropout, gated.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=gated.dtype)
-            gated = jnp.where(keep, gated * inv_keep, jnp.zeros((), dtype=gated.dtype))
+        if not deterministic and self.hidden_dropout > 0.0:
+            gated = inverted_dropout(gated, self.hidden_dropout, k3)
 
         # Output projections
-        h = linear_3d(
-            self.wh1, mx, self.compute_dtype, self.accum_dtype, self.gemm_backend
-        ) + linear_3d(self.wh2, gated, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+        h = linear_3d(self.wh1, mx, self.compute_dtype, self.accum_dtype) + linear_3d(
+            self.wh2, gated, self.compute_dtype, self.accum_dtype
+        )
 
         # Output dropout
-        if not deterministic and self.dropout > 0.0 and k4 is not None:
-            keep = jax.random.bernoulli(k4, 1.0 - self.dropout, h.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=h.dtype)
-            h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
+        if not deterministic and self.dropout > 0.0:
+            h = inverted_dropout(h, self.dropout, k4)
 
         # Residual
         y = h + x
 
         # Build output cache
         if return_cache:
+            assert h_last is not None
             new_cache = LayerCache(
                 attn=new_attn_cache,
                 norm=new_norm_state,
-                ema=EMAState(h=h_last) if h_last is not None else None,
-                position=new_position
-                if new_position is not None
-                else jnp.array(0, dtype=jnp.int32),
+                ema=EMAState(h=h_last),
+                position=new_position,
             )
         else:
             new_cache = None
 
         return y, new_cache
-
-    @classmethod
-    def with_init(
-        cls,
-        model_dim: int,
-        z_dim: int,
-        value_dim: int,
-        num_heads: int,
-        cema_ndim: int,
-        chunk_size: int,
-        norm_num_groups: int,
-        norm_eps: float = 1e-5,
-        norm_affine: bool = True,
-        rope_base: float = 10000.0,
-        max_cache_len: int | None = None,
-        cache_unbounded: bool = False,
-        dropout: float = 0.0,
-        attention_dropout: float = 0.0,
-        hidden_dropout: float = 0.0,
-        param_dtype: jnp.dtype = jnp.float32,
-        compute_dtype: jnp.dtype = jnp.float32,
-        accum_dtype: jnp.dtype = jnp.float32,
-        gemm_backend: str = "default",
-        init_mode: InitMode = "gaussian",
-        *,
-        key: PRNGKeyArray,
-    ) -> "MegalodonAttention":
-        """Create MegalodonAttention with custom weight initialization.
-
-        This is the recommended way to construct MegalodonAttention when using
-        custom initialization modes. Creates the module with default init,
-        then reinitializes all Linear weights according to init_mode.
-
-        :param int model_dim: Model hidden dimension D.
-        :param int z_dim: Shared Q/K dimension.
-        :param int value_dim: Value dimension.
-        :param int num_heads: Number of attention heads.
-        :param int cema_ndim: Number of EMA orders for ComplexEMA.
-        :param int chunk_size: Attention chunk size.
-        :param int norm_num_groups: Number of groups for TimestepNorm.
-        :param float norm_eps: Epsilon for normalization.
-        :param bool norm_affine: Whether normalization layers include affine parameters.
-        :param float rope_base: Base for rotary embeddings.
-        :param int | None max_cache_len: Max KV cache length. None/-1 = chunk_size.
-        :param bool cache_unbounded: If True, never clamp cache length.
-        :param float dropout: Output dropout rate.
-        :param float attention_dropout: Attention weight dropout rate.
-        :param float hidden_dropout: Hidden layer dropout rate.
-        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
-        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
-        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
-        :param str gemm_backend: GEMM backend selector.
-        :param InitMode init_mode: Initialization mode for Linear weights.
-        :param PRNGKeyArray key: PRNG key for initialization.
-        :return MegalodonAttention: Instance with reinitialized weights.
-        """
-        key1, key2 = jax.random.split(key)
-        instance = cls(
-            model_dim=model_dim,
-            z_dim=z_dim,
-            value_dim=value_dim,
-            num_heads=num_heads,
-            cema_ndim=cema_ndim,
-            chunk_size=chunk_size,
-            norm_num_groups=norm_num_groups,
-            norm_eps=norm_eps,
-            norm_affine=norm_affine,
-            rope_base=rope_base,
-            max_cache_len=max_cache_len,
-            cache_unbounded=cache_unbounded,
-            dropout=dropout,
-            attention_dropout=attention_dropout,
-            hidden_dropout=hidden_dropout,
-            param_dtype=param_dtype,
-            compute_dtype=compute_dtype,
-            accum_dtype=accum_dtype,
-            gemm_backend=gemm_backend,
-            key=key1,
-        )
-        if init_mode != "none":
-            # Don't pass dim - matches PyTorch behavior (std=1.0 for gaussian)
-            instance = reinit_linear_weights(instance, init_mode, key2)
-        return instance
 
 
 # -----------------------------------------------------------------------------
@@ -1513,16 +1325,12 @@ class NormalizedFFN(eqx.Module):
     fc2: eqx.nn.Linear
     fc3: eqx.nn.Linear | None  # Only for SwiGLU
 
-    model_dim: int = eqx.field(static=True)
-    ffn_hidden_dim: int = eqx.field(static=True)
     swiglu: bool = eqx.field(static=True)
     hidden_dropout: float = eqx.field(static=True)
     dropout: float = eqx.field(static=True)
-    alpha: float | None = eqx.field(static=True)  # Residual rescale factor
-    param_dtype: jnp.dtype = eqx.field(static=True)
+    alpha: Float[Array, "dim"] | None
     compute_dtype: jnp.dtype = eqx.field(static=True)
     accum_dtype: jnp.dtype = eqx.field(static=True)
-    gemm_backend: str = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1538,7 +1346,6 @@ class NormalizedFFN(eqx.Module):
         param_dtype: jnp.dtype = jnp.float32,
         compute_dtype: jnp.dtype = jnp.float32,
         accum_dtype: jnp.dtype = jnp.float32,
-        gemm_backend: str = "default",
         *,
         key: PRNGKeyArray,
     ):
@@ -1547,7 +1354,7 @@ class NormalizedFFN(eqx.Module):
         :param int model_dim: Model hidden dimension.
         :param int ffn_hidden_dim: FFN intermediate dimension.
         :param float norm_eps: Epsilon for layer normalization.
-        :param bool norm_affine: Whether normalization includes affine parameters.
+        :param bool norm_affine: Whether the FFN LayerNorm includes affine parameters.
         :param bool swiglu: Whether to use SwiGLU activation.
         :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
         :param int layer_id: Layer index for computing rescale factor (0-indexed).
@@ -1556,29 +1363,46 @@ class NormalizedFFN(eqx.Module):
         :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
         :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
         :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
-        :param str gemm_backend: GEMM backend selector.
         :param PRNGKeyArray key: PRNG key for initialization.
         """
-        self.model_dim = model_dim
-        self.ffn_hidden_dim = ffn_hidden_dim
+        _validate_dropout_rate("dropout", dropout)
+        _validate_dropout_rate("hidden_dropout", hidden_dropout)
         self.swiglu = swiglu
         self.hidden_dropout = hidden_dropout
         self.dropout = dropout
-        self.param_dtype = param_dtype
         self.compute_dtype = compute_dtype
         self.accum_dtype = accum_dtype
-        self.gemm_backend = gemm_backend
-        # Compute rescale alpha: 0.1 * (0.5 ** layer_id)
-        self.alpha = (0.1 * (0.5**layer_id)) if rescale else None
+        # Released layer scale is a trainable per-feature vector.
+        self.alpha = (
+            jnp.full((model_dim,), 0.1 * (0.5**layer_id), dtype=jnp.float32) if rescale else None
+        )
 
         keys = jax.random.split(key, 3)
 
         self.norm = BatchedLayerNorm(model_dim, eps=norm_eps, affine=norm_affine)
-        self.fc1 = eqx.nn.Linear(model_dim, ffn_hidden_dim, dtype=param_dtype, key=keys[0])
-        self.fc2 = eqx.nn.Linear(ffn_hidden_dim, model_dim, dtype=param_dtype, key=keys[1])
+        self.fc1 = eqx.nn.Linear(
+            model_dim,
+            ffn_hidden_dim,
+            use_bias=False,
+            dtype=param_dtype,
+            key=keys[0],
+        )
+        self.fc2 = eqx.nn.Linear(
+            ffn_hidden_dim,
+            model_dim,
+            use_bias=False,
+            dtype=param_dtype,
+            key=keys[1],
+        )
 
         if swiglu:
-            self.fc3 = eqx.nn.Linear(model_dim, ffn_hidden_dim, dtype=param_dtype, key=keys[2])
+            self.fc3 = eqx.nn.Linear(
+                model_dim,
+                ffn_hidden_dim,
+                use_bias=False,
+                dtype=param_dtype,
+                key=keys[2],
+            )
         else:
             self.fc3 = None
 
@@ -1597,6 +1421,8 @@ class NormalizedFFN(eqx.Module):
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :return jax.Array: Output tensor of shape (batch, seq, dim).
         """
+        if not deterministic and key is None and (self.dropout > 0.0 or self.hidden_dropout > 0.0):
+            raise ValueError("PRNG key required when deterministic=False and dropout is enabled")
         x = x.astype(self.compute_dtype)
         residual = x if residual_base is None else residual_base.astype(self.compute_dtype)
 
@@ -1606,102 +1432,27 @@ class NormalizedFFN(eqx.Module):
         # Hidden layer with activation
         if self.swiglu:
             h = jax.nn.silu(
-                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
-            ) * linear_3d(self.fc3, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype)
+            ) * linear_3d(self.fc3, h, self.compute_dtype, self.accum_dtype)
         else:
-            h = jax.nn.silu(
-                linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
-            )
+            h = jax.nn.silu(linear_3d(self.fc1, h, self.compute_dtype, self.accum_dtype))
 
         # Hidden dropout
         if not deterministic and self.hidden_dropout > 0.0:
-            if key is not None:
-                k1, k2 = jax.random.split(key)
-            else:
-                k1 = k2 = None
-            if k1 is not None:
-                keep = jax.random.bernoulli(k1, 1.0 - self.hidden_dropout, h.shape)
-                inv_keep = jnp.asarray(1.0 / (1.0 - self.hidden_dropout), dtype=h.dtype)
-                h = jnp.where(keep, h * inv_keep, jnp.zeros((), dtype=h.dtype))
+            k1, k2 = jax.random.split(key)
+            h = inverted_dropout(h, self.hidden_dropout, k1)
         else:
             k2 = key
 
         # Output projection
-        out = linear_3d(self.fc2, h, self.compute_dtype, self.accum_dtype, self.gemm_backend)
+        out = linear_3d(self.fc2, h, self.compute_dtype, self.accum_dtype)
 
         # Output dropout
-        if not deterministic and self.dropout > 0.0 and k2 is not None:
-            keep = jax.random.bernoulli(k2, 1.0 - self.dropout, out.shape)
-            inv_keep = jnp.asarray(1.0 / (1.0 - self.dropout), dtype=out.dtype)
-            out = jnp.where(keep, out * inv_keep, jnp.zeros((), dtype=out.dtype))
+        if not deterministic and self.dropout > 0.0:
+            out = inverted_dropout(out, self.dropout, k2)
 
         # Apply residual rescaling if enabled (cast to preserve bf16)
         if self.alpha is not None:
-            out = out * jnp.asarray(self.alpha, dtype=out.dtype)
+            out = out * self.alpha.astype(out.dtype)
 
         return residual + out
-
-    @classmethod
-    def with_init(
-        cls,
-        model_dim: int,
-        ffn_hidden_dim: int,
-        norm_eps: float = 1e-5,
-        norm_affine: bool = True,
-        swiglu: bool = False,
-        rescale: bool = False,
-        layer_id: int = 0,
-        hidden_dropout: float = 0.0,
-        dropout: float = 0.0,
-        param_dtype: jnp.dtype = jnp.float32,
-        compute_dtype: jnp.dtype = jnp.float32,
-        accum_dtype: jnp.dtype = jnp.float32,
-        gemm_backend: str = "default",
-        init_mode: InitMode = "gaussian",
-        *,
-        key: PRNGKeyArray,
-    ) -> "NormalizedFFN":
-        """Create NormalizedFFN with custom weight initialization.
-
-        This is the recommended way to construct NormalizedFFN when using
-        custom initialization modes. Creates the module with default init,
-        then reinitializes all Linear weights according to init_mode.
-
-        :param int model_dim: Model hidden dimension.
-        :param int ffn_hidden_dim: FFN intermediate dimension.
-        :param float norm_eps: Epsilon for layer normalization.
-        :param bool norm_affine: Whether normalization includes affine parameters.
-        :param bool swiglu: Whether to use SwiGLU activation.
-        :param bool rescale: Whether to apply residual rescaling (rescale_nffn).
-        :param int layer_id: Layer index for computing rescale factor (0-indexed).
-        :param float hidden_dropout: Dropout after hidden layer.
-        :param float dropout: Dropout after output projection.
-        :param jnp.dtype param_dtype: Parameter storage dtype for Linear weights.
-        :param jnp.dtype compute_dtype: Compute dtype for matmuls and activations.
-        :param jnp.dtype accum_dtype: Accumulation dtype for matmuls/reductions.
-        :param str gemm_backend: GEMM backend selector.
-        :param InitMode init_mode: Initialization mode for Linear weights.
-        :param PRNGKeyArray key: PRNG key for initialization.
-        :return NormalizedFFN: Instance with reinitialized weights.
-        """
-        key1, key2 = jax.random.split(key)
-        instance = cls(
-            model_dim=model_dim,
-            ffn_hidden_dim=ffn_hidden_dim,
-            norm_eps=norm_eps,
-            norm_affine=norm_affine,
-            swiglu=swiglu,
-            rescale=rescale,
-            layer_id=layer_id,
-            hidden_dropout=hidden_dropout,
-            dropout=dropout,
-            param_dtype=param_dtype,
-            compute_dtype=compute_dtype,
-            accum_dtype=accum_dtype,
-            gemm_backend=gemm_backend,
-            key=key1,
-        )
-        if init_mode != "none":
-            # Don't pass dim - matches PyTorch behavior (std=1.0 for gaussian)
-            instance = reinit_linear_weights(instance, init_mode, key2)
-        return instance

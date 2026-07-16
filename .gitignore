@@ -187,5 +187,4 @@ __marimo__/
 profile/
 
 # setuptools-scm generated version file
-src/megalodon/_version.py
 src/megalodon_jax/_version.py

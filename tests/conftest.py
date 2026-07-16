@@ -12,7 +12,6 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
 
 import jax
-import numpy as np
 import pytest
 
 try:
@@ -24,6 +23,12 @@ except ModuleNotFoundError:  # pragma: no cover - optional dependency
 _JAX_GPU_AVAILABLE = jax.default_backend() == "gpu"
 _TORCH_AVAILABLE = torch is not None
 _TORCH_CUDA_AVAILABLE = bool(_TORCH_AVAILABLE and torch.cuda.is_available())
+_AGGRESSIVE_CLEANUP = os.environ.get("MEGALODON_TEST_AGGRESSIVE_CLEANUP", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def pytest_sessionstart(session: pytest.Session) -> None:
@@ -52,22 +57,27 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
 @pytest.fixture
 def random_seed() -> int:
-    """Seed numpy and torch RNGs for reproducibility.
+    """Return the deterministic seed shared by randomized tests.
 
     :return int: Seed value used for the session.
     """
-    if _TORCH_AVAILABLE:
-        torch.manual_seed(42)
-    np.random.seed(42)
     return 42
 
 
 @pytest.fixture(autouse=True)
 def clear_gpu_caches() -> Iterator[None]:
-    """Clear GPU caches before and after each test to prevent OOM.
+    """Release accelerator objects around tests that can otherwise retain memory.
+
+    CPU tests skip collection by default because collecting every test adds
+    substantial latency without releasing JAX compilation caches. Set
+    ``MEGALODON_TEST_AGGRESSIVE_CLEANUP=1`` for constrained CPU environments.
 
     :return Iterator[None]: Context that clears GPU caches around each test.
     """
+    if not (_AGGRESSIVE_CLEANUP or _JAX_GPU_AVAILABLE or _TORCH_CUDA_AVAILABLE):
+        yield
+        return
+
     import gc
 
     # Clear before test
@@ -83,54 +93,3 @@ def clear_gpu_caches() -> Iterator[None]:
     if _TORCH_CUDA_AVAILABLE:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-
-@pytest.fixture
-def force_fp32_matmul() -> Iterator[None]:
-    """Force float32 matmuls for precision-sensitive parity tests.
-
-    GPU matmuls use TensorFloat-32 by default on Ampere+ GPUs, which truncates
-    mantissa from 23 to 10 bits. This causes ~1e-3 differences vs fp32.
-    Use this fixture when exact parity with PyTorch CPU is required.
-
-    :return Iterator[None]: Context that forces float32 matmul precision.
-    """
-    import jax
-
-    original = jax.config.jax_default_matmul_precision
-    jax.config.update("jax_default_matmul_precision", "float32")
-    yield
-    jax.config.update("jax_default_matmul_precision", original)
-
-
-@pytest.fixture
-def torch_device() -> torch.device:
-    """Get the appropriate torch device and ensure TF32 settings match JAX.
-
-    Both PyTorch and JAX should use the same precision mode (TF32 on GPU).
-
-    :return torch.device: Selected torch device for the session.
-    """
-    if not _TORCH_AVAILABLE:
-        pytest.skip("torch is not installed")
-    if _TORCH_CUDA_AVAILABLE:
-        device = torch.device("cuda")
-        # Enable TF32 to match JAX's default behavior
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-    else:
-        device = torch.device("cpu")
-    return device
-
-
-def sync_and_clear_torch() -> None:
-    """Synchronize and clear PyTorch GPU memory before switching to JAX.
-
-    :return None: None.
-    """
-    import gc
-
-    gc.collect()
-    if _TORCH_CUDA_AVAILABLE:
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()

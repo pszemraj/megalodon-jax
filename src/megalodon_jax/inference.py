@@ -16,16 +16,26 @@
 from __future__ import annotations
 
 import functools
+import math
+import operator
 from collections.abc import Callable
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.cache import validate_generation_state_host
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.model import MegalodonForCausalLM
-from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache, NormState
+from megalodon_jax.types import (
+    AttentionCache,
+    GenerationState,
+    LayerCache,
+    ModelCache,
+    NormState,
+)
 
 # ---------------------------------------------------------------------------
 # Cache helpers
@@ -34,130 +44,15 @@ from megalodon_jax.types import AttentionCache, EMAState, LayerCache, ModelCache
 
 def init_cache(
     config: MegalodonConfig,
-    batch_size: int,
-    dtype: jnp.dtype | None = None,
-    *,
-    allocate_kv: bool = False,
-    allocate_norm: bool = False,
-    allocate_ema: bool = False,
 ) -> ModelCache:
-    """Create an empty ModelCache for autoregressive generation.
+    """Create a sparse zero-history cache for autoregressive generation.
 
     :param MegalodonConfig config: Model configuration.
-    :param int batch_size: Batch size for cached tensors.
-    :param jnp.dtype | None dtype: Floating dtype for cached arrays (defaults to config.compute_dtype).
-    :param bool allocate_kv: Whether to pre-allocate KV buffers.
-    :param bool allocate_norm: Whether to pre-allocate TimestepNorm state.
-    :param bool allocate_ema: Whether to pre-allocate ComplexEMA state.
     :return ModelCache: Initialized cache with per-layer state.
     """
 
-    cache_len = config.effective_max_cache_len
-    cache_dtype = config.compute_dtype if dtype is None else dtype
-    num_heads = config.num_heads
-    head_dim = config.head_dim
-    value_head_dim = config.value_head_dim
-
-    def make_attn_cache() -> AttentionCache | None:
-        """Build an AttentionCache when KV preallocation is requested.
-
-        :return AttentionCache | None: Allocated cache or None.
-        """
-        if not allocate_kv:
-            return None
-        k = jnp.zeros((batch_size, cache_len, num_heads, head_dim), dtype=cache_dtype)
-        v = jnp.zeros((batch_size, cache_len, num_heads, value_head_dim), dtype=cache_dtype)
-        return AttentionCache(k=k, v=v, count=jnp.array(0, dtype=jnp.int32))
-
-    def make_norm_state() -> NormState:
-        """Create an initialized NormState for a batch.
-
-        :return NormState: Initialized norm state.
-        """
-        return NormState(
-            count=jnp.zeros((batch_size,), dtype=jnp.int32),
-            mean=jnp.zeros((batch_size, config.norm_num_groups), dtype=jnp.float32),
-            var=jnp.ones((batch_size, config.norm_num_groups), dtype=jnp.float32),
-        )
-
-    def make_ema_state() -> EMAState:
-        """Create an initialized EMAState for a batch.
-
-        :return EMAState: Initialized EMA state.
-        """
-        h = jnp.zeros((batch_size, config.model_dim, config.cema_ndim), dtype=jnp.complex64)
-        return EMAState(h=h)
-
-    layer_caches = []
-    for _ in range(config.num_layers):
-        layer_caches.append(
-            LayerCache(
-                attn=make_attn_cache(),
-                norm=make_norm_state() if allocate_norm else None,
-                ema=make_ema_state() if allocate_ema else None,
-                position=jnp.array(0, dtype=jnp.int32),
-            )
-        )
-
-    final_norm = make_norm_state()
-
-    return ModelCache(layer_caches=tuple(layer_caches), final_norm=final_norm)
-
-
-def trim_cache(cache: ModelCache, max_len: int) -> ModelCache:
-    """Trim KV cache entries to the most recent ``max_len`` tokens.
-
-    The cache is stored as a ring buffer; trimming preserves absolute positions
-    by reindexing into a smaller ring when needed.
-
-    :param ModelCache cache: Cache to trim.
-    :param int max_len: Maximum number of tokens to retain.
-    :return ModelCache: Trimmed cache.
-    """
-
-    def trim_layer(layer_cache: LayerCache | None) -> LayerCache | None:
-        """Trim a layer cache to the newest max_len entries.
-
-        :param LayerCache | None layer_cache: Layer cache to trim.
-        :return LayerCache | None: Trimmed layer cache.
-        """
-        if layer_cache is None or layer_cache.attn is None:
-            return layer_cache
-        attn = layer_cache.attn
-        cache_size = attn.k.shape[1]
-        if cache_size <= max_len:
-            return layer_cache
-        valid_len = jnp.minimum(attn.count, cache_size)
-        keep_len = jnp.minimum(valid_len, max_len)
-        idx = jnp.arange(max_len, dtype=jnp.int32)
-        keep_mask = idx < keep_len
-        start_pos = attn.count - keep_len
-        old_idx = jnp.mod(start_pos + idx, cache_size)
-        new_idx = jnp.mod(start_pos + idx, max_len)
-
-        k_keep = jnp.take(attn.k, old_idx, axis=1)
-        v_keep = jnp.take(attn.v, old_idx, axis=1)
-        mask = keep_mask[None, :, None, None]
-        k_keep = jnp.where(mask, k_keep, jnp.zeros((), dtype=attn.k.dtype))
-        v_keep = jnp.where(mask, v_keep, jnp.zeros((), dtype=attn.v.dtype))
-
-        B, _, H, Dh = attn.k.shape
-        _, _, _, Dv = attn.v.shape
-        new_k = jnp.zeros((B, max_len, H, Dh), dtype=attn.k.dtype)
-        new_v = jnp.zeros((B, max_len, H, Dv), dtype=attn.v.dtype)
-        new_k = new_k.at[:, new_idx].set(k_keep)
-        new_v = new_v.at[:, new_idx].set(v_keep)
-
-        trimmed = AttentionCache(k=new_k, v=new_v, count=attn.count)
-        return LayerCache(
-            attn=trimmed,
-            norm=layer_cache.norm,
-            ema=layer_cache.ema,
-            position=layer_cache.position,
-        )
-
-    trimmed_layers = tuple(trim_layer(lc) for lc in cache.layer_caches)
-    return ModelCache(layer_caches=trimmed_layers, final_norm=cache.final_norm)
+    layer_caches = tuple(None for _ in range(config.num_layers))
+    return ModelCache(layer_caches=layer_caches, final_norm=None)
 
 
 def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCache:
@@ -169,7 +64,62 @@ def index_cache(cache: ModelCache, indices: Int[Array, "new_batch"]) -> ModelCac
     :param ModelCache cache: Cache to slice.
     :param Int[Array, "new_batch"] indices: Batch indices to select.
     :return ModelCache: Sliced cache.
+    :raises TypeError: If indices do not have an integer dtype.
+    :raises ValueError: If indices are not rank one or are out of bounds.
     """
+
+    source_dtype = getattr(indices, "dtype", None)
+    if source_dtype is not None and np.dtype(source_dtype) != np.dtype(np.int32):
+        raise TypeError(f"indices must have dtype int32, got {source_dtype}")
+
+    indices = jnp.asarray(indices)
+    if indices.ndim != 1:
+        raise ValueError(f"indices must be rank one, got shape {indices.shape}")
+    if indices.dtype != jnp.int32:
+        raise TypeError(f"indices must have dtype int32, got {indices.dtype}")
+
+    batch_size: int | None = None
+
+    def bind_batch(name: str, x: Array) -> None:
+        """Bind and cross-check the batch width of one cache array.
+
+        :param str name: Cache component name used in validation errors.
+        :param Array x: Cache array with a leading batch dimension.
+        """
+        nonlocal batch_size
+        if x.ndim == 0:
+            raise ValueError(f"{name} must have a batch dimension")
+        if batch_size is None:
+            batch_size = x.shape[0]
+        elif x.shape[0] != batch_size:
+            raise ValueError(f"cache batch mismatch at {name}: {x.shape[0]} != {batch_size}")
+
+    for layer_index, layer_cache in enumerate(cache.layer_caches):
+        if layer_cache is None:
+            continue
+        if layer_cache.attn is not None:
+            bind_batch(f"layers.{layer_index}.attn.k", layer_cache.attn.k)
+            bind_batch(f"layers.{layer_index}.attn.v", layer_cache.attn.v)
+        if layer_cache.norm is not None:
+            bind_batch(f"layers.{layer_index}.norm.count", layer_cache.norm.count)
+            bind_batch(f"layers.{layer_index}.norm.mean", layer_cache.norm.mean)
+            bind_batch(f"layers.{layer_index}.norm.var", layer_cache.norm.var)
+        if layer_cache.ema is not None:
+            bind_batch(f"layers.{layer_index}.ema.h", layer_cache.ema.h)
+    if cache.final_norm is not None:
+        bind_batch("final_norm.count", cache.final_norm.count)
+        bind_batch("final_norm.mean", cache.final_norm.mean)
+        bind_batch("final_norm.var", cache.final_norm.var)
+
+    if batch_size is None:
+        if indices.size != 0:
+            raise ValueError("cannot index a sparse cache without allocated batch state")
+    else:
+        indices = eqx.error_if(
+            indices,
+            jnp.any((indices < 0) | (indices >= batch_size)),
+            f"cache indices must be in [0, {batch_size})",
+        )
 
     def index_array(x: Array | None) -> Array | None:
         """Index a cache array along the batch dimension.
@@ -255,10 +205,10 @@ def _apply_top_k(
     """
     if top_k is None or top_k <= 0:
         return logits
-    k = int(min(top_k, logits.shape[-1]))
-    values, _ = jax.lax.top_k(logits, k)
-    thresh = values[:, -1][:, None]
-    return jnp.where(logits < thresh, -jnp.inf, logits)
+    values, indices = jax.lax.top_k(logits, top_k)
+    filtered = jnp.full_like(logits, -jnp.inf)
+    batch = jnp.arange(logits.shape[0])[:, None]
+    return filtered.at[batch, indices].set(values)
 
 
 def _apply_top_p(
@@ -278,8 +228,7 @@ def _apply_top_p(
         return logits
 
     if top_k is not None and top_k > 0:
-        k = int(min(top_k, logits.shape[-1]))
-        sorted_logits, sorted_indices = jax.lax.top_k(logits, k)
+        sorted_logits, sorted_indices = jax.lax.top_k(logits, top_k)
     else:
         sorted_indices = jnp.argsort(logits, axis=-1)[:, ::-1]
         sorted_logits = jnp.take_along_axis(logits, sorted_indices, axis=-1)
@@ -323,12 +272,26 @@ def sample_token(
     :return Int[Array, "batch"]: Sampled token IDs.
     """
 
-    if temperature < 0.0:
-        raise ValueError(f"temperature must be >= 0, got {temperature}")
-    if top_k is not None and top_k < 0:
-        raise ValueError(f"top_k must be >= 0, got {top_k}")
-    if temperature != 0.0 and top_p is not None and not (0.0 < top_p <= 1.0):
-        raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+    _validate_sampling(temperature, top_k, top_p, logits.shape[-1])
+    return _sample_token_validated(logits, key, temperature, top_k, top_p)
+
+
+def _sample_token_validated(
+    logits: Float[Array, "batch vocab"],
+    key: PRNGKeyArray,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+) -> Int[Array, "batch"]:
+    """Sample after the eager public boundary has validated static controls.
+
+    :param Float[Array, "batch vocab"] logits: Logits for sampling.
+    :param PRNGKeyArray key: PRNG key for categorical sampling.
+    :param float temperature: Validated sampling temperature.
+    :param int | None top_k: Validated top-k filter.
+    :param float | None top_p: Validated top-p filter.
+    :return Int[Array, "batch"]: Sampled token IDs.
+    """
 
     if temperature == 0.0:
         return greedy_token(logits)
@@ -365,7 +328,90 @@ def _sample_fn(
     """
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
-    return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
+    return functools.partial(
+        _sample_token_validated,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+    )
+
+
+def _validate_sampling(
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+    output_size: int,
+) -> None:
+    """Validate sampling controls before selecting greedy or stochastic execution.
+
+    :param float temperature: Sampling temperature, including zero for greedy decoding.
+    :param int | None top_k: Maximum number of candidate tokens, or None.
+    :param float | None top_p: Nucleus probability threshold, or None.
+    :param int output_size: Width of the model output vocabulary.
+    :raises ValueError: If a control is non-finite, out of range, or has an invalid type.
+    """
+    if isinstance(temperature, (bool, np.bool_)):
+        raise ValueError("temperature must be a non-boolean finite number")
+    if not math.isfinite(temperature) or temperature < 0.0:
+        raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
+    if top_k is not None:
+        if isinstance(top_k, bool):
+            raise ValueError(f"top_k must be an integer, got {top_k!r}")
+        try:
+            top_k_value = operator.index(top_k)
+        except TypeError as error:
+            raise ValueError(f"top_k must be an integer, got {top_k!r}") from error
+        if not 0 <= top_k_value <= output_size:
+            raise ValueError(f"top_k must be in [0, {output_size}], got {top_k}")
+    if top_p is not None:
+        if isinstance(top_p, (bool, np.bool_)):
+            raise ValueError("top_p must be a non-boolean finite number")
+        if not math.isfinite(top_p) or not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be finite and in (0, 1], got {top_p}")
+
+
+def _validate_max_new_tokens(max_new_tokens: object) -> int:
+    """Normalize a requested generation length through the integer protocol.
+
+    :param object max_new_tokens: Requested number of generated tokens.
+    :raises ValueError: If the value is not a positive, non-boolean integer.
+    :return int: Normalized positive generation length.
+    """
+    if isinstance(max_new_tokens, bool):
+        raise ValueError("max_new_tokens must be a positive integer")
+    try:
+        value = operator.index(max_new_tokens)
+    except TypeError as error:
+        raise ValueError("max_new_tokens must be a positive integer") from error
+    if value <= 0:
+        raise ValueError("max_new_tokens must be a positive integer")
+    return value
+
+
+def _validate_token_id_override(
+    name: str,
+    token_id: object | None,
+    vocab_size: int,
+) -> int | None:
+    """Normalize an optional special-token override and enforce vocabulary bounds.
+
+    :param str name: Argument name used in validation errors.
+    :param object | None token_id: Optional token ID override.
+    :param int vocab_size: Exclusive upper vocabulary bound.
+    :raises ValueError: If the override is not a non-boolean integer in range.
+    :return int | None: Normalized token ID or ``None``.
+    """
+    if token_id is None:
+        return None
+    if isinstance(token_id, bool):
+        raise ValueError(f"{name} must be an integer token ID")
+    try:
+        value = operator.index(token_id)
+    except TypeError as error:
+        raise ValueError(f"{name} must be an integer token ID") from error
+    if not 0 <= value < vocab_size:
+        raise ValueError(f"{name} must be in [0, {vocab_size}), got {value}")
+    return value
 
 
 def _generate_core(
@@ -377,17 +423,24 @@ def _generate_core(
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
-    bos_token_id: int | None = None,
     eos_token_id: int | None = None,
     attention_mask: Bool[Array, "batch prompt_len"] | None = None,
     cache: ModelCache | None = None,
+    state: GenerationState | None = None,
     return_cache: bool = False,
-) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
-    """Autoregressive generation using a fixed-shape scan.
+    return_state: bool = False,
+) -> tuple[
+    Int[Array, "batch total_len"],
+    GenerationState | ModelCache | None,
+    PRNGKeyArray | None,
+]:
+    """Implement the validated numerical transition wrapped by ``filter_jit`` below.
 
-    If return_cache is True and max_new_tokens == 1, the cache is advanced to
-    include the generated token. If sampling is enabled (temperature > 0),
-    the returned key is the next key to use for subsequent sampling calls.
+    A ``GenerationState`` resumes directly from its stored next-token logits;
+    its cache already includes every previously emitted token. If sampling is
+    enabled, the returned key is the next key for a subsequent call. All host
+    validation and empty-prompt normalization occur in :func:`generate` before
+    this function is entered.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
@@ -396,78 +449,68 @@ def _generate_core(
     :param float temperature: Sampling temperature.
     :param int | None top_k: Top-k filter.
     :param float | None top_p: Top-p filter.
-    :param int | None bos_token_id: Optional BOS token ID.
     :param int | None eos_token_id: Optional EOS token ID.
     :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
-    :param ModelCache | None cache: Optional cache state.
-    :param bool return_cache: Whether to return cache.
-    :raises ValueError: If inputs are invalid or missing required RNG.
-    :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
+    :param ModelCache | None cache: Optional model-level prefix cache.
+    :param GenerationState | None state: Complete generation continuation state.
+    :param bool return_cache: Whether to return the final model-level cache.
+    :param bool return_state: Whether to return complete resumable generation state.
+    :return tuple[Int[Array, "batch total_len"], GenerationState | ModelCache | None, PRNGKeyArray | None]: Output IDs, continuation artifact, and key.
     """
-
-    if max_new_tokens < 0:
-        raise ValueError(f"max_new_tokens must be non-negative, got {max_new_tokens}")
-    if max_new_tokens == 0:
-        raise ValueError(
-            "max_new_tokens must be > 0 to generate; Transformers treats this as an invalid length."
-        )
-
     needs_rng = temperature != 0.0
-    if needs_rng and key is None:
-        raise ValueError("key is required when temperature > 0.")
-
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
 
-    if prompt_len == 0:
-        if bos_token_id is None:
-            bos_token_id = getattr(model.config, "bos_token_id", None)
-        if bos_token_id is None:
-            raise ValueError(
-                "prompt_ids is empty; provide bos_token_id or pass at least one token."
-            )
-        prompt_ids = jnp.full((B, 1), bos_token_id, dtype=prompt_ids.dtype)
-        attention_mask = jnp.ones((B, 1), dtype=jnp.bool_)
-        prompt_len = 1
-
-    needs_cache = return_cache or max_new_tokens > 1
-
-    # Prefill
-    logits, cache = model(
-        prompt_ids,
-        attention_mask=attention_mask,
-        cache=cache,
-        return_cache=needs_cache,
-        deterministic=True,
-    )
-
-    if attention_mask is not None:
-        mask = attention_mask.astype(jnp.bool_)
-        positions = jnp.arange(prompt_len, dtype=jnp.int32)
-        masked_positions = jnp.where(mask, positions, -1)
-        last_idx = masked_positions.max(axis=1)
-        has_empty = jnp.any(last_idx < 0)
-        last_idx = eqx.error_if(
-            last_idx,
-            has_empty,
-            "attention_mask must contain at least one True per batch element.",
-        )
-        gather_idx = jnp.broadcast_to(last_idx[:, None, None], (B, 1, logits.shape[-1]))
-        last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+    if state is not None:
+        cache = state.cache
+        last_logits = state.next_logits
+        finished = state.finished
     else:
-        last_logits = logits[:, -1, :]
+        needs_cache = return_cache or return_state or max_new_tokens > 1
+        logits, cache = model(
+            prompt_ids,
+            attention_mask=attention_mask,
+            cache=cache,
+            return_cache=needs_cache,
+            deterministic=True,
+        )
+
+        if attention_mask is not None:
+            mask = attention_mask.astype(jnp.bool_)
+            positions = jnp.arange(prompt_len, dtype=jnp.int32)
+            masked_positions = jnp.where(mask, positions, -1)
+            last_idx = masked_positions.max(axis=1)
+            has_empty = jnp.any(last_idx < 0)
+            last_idx = eqx.error_if(
+                last_idx,
+                has_empty,
+                "attention_mask must contain at least one True per batch element.",
+            )
+            gather_idx = jnp.broadcast_to(
+                last_idx[:, None, None],
+                (B, 1, logits.shape[-1]),
+            )
+            last_logits = jnp.take_along_axis(logits, gather_idx, axis=1)[:, 0, :]
+        else:
+            last_logits = logits[:, -1, :]
+        finished = jnp.zeros((B,), dtype=jnp.bool_)
 
     if needs_rng:
         key, subkey = jax.random.split(key)
     else:
         subkey = None
     first_token = sample(last_logits, subkey)
-
-    finished = jnp.zeros((B,), dtype=jnp.bool_)
     if eos_token_id is not None:
-        finished = first_token == eos_token_id
+        finished = finished | (first_token == eos_token_id)
         first_token = jnp.where(finished, eos_token_id, first_token)
 
+    needs_final_artifact = return_cache or return_state
+    if (max_new_tokens > 1 or needs_final_artifact) and cache is None:
+        raise RuntimeError("generation cache was not initialized")
+
+    # Fixed-shape batching advances finished rows with synthetic EOS tokens. Attention uses
+    # one scalar timeline for the whole batch, so the returned cache matches the rectangular
+    # result rather than a row sliced at its first EOS.
     if needs_rng:
 
         def scan_step(
@@ -536,16 +579,19 @@ def _generate_core(
             return (new_cache, next_token, done), next_token
 
     if max_new_tokens == 1:
-        if return_cache:
-            _, cache = model(
+        final_cache = None
+        next_logits = None
+        if needs_final_artifact:
+            logits_step, final_cache = model(
                 first_token[:, None],
                 cache=cache,
                 return_cache=True,
                 deterministic=True,
             )
-        final_cache = cache if return_cache else None
+            next_logits = logits_step[:, 0, :]
         generated = first_token[:, None]
         final_key = key
+        final_finished = finished
     else:
         if needs_rng:
             init_carry = (cache, first_token, key, finished)
@@ -557,6 +603,7 @@ def _generate_core(
             )
             scan_cache = final_carry[0]
             final_key = final_carry[2]
+            final_finished = final_carry[3]
         else:
             init_carry = (cache, first_token, finished)
             final_carry, tokens_scan = jax.lax.scan(
@@ -567,21 +614,42 @@ def _generate_core(
             )
             scan_cache = final_carry[0]
             final_key = key
+            final_finished = final_carry[2]
 
         generated = jnp.concatenate([first_token[:, None], tokens_scan.T], axis=1)
-        if return_cache:
+        final_cache = None
+        next_logits = None
+        if needs_final_artifact:
             last_token = generated[:, -1]
-            _, final_cache = model(
+            logits_step, final_cache = model(
                 last_token[:, None],
                 cache=scan_cache,
                 return_cache=True,
                 deterministic=True,
             )
-        else:
-            final_cache = None
+            next_logits = logits_step[:, 0, :]
+
+    continuation: GenerationState | ModelCache | None
+    if return_state:
+        assert final_cache is not None and next_logits is not None
+        continuation = GenerationState(
+            cache=final_cache,
+            next_logits=jax.lax.stop_gradient(next_logits),
+            finished=final_finished,
+            eos_token_id=eos_token_id,
+        )
+    elif return_cache:
+        continuation = final_cache
+    else:
+        continuation = None
 
     result = jnp.concatenate([prompt_ids, generated], axis=1)
-    return result, final_cache, final_key
+    return result, continuation, final_key
+
+
+# Keep the public API eager for fail-closed validation while compiling the
+# complete validated prompt/decode transition behind one private boundary.
+_compiled_generate_core = eqx.filter_jit(_generate_core)
 
 
 def generate(
@@ -597,9 +665,20 @@ def generate(
     eos_token_id: int | None = None,
     attention_mask: Bool[Array, "batch prompt_len"] | None = None,
     cache: ModelCache | None = None,
+    state: GenerationState | None = None,
     return_cache: bool = False,
-) -> tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]:
+    return_state: bool = False,
+) -> tuple[
+    Int[Array, "batch total_len"],
+    GenerationState | ModelCache | None,
+    PRNGKeyArray | None,
+]:
     """Autoregressive generation with padding-aware constraints.
+
+    Use ``state`` with an empty ``prompt_ids`` array and ``return_state=True``
+    for exact split-call continuation. A raw ``ModelCache`` is accepted and
+    returned for model-forward compatibility, but it does not contain the
+    next-token logits or EOS status required to resume ``generate()``.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
@@ -611,37 +690,127 @@ def generate(
     :param int | None bos_token_id: Optional BOS token ID.
     :param int | None eos_token_id: Optional EOS token ID.
     :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
-    :param ModelCache | None cache: Optional cache.
-    :param bool return_cache: Whether to return cache.
+    :param ModelCache | None cache: Optional model-level prefix cache.
+    :param GenerationState | None state: Complete generation continuation state.
+    :param bool return_cache: Whether to return a model-level cache. This artifact alone
+        cannot resume generation.
+    :param bool return_state: Whether to return complete resumable generation state.
     :raises ValueError: If inputs are invalid or padding constraints are violated.
-    :return tuple[Int[Array, "batch total_len"], ModelCache | None, PRNGKeyArray | None]: Output IDs, cache, key.
+    :return tuple[Int[Array, "batch total_len"], GenerationState | ModelCache | None, PRNGKeyArray | None]: Output IDs, continuation artifact, and key.
     """
 
-    if attention_mask is None:
-        return _generate_core(
-            model,
-            prompt_ids,
-            max_new_tokens,
-            key,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            attention_mask=None,
-            cache=cache,
-            return_cache=return_cache,
-        )
+    max_new_tokens = _validate_max_new_tokens(max_new_tokens)
+    if prompt_ids.ndim != 2:
+        raise ValueError(f"prompt_ids must be rank two, got shape {prompt_ids.shape}")
+    if not jnp.issubdtype(prompt_ids.dtype, jnp.integer):
+        raise TypeError(f"prompt_ids must have integer dtype, got {prompt_ids.dtype}")
+    if cache is not None and state is not None:
+        raise ValueError("cache and state are mutually exclusive")
+    if return_cache and return_state:
+        raise ValueError("return_cache and return_state are mutually exclusive")
+    if model.config.effective_output_size != model.config.vocab_size:
+        raise ValueError("generate requires effective_output_size to equal vocab_size")
+    _validate_sampling(
+        temperature,
+        top_k,
+        top_p,
+        model.config.effective_output_size,
+    )
+    temperature = float(temperature)
+    top_k = None if top_k is None else operator.index(top_k)
+    top_p = None if top_p is None else float(top_p)
+    if temperature != 0.0 and key is None:
+        raise ValueError("key is required when temperature > 0.")
 
-    has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
-    needs_cache = cache is not None or return_cache or max_new_tokens > 1
-    if has_padding and needs_cache:
+    bos_token_id = _validate_token_id_override(
+        "bos_token_id",
+        bos_token_id,
+        model.config.vocab_size,
+    )
+    eos_token_id = _validate_token_id_override(
+        "eos_token_id",
+        eos_token_id,
+        model.config.vocab_size,
+    )
+    if state is not None:
+        # Match model-entry validation cost: check compact state and schemas on
+        # every call, while persistence performs the full K/V payload scan.
+        validate_generation_state_host(
+            state,
+            model.config,
+            check_full_payload=False,
+        )
+        if eos_token_id is None:
+            eos_token_id = None if state.eos_token_id is None else int(state.eos_token_id)
+        elif eos_token_id != state.eos_token_id:
+            raise ValueError(
+                "eos_token_id must match generation state metadata; got "
+                f"{eos_token_id} and {state.eos_token_id}"
+            )
+
+    batch_size, prompt_len = prompt_ids.shape
+    if state is not None:
+        if prompt_len != 0:
+            raise ValueError("state continuation requires an empty prompt_ids sequence")
+        if batch_size != state.next_logits.shape[0]:
+            raise ValueError(
+                "prompt_ids batch size must match generation state, got "
+                f"{batch_size} and {state.next_logits.shape[0]}"
+            )
+    elif prompt_len == 0 and cache is not None:
         raise ValueError(
-            "Cannot use cache with padded attention_mask. "
-            "Provide unpadded prompts for cached generation."
+            "empty-prompt continuation requires GenerationState; ModelCache does not "
+            "contain next-token logits"
         )
 
-    return _generate_core(
+    if attention_mask is not None:
+        attention_mask = jnp.asarray(attention_mask)
+        if attention_mask.shape != prompt_ids.shape:
+            raise ValueError(
+                "attention_mask shape must match prompt_ids shape, got "
+                f"{attention_mask.shape} and {prompt_ids.shape}"
+            )
+        has_padding = not bool(jax.device_get(jnp.all(attention_mask)))
+        needs_cache = (
+            cache is not None
+            or state is not None
+            or return_cache
+            or return_state
+            or max_new_tokens > 1
+        )
+        if has_padding and needs_cache:
+            raise ValueError(
+                "Cannot use cache with padded attention_mask. "
+                "Provide unpadded prompts for cached generation."
+            )
+        if has_padding:
+            mask = attention_mask.astype(jnp.bool_)
+            if bool(jax.device_get(jnp.any(~jnp.any(mask, axis=1)))):
+                raise ValueError("attention_mask must contain at least one True per batch element.")
+            has_non_right_padding = jnp.any((~mask[:, :-1]) & mask[:, 1:])
+            if bool(jax.device_get(has_non_right_padding)):
+                raise ValueError(
+                    "attention_mask rows must contain a contiguous valid prefix followed by "
+                    "optional right padding"
+                )
+            attention_mask = mask
+        else:
+            attention_mask = None
+
+    if state is None and prompt_len == 0:
+        resolved_bos = bos_token_id
+        if resolved_bos is None:
+            resolved_bos = getattr(model.config, "bos_token_id", None)
+        if resolved_bos is None:
+            raise ValueError(
+                "prompt_ids is empty; provide bos_token_id or pass at least one token."
+            )
+        prompt_ids = jnp.full((batch_size, 1), resolved_bos, dtype=prompt_ids.dtype)
+        # The synthetic BOS is valid and unpadded. Cached calls represent the
+        # all-valid case with no mask metadata.
+        attention_mask = None
+
+    return _compiled_generate_core(
         model,
         prompt_ids,
         max_new_tokens,
@@ -649,13 +818,10 @@ def generate(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
         attention_mask=attention_mask,
         cache=cache,
+        state=state,
         return_cache=return_cache,
+        return_state=return_state,
     )
-
-
-# Convenience JIT wrapper for generation with static knobs
-generate_jit = eqx.filter_jit(_generate_core)

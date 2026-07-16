@@ -16,7 +16,19 @@
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Float, PRNGKeyArray
+from jaxtyping import Array, Float
+
+
+def _rms_normalize(x: Array, eps: float) -> Array:
+    """Return RMS-normalized values in fp32 for numerically sensitive callers.
+
+    :param Array x: Values to normalize over their final axis.
+    :param float eps: Numerical stability epsilon added to the mean square.
+    :return Array: RMS-normalized fp32 values.
+    """
+    x_f32 = x.astype(jnp.float32)
+    rms = jnp.sqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + eps)
+    return x_f32 / rms
 
 
 class RMSNorm(eqx.Module):
@@ -27,13 +39,11 @@ class RMSNorm(eqx.Module):
     initializing gamma to zeros gives an effective scale of 1.
 
     Attributes:
-        dim: Feature dimension.
         eps: Small constant for numerical stability.
         affine: Whether to include learnable scale parameter.
         gamma: Learnable scale parameter (shape: dim), or None if affine=False.
     """
 
-    dim: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
     affine: bool = eqx.field(static=True)
     gamma: Float[Array, "dim"] | None
@@ -43,19 +53,14 @@ class RMSNorm(eqx.Module):
         dim: int,
         eps: float = 1e-6,
         affine: bool = True,
-        *,
-        key: PRNGKeyArray | None = None,
     ):
         """Initialize RMSNorm.
 
         :param int dim: Feature dimension.
         :param float eps: Numerical stability epsilon.
         :param bool affine: Whether to include learnable scale.
-        :param PRNGKeyArray | None key: PRNG key (unused).
         :return None: None.
         """
-        del key  # unused
-        self.dim = dim
         self.eps = eps
         self.affine = affine
         if affine:
@@ -69,11 +74,9 @@ class RMSNorm(eqx.Module):
         :param Float[Array, "... dim"] x: Input tensor with feature dimension last.
         :return Float[Array, "... dim"]: Normalized tensor.
         """
-        # Compute RMS in fp32 to avoid bf16 overflow on x**2
-        # (bf16 max ~65504, so values > ~256 would overflow when squared)
-        x_f32 = x.astype(jnp.float32)
-        rms = jnp.sqrt(jnp.mean(x_f32**2, axis=-1, keepdims=True) + self.eps)
-        x_normed = (x_f32 / rms).astype(x.dtype)
+        # Compute RMS in fp32 for reduction accuracy and stable squared sums.
+        # BF16 has FP32-like exponent range (~3.39e38), unlike FP16 (~65504).
+        x_normed = _rms_normalize(x, self.eps).astype(x.dtype)
         # Apply scale if affine (cast gamma to input dtype to preserve bf16)
         if self.affine and self.gamma is not None:
             scale = (self.gamma + 1.0).astype(x.dtype)
@@ -85,10 +88,9 @@ class BatchedLayerNorm(eqx.Module):
     """LayerNorm for batched inputs with normalization over the last dimension.
 
     This implementation accepts arbitrary leading dimensions and normalizes over
-    the final axis, matching PyTorch LayerNorm semantics for [*, D] inputs.
+    the final axis. Stored weight uses the released plus-one parameterization.
     """
 
-    dim: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
     affine: bool = eqx.field(static=True)
     weight: Float[Array, "dim"] | None
@@ -99,23 +101,18 @@ class BatchedLayerNorm(eqx.Module):
         dim: int,
         eps: float = 1e-5,
         affine: bool = True,
-        *,
-        key: PRNGKeyArray | None = None,
     ):
         """Initialize BatchedLayerNorm.
 
         :param int dim: Feature dimension for normalization.
         :param float eps: Numerical stability epsilon.
         :param bool affine: Whether to include learnable scale and bias.
-        :param PRNGKeyArray | None key: PRNG key (unused).
         :return None: None.
         """
-        del key  # unused
-        self.dim = dim
         self.eps = eps
         self.affine = affine
         if affine:
-            self.weight = jnp.ones((dim,), dtype=jnp.float32)
+            self.weight = jnp.zeros((dim,), dtype=jnp.float32)
             self.bias = jnp.zeros((dim,), dtype=jnp.float32)
         else:
             self.weight = None
@@ -133,7 +130,7 @@ class BatchedLayerNorm(eqx.Module):
         y = (x_f32 - mean) * jax.lax.rsqrt(var + self.eps)
         y = y.astype(x.dtype)
         if self.affine and self.weight is not None and self.bias is not None:
-            weight = self.weight.astype(x.dtype)
+            weight = (self.weight + 1.0).astype(x.dtype)
             bias = self.bias.astype(x.dtype)
             y = y * weight + bias
         return y

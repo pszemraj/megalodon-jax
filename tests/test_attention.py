@@ -18,7 +18,75 @@ from megalodon_jax.layers import (
     attention_multi_chunk,
     attention_single_chunk,
 )
-from tests.utils import require_torch_modeling, to_jax, to_torch
+from megalodon_jax.ops import dot_precision
+from megalodon_jax.types import AttentionCache
+from tests.reference.cache import cache_partition_errors
+
+_CACHE_PARTITIONS = (
+    (1,) * 12,
+    (3, 2, 7),
+    (5, 4, 3),
+    (4, 4, 4),
+    (3, 5, 4),
+    (7, 1, 4),
+)
+_FAST_CACHE_PARTITION = (3, 5, 4)
+
+
+def assert_cache_partition_invariance(
+    attention_window: int | None,
+    partition: tuple[int, ...],
+    seed: int,
+) -> None:
+    """Assert cached and noncached attention agree for one call partition."""
+    errors = cache_partition_errors(attention_window, partition, seed=seed)
+    assert errors["output"] <= 2e-6
+    assert errors["noncached_output"] <= 2e-6
+    # Vectorized prefill and tokenwise decode may use different transcendental
+    # lowering for RoPE, so K agrees to fp32 precision rather than bit identity.
+    assert errors["cache_k"] <= 2e-6
+    assert errors["cache_v"] == 0.0
+    assert errors["cache_count"] == 0.0
+
+
+@pytest.mark.parametrize("probability", [-0.1, 1.0])
+@pytest.mark.parametrize(
+    ("module_kind", "field"),
+    [
+        ("chunked", "attention_dropout"),
+        ("ffn", "dropout"),
+        ("ffn", "hidden_dropout"),
+        ("attention", "dropout"),
+        ("attention", "attention_dropout"),
+        ("attention", "hidden_dropout"),
+    ],
+)
+def test_module_dropout_probability_validation(
+    module_kind: str,
+    field: str,
+    probability: float,
+    random_seed: int,
+) -> None:
+    """Every reusable module rejects invalid inverted-dropout probabilities."""
+    key = jax.random.PRNGKey(random_seed)
+    with pytest.raises(ValueError, match=rf"{field} must be in \[0, 1\)"):
+        if module_kind == "chunked":
+            ChunkedAttention(1, 4, 4, 4, **{field: probability})
+        elif module_kind == "ffn":
+            NormalizedFFN(8, 16, key=key, **{field: probability})
+        else:
+            MegalodonAttention(
+                model_dim=8,
+                z_dim=8,
+                value_dim=8,
+                num_heads=2,
+                cema_ndim=2,
+                chunk_size=4,
+                norm_num_groups=2,
+                key=key,
+                **{field: probability},
+            )
+
 
 # -----------------------------------------------------------------------------
 # Attention Primitive Tests
@@ -65,47 +133,45 @@ class TestAttentionPrimitives:
 
         out = attention_single_chunk(q, k, v, causal=True)
 
-        # For causal attention, verify shapes and non-NaN outputs
-        assert out.shape == (batch, seq, heads, head_dim)
-        assert not jnp.any(jnp.isnan(out))
-
-        # Verify causality: output at position 0 should only depend on input at position 0
-        # We can test this by checking that changing future inputs doesn't affect past outputs
-        # Modify v at position 3 and check that output at position 0 is unchanged
-        v_modified = v.at[:, 3, :, :].set(v[:, 3, :, :] * 100)
-        out_modified = attention_single_chunk(q, k, v_modified, causal=True)
-
-        # Position 0 output should be identical (can't see position 3)
+        # The first query has exactly one visible key, so this is a direct causal anchor.
         np.testing.assert_allclose(
-            np.array(out[:, 0, :, :]),
-            np.array(out_modified[:, 0, :, :]),
+            np.array(out[:, 0]),
+            np.array(v[:, 0]),
             rtol=1e-6,
-            err_msg="Causal masking failed: position 0 saw future position 3",
+            err_msg="First causal position should output its own value exactly",
         )
 
-    def test_single_chunk_no_temperature_scaling(self, random_seed: int) -> None:
-        """Test that attention uses scale=1.0 (no temperature scaling).
+    def test_single_chunk_causal_masking_with_more_queries_than_keys(self) -> None:
+        """Causal masking remains defined when early queries precede all keys."""
+        q = jnp.zeros((1, 4, 1, 1), dtype=jnp.float32)
+        k = jnp.zeros((1, 2, 1, 1), dtype=jnp.float32)
+        v = jnp.asarray([[[[2.0]], [[6.0]]]], dtype=jnp.float32)
 
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, seq, heads, head_dim = 1, 4, 1, 8
+        actual = attention_single_chunk(q, k, v, causal=True)
 
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3 = jax.random.split(key, 3)
+        expected = jnp.asarray([[[[0.0]], [[0.0]], [[2.0]], [[4.0]]]], dtype=jnp.float32)
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=0.0, rtol=0.0)
 
-        # Use small values to avoid softmax saturation
-        q = jax.random.normal(k1, (batch, seq, heads, head_dim)) * 0.1
-        k = jax.random.normal(k2, (batch, seq, heads, head_dim)) * 0.1
-        v = jax.random.normal(k3, (batch, seq, heads, head_dim))
+    def test_only_structurally_masked_rows_suppress_softmax_nan(self) -> None:
+        """Empty rows become zero while numerical NaNs on valid edges remain visible."""
+        q = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
+        k = jnp.zeros_like(q)
+        v = jnp.ones_like(q)
 
-        out = attention_single_chunk(q, k, v)
+        empty = attention_single_chunk(
+            q,
+            k,
+            v,
+            qk_mask=jnp.zeros((1, 1, 1), dtype=jnp.bool_),
+            causal=False,
+        )
+        np.testing.assert_array_equal(np.asarray(empty), np.zeros_like(np.asarray(empty)))
 
-        # Verify output is not NaN and has reasonable magnitude
-        assert not jnp.any(jnp.isnan(out))
+        corrupted = attention_single_chunk(q.at[0, 0, 0, 0].set(jnp.nan), k, v)
+        assert bool(jnp.any(jnp.isnan(corrupted)))
 
     def test_single_chunk_preserves_bf16_dtype(self, random_seed: int) -> None:
-        """Test that attention_single_chunk preserves bf16 dtype (no forced fp32).
+        """Test that attention_single_chunk preserves BF16 compute boundaries.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -123,6 +189,143 @@ class TestAttentionPrimitives:
 
         assert out.dtype == jnp.bfloat16
         assert not jnp.any(jnp.isnan(out))
+
+    def test_fp32_softmax_returns_probabilities_to_bf16_before_values(
+        self, random_seed: int
+    ) -> None:
+        """The direct-BF16 value contraction matches the former wide-result policy."""
+        key = jax.random.PRNGKey(random_seed)
+        q_key, k_key, v_key, coefficient_key = jax.random.split(key, 4)
+        q = jax.random.normal(q_key, (1, 8, 2, 8), dtype=jnp.bfloat16)
+        k = jax.random.normal(k_key, (1, 8, 2, 8), dtype=jnp.bfloat16)
+        v = jax.random.normal(v_key, (1, 8, 2, 16), dtype=jnp.bfloat16)
+        coefficients = jax.random.normal(
+            coefficient_key,
+            v.shape,
+            dtype=jnp.bfloat16,
+        )
+
+        actual = attention_single_chunk(q, k, v, causal=False)
+        scores = jnp.einsum(
+            "bqhd,bkhd->bhqk",
+            q,
+            k,
+            precision=dot_precision(q.dtype),
+            preferred_element_type=jnp.float32,
+        )
+        probabilities = jax.nn.softmax(scores, axis=-1).astype(jnp.bfloat16)
+        expected = jnp.einsum(
+            "bhqk,bkhd->bqhd",
+            probabilities,
+            v,
+            precision=dot_precision(q.dtype),
+            preferred_element_type=jnp.float32,
+        ).astype(jnp.bfloat16)
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+        def direct_loss(q_value: jax.Array, k_value: jax.Array, v_value: jax.Array) -> jax.Array:
+            output = attention_single_chunk(q_value, k_value, v_value, causal=False)
+            return jnp.sum(output.astype(jnp.float32) * coefficients.astype(jnp.float32))
+
+        def wide_result_loss(
+            q_value: jax.Array,
+            k_value: jax.Array,
+            v_value: jax.Array,
+        ) -> jax.Array:
+            score = jnp.einsum(
+                "bqhd,bkhd->bhqk",
+                q_value,
+                k_value,
+                precision=dot_precision(q_value.dtype),
+                preferred_element_type=jnp.float32,
+            )
+            probability = jax.nn.softmax(score, axis=-1).astype(jnp.bfloat16)
+            output = jnp.einsum(
+                "bhqk,bkhd->bqhd",
+                probability,
+                v_value,
+                precision=dot_precision(q_value.dtype),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            return jnp.sum(output.astype(jnp.float32) * coefficients.astype(jnp.float32))
+
+        actual_loss, actual_grads = jax.value_and_grad(direct_loss, argnums=(0, 1, 2))(q, k, v)
+        expected_loss, expected_grads = jax.value_and_grad(
+            wide_result_loss,
+            argnums=(0, 1, 2),
+        )(q, k, v)
+        np.testing.assert_array_equal(np.asarray(actual_loss), np.asarray(expected_loss))
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            np.testing.assert_array_equal(np.asarray(actual_grad), np.asarray(expected_grad))
+
+    def test_bf16_attention_lowering_keeps_qk_fp32_and_pv_bf16(self) -> None:
+        """QK keeps its FP32 score buffer while PV returns BF16 with FP32 accumulation."""
+        q = jnp.zeros((1, 4, 2, 8), dtype=jnp.bfloat16)
+        k = jnp.zeros_like(q)
+        v = jnp.zeros((1, 4, 2, 16), dtype=jnp.bfloat16)
+
+        lowered = jax.jit(
+            lambda query, key, value: attention_single_chunk(
+                query,
+                key,
+                value,
+                causal=False,
+            )
+        ).lower(q, k, v)
+        stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
+        dot_lines = [line for line in stablehlo.splitlines() if "dot_general" in line]
+
+        assert len(dot_lines) == 2
+        qk_dot, pv_dot = dot_lines
+        assert "algorithm =" not in qk_dot
+        assert "tensor<1x4x2x8xbf16>" in qk_dot
+        assert "-> tensor<1x2x4x4xf32>" in qk_dot
+        assert "lhs_precision_type = bf16" in pv_dot
+        assert "rhs_precision_type = bf16" in pv_dot
+        assert "accumulation_type = f32" in pv_dot
+        assert "-> tensor<1x2x16x4xbf16>" in pv_dot
+
+    def test_post_softmax_and_dropkey_semantics(self) -> None:
+        """The two released attention-dropout placements remain explicit."""
+        q = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
+        k = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
+        v = jnp.arange(1, 5, dtype=jnp.float32).reshape(1, 4, 1, 1)
+        key = jax.random.PRNGKey(7)
+        keep = np.asarray(jax.random.bernoulli(key, 0.5, (1, 1, 1, 4)))[0, 0, 0]
+
+        post = attention_single_chunk(
+            q,
+            k,
+            v,
+            causal=False,
+            dropout_rate=0.5,
+            dropout_mode="post_softmax",
+            deterministic=False,
+            key=key,
+        )
+        dropkey = attention_single_chunk(
+            q,
+            k,
+            v,
+            causal=False,
+            dropout_rate=0.5,
+            dropout_mode="dropkey",
+            deterministic=False,
+            key=key,
+        )
+
+        values = np.arange(1, 5, dtype=np.float32)
+        expected_post = np.sum(values * keep * 0.5)
+        expected_dropkey = np.mean(values[keep]) if np.any(keep) else 0.0
+        np.testing.assert_allclose(np.asarray(post).item(), expected_post, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(dropkey).item(), expected_dropkey, atol=1e-6)
+
+    def test_attention_dropout_rejects_one(self) -> None:
+        """Degenerate p=1 cannot reach either softmax path."""
+        q = jnp.ones((1, 1, 1, 2), dtype=jnp.float32)
+        with pytest.raises(ValueError, match=r"\[0, 1\)"):
+            attention_single_chunk(q, q, q, dropout_rate=1.0)
 
     def test_single_chunk_query_key_mask_blocks_cross_segment(self) -> None:
         """qk_mask should block cross-segment attention links."""
@@ -338,6 +541,50 @@ class TestAttentionPrimitives:
         np.testing.assert_allclose(np.array(out_default), np.array(out_mono), rtol=1e-5, atol=1e-5)
         assert not np.allclose(np.array(out_default), np.array(out_shifted))
 
+    def test_masked_multi_chunk_is_invariant_to_aligned_calls(self, random_seed: int) -> None:
+        """Masks preserve results when calls split only at source chunk boundaries."""
+        batch, length, heads, head_dim, value_dim = 2, 12, 2, 4, 3
+        chunk_size = 4
+        key = jax.random.PRNGKey(random_seed)
+        kq, kk, kv = jax.random.split(key, 3)
+        q = jax.random.normal(kq, (batch, length, heads, head_dim))
+        k = jax.random.normal(kk, (batch, length, heads, head_dim))
+        v = jax.random.normal(kv, (batch, length, heads, value_dim))
+        mask = jnp.asarray([
+            [True, False, True, True, True, True, False, True, True, False, True, True],
+            [True, True, False, True, False, True, True, True, True, True, False, True],
+        ])
+        rotary = RotaryEmbedding(dim=head_dim)
+
+        full = attention_multi_chunk(
+            q,
+            k,
+            v,
+            chunk_size=chunk_size,
+            start_index=jnp.asarray(0, dtype=jnp.int32),
+            rotary=rotary,
+            mask=mask,
+        )
+        for partition in ((4, 8), (8, 4), (4, 4, 4)):
+            pieces = []
+            start = 0
+            for width in partition:
+                stop = start + width
+                pieces.append(
+                    attention_multi_chunk(
+                        q[:, start:stop],
+                        k[:, start:stop],
+                        v[:, start:stop],
+                        chunk_size=chunk_size,
+                        start_index=jnp.asarray(start, dtype=jnp.int32),
+                        rotary=rotary,
+                        mask=mask[:, start:stop],
+                    )
+                )
+                start = stop
+            actual = jnp.concatenate(pieces, axis=1)
+            np.testing.assert_allclose(np.asarray(actual), np.asarray(full), atol=2e-6, rtol=2e-6)
+
 
 # -----------------------------------------------------------------------------
 # ChunkedAttention Tests
@@ -346,6 +593,171 @@ class TestAttentionPrimitives:
 
 class TestChunkedAttention:
     """Tests for ChunkedAttention module."""
+
+    def test_chunk_local_matches_dense_oracle_across_restarts(
+        self,
+        random_seed: int,
+    ) -> None:
+        """Cached chunk-local attention matches an independent restart-aware oracle."""
+        batch, length, heads, head_dim, value_dim = 2, 11, 2, 4, 3
+        chunk_size = 4
+        key = jax.random.PRNGKey(random_seed)
+        _, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=chunk_size,
+        )
+        q = jax.random.normal(kq, (batch, length, heads, head_dim))
+        k = jax.random.normal(kk, (batch, length, heads, head_dim))
+        v = jax.random.normal(kv, (batch, length, heads, value_dim))
+
+        def chunk_local_rope(values: np.ndarray) -> np.ndarray:
+            """Apply adjacent-pair RoPE with source-chunk position restarts."""
+            pairs = values.reshape(batch, length, heads, head_dim // 2, 2)
+            frequencies = 10_000.0 ** (-np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
+            positions = np.arange(length, dtype=np.float32) % chunk_size
+            angles = positions[:, None] * frequencies[None, :]
+            cosine = np.cos(angles)[None, :, None, :]
+            sine = np.sin(angles)[None, :, None, :]
+            rotated = np.empty_like(pairs)
+            rotated[..., 0] = pairs[..., 0] * cosine - pairs[..., 1] * sine
+            rotated[..., 1] = pairs[..., 0] * sine + pairs[..., 1] * cosine
+            return rotated.reshape(values.shape)
+
+        q_dense = chunk_local_rope(np.asarray(q))
+        k_dense = chunk_local_rope(np.asarray(k))
+        v_dense = np.asarray(v)
+        expected = np.empty((batch, length, heads, value_dim), dtype=np.float32)
+        for query_index in range(length):
+            key_start = query_index - query_index % chunk_size
+            valid_k = k_dense[:, key_start : query_index + 1]
+            scores = np.einsum("bhd,bshd->bhs", q_dense[:, query_index], valid_k)
+            scores -= np.max(scores, axis=-1, keepdims=True)
+            weights = np.exp(scores)
+            weights /= np.sum(weights, axis=-1, keepdims=True)
+            expected[:, query_index] = np.einsum(
+                "bhs,bshv->bhv",
+                weights,
+                v_dense[:, key_start : query_index + 1],
+            )
+
+        outputs = []
+        cache = None
+        offset = 0
+        for width in (3, 1, 5, 2):
+            part, cache, _ = module(
+                q[:, offset : offset + width],
+                k[:, offset : offset + width],
+                v[:, offset : offset + width],
+                cache=cache,
+                return_cache=True,
+            )
+            outputs.append(part)
+            offset += width
+        actual = jnp.concatenate(outputs, axis=1)
+
+        assert cache is not None and int(cache.count) == length
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=2e-6)
+
+    def test_sliding_window_matches_dense_oracle_after_wraparound(
+        self,
+        random_seed: int,
+    ) -> None:
+        """Streamed ring attention matches an independent absolute-position dense oracle."""
+        batch, length, heads, head_dim, value_dim = 2, 11, 2, 4, 3
+        window = 4
+        key = jax.random.PRNGKey(random_seed)
+        _, kq, kk, kv = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=heads,
+            head_dim=head_dim,
+            value_head_dim=value_dim,
+            chunk_size=3,
+            attention_window=window,
+        )
+        q = jax.random.normal(kq, (batch, length, heads, head_dim))
+        k = jax.random.normal(kk, (batch, length, heads, head_dim))
+        v = jax.random.normal(kv, (batch, length, heads, value_dim))
+
+        def absolute_rope(values: np.ndarray) -> np.ndarray:
+            """Apply source adjacent-pair RoPE without calling production rotation code."""
+            pairs = values.reshape(batch, length, heads, head_dim // 2, 2)
+            frequencies = 10_000.0 ** (-np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)
+            angles = np.arange(length, dtype=np.float32)[:, None] * frequencies[None, :]
+            cosine = np.cos(angles)[None, :, None, :]
+            sine = np.sin(angles)[None, :, None, :]
+            rotated = np.empty_like(pairs)
+            rotated[..., 0] = pairs[..., 0] * cosine - pairs[..., 1] * sine
+            rotated[..., 1] = pairs[..., 0] * sine + pairs[..., 1] * cosine
+            return rotated.reshape(values.shape)
+
+        q_dense = absolute_rope(np.asarray(q))
+        k_dense = absolute_rope(np.asarray(k))
+        v_dense = np.asarray(v)
+        expected = np.empty((batch, length, heads, value_dim), dtype=np.float32)
+        for query_index in range(length):
+            key_start = max(0, query_index - window + 1)
+            valid_k = k_dense[:, key_start : query_index + 1]
+            scores = np.einsum(
+                "bhd,bshd->bhs",
+                q_dense[:, query_index],
+                valid_k,
+            )
+            scores -= np.max(scores, axis=-1, keepdims=True)
+            weights = np.exp(scores)
+            weights /= np.sum(weights, axis=-1, keepdims=True)
+            expected[:, query_index] = np.einsum(
+                "bhs,bshv->bhv",
+                weights,
+                v_dense[:, key_start : query_index + 1],
+            )
+
+        outputs = []
+        cache = None
+        offset = 0
+        for width in (3, 1, 5, 2):
+            part, cache, _ = module(
+                q[:, offset : offset + width],
+                k[:, offset : offset + width],
+                v[:, offset : offset + width],
+                cache=cache,
+                return_cache=True,
+            )
+            outputs.append(part)
+            offset += width
+        actual = jnp.concatenate(outputs, axis=1)
+        assert cache is not None and int(cache.count) == length
+        np.testing.assert_allclose(np.asarray(actual), expected, atol=2e-6, rtol=2e-6)
+
+    @pytest.mark.parametrize(
+        "position_ids",
+        [
+            pytest.param([[0, 0, 0, 0]], id="repeated"),
+            pytest.param([[0, 10, 20, 30]], id="gapped"),
+        ],
+    )
+    def test_sliding_window_mask_uses_token_order(
+        self,
+        position_ids: list[list[int]],
+    ) -> None:
+        """Explicit RoPE coordinates cannot change causal or window support."""
+        module = ChunkedAttention(
+            num_heads=1,
+            head_dim=2,
+            value_head_dim=1,
+            chunk_size=4,
+            attention_window=2,
+        )
+        q = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
+        k = jnp.zeros_like(q)
+        v = jnp.arange(1, 5, dtype=jnp.float32).reshape(1, 4, 1, 1)
+
+        actual, _, _ = module(q, k, v, position_ids=jnp.asarray(position_ids))
+
+        expected = jnp.asarray([1.0, 1.5, 2.5, 3.5], dtype=jnp.float32).reshape(1, 4, 1, 1)
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=1e-6)
 
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test ChunkedAttention forward pass shapes.
@@ -357,75 +769,34 @@ class TestChunkedAttention:
         chunk_size = 16
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim))
         k = jax.random.normal(k3, (batch, seq, heads, head_dim))
         v = jax.random.normal(k4, (batch, seq, heads, value_dim))
 
-        out, cache, position = attn(q, k, v)
+        out, cache, _ = attn(q, k, v)
 
         assert out.shape == (batch, seq, heads, value_dim)
         assert cache is None  # No cache returned without return_cache=True
-
-    def test_streaming_with_cache(self, random_seed: int) -> None:
-        """Test ChunkedAttention streaming with cache.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, heads, head_dim, value_dim = 2, 4, 32, 64
-        chunk_size = 16
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-
-        attn = ChunkedAttention(
-            num_heads=heads,
-            head_dim=head_dim,
-            value_head_dim=value_dim,
-            chunk_size=chunk_size,
-            key=k1,
-        )
-
-        # Process tokens one at a time
-        outputs = []
-        cache = None
-
-        for i in range(8):
-            ki = jax.random.fold_in(k2, i)
-            q = jax.random.normal(ki, (batch, 1, heads, head_dim))
-            k = jax.random.normal(jax.random.fold_in(k3, i), (batch, 1, heads, head_dim))
-            v = jax.random.normal(jax.random.fold_in(k4, i), (batch, 1, heads, value_dim))
-
-            out, cache, position = attn(q, k, v, cache=cache, return_cache=True)
-            outputs.append(out)
-
-        # Check final cache state
-        assert cache is not None
-        assert cache.count == 8
-        # Fixed-size buffer: shape is max_cache_len (=chunk_size by default)
-        assert cache.k.shape[1] == chunk_size
 
     def test_streaming_rejects_strict_metadata(self, random_seed: int) -> None:
         """Streaming cache path should reject segment/position strict metadata."""
         heads, head_dim, value_dim, chunk_size = 2, 8, 8, 8
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
         q = jax.random.normal(k2, (1, 4, heads, head_dim))
         k = jax.random.normal(k3, (1, 4, heads, head_dim))
@@ -447,14 +818,13 @@ class TestChunkedAttention:
         seq = 3  # L < chunk_size to hit the token-wise path
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim), dtype=jnp.bfloat16)
@@ -481,16 +851,14 @@ class TestChunkedAttention:
         seq = 6  # force wraparound
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            max_cache_len=cache_size,
-            cache_unbounded=True,
-            key=k1,
+            attention_window=cache_size,
         )
 
         q = jax.random.normal(k2, (batch, seq, heads, head_dim))
@@ -532,6 +900,75 @@ class TestChunkedAttention:
             atol=1e-6,
         )
 
+    @pytest.mark.parametrize("attention_window", [None, 3, 8])
+    def test_arbitrary_cache_partition_invariance(
+        self,
+        random_seed: int,
+        attention_window: int | None,
+    ) -> None:
+        """Cached outputs and state cannot depend on caller chunk boundaries."""
+        for partition in _CACHE_PARTITIONS:
+            if attention_window in (None, 8) and partition == _FAST_CACHE_PARTITION:
+                continue
+            assert_cache_partition_invariance(attention_window, partition, random_seed)
+
+    @pytest.mark.fast
+    def test_pristine_prefill_partition_smoke(self, random_seed: int) -> None:
+        """Routine gate covers faithful and sliding prefill with one uneven split."""
+        for attention_window in (None, 8):
+            assert_cache_partition_invariance(
+                attention_window,
+                _FAST_CACHE_PARTITION,
+                random_seed,
+            )
+
+    @pytest.mark.parametrize("attention_window", [None, 8])
+    @pytest.mark.parametrize("deterministic", [True, False])
+    @pytest.mark.fast
+    def test_pristine_prefill_has_no_sequence_loop(
+        self,
+        random_seed: int,
+        attention_window: int | None,
+        deterministic: bool,
+    ) -> None:
+        """Zero-dropout prompt prefill stays vectorized in either execution mode."""
+        key = jax.random.PRNGKey(random_seed)
+        _, q_key, k_key, v_key = jax.random.split(key, 4)
+        module = ChunkedAttention(
+            num_heads=2,
+            head_dim=8,
+            value_head_dim=6,
+            chunk_size=4,
+            attention_window=attention_window,
+        )
+        q = jax.random.normal(q_key, (1, 12, 2, 8))
+        k = jax.random.normal(k_key, (1, 12, 2, 8))
+        v = jax.random.normal(v_key, (1, 12, 2, 6))
+
+        expected, _, _ = module(q, k, v, deterministic=deterministic)
+        actual, cache, _ = module(
+            q,
+            k,
+            v,
+            return_cache=True,
+            deterministic=deterministic,
+        )
+        assert cache is not None and int(cache.count) == q.shape[1]
+        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-6, rtol=2e-6)
+
+        lowered = jax.jit(
+            lambda q, k, v: module(
+                q,
+                k,
+                v,
+                return_cache=True,
+                deterministic=deterministic,
+            )
+        ).lower(q, k, v)
+        stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
+
+        assert "stablehlo.while" not in stablehlo
+
 
 # -----------------------------------------------------------------------------
 # NormalizedFFN Tests
@@ -540,6 +977,27 @@ class TestChunkedAttention:
 
 class TestNormalizedFFN:
     """Tests for NormalizedFFN module."""
+
+    @pytest.mark.parametrize(
+        ("dropout", "hidden_dropout"),
+        [(0.2, 0.0), (0.0, 0.2)],
+    )
+    def test_active_dropout_requires_key(
+        self,
+        dropout: float,
+        hidden_dropout: float,
+        random_seed: int,
+    ) -> None:
+        """Direct FFN use must not silently skip an active stochastic path."""
+        ffn = NormalizedFFN(
+            model_dim=8,
+            ffn_hidden_dim=16,
+            dropout=dropout,
+            hidden_dropout=hidden_dropout,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        with pytest.raises(ValueError, match="PRNG key required"):
+            ffn(jnp.ones((1, 2, 8)), deterministic=False)
 
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test NormalizedFFN forward pass shapes.
@@ -588,6 +1046,27 @@ class TestNormalizedFFN:
         assert out.shape == (batch, seq, model_dim)
         assert ffn.fc3 is not None  # SwiGLU has fc3
 
+    def test_source_bias_topology_and_trainable_rescale(self, random_seed: int) -> None:
+        """FFN projections are bias-free and layer scale is a vector parameter."""
+        ffn = NormalizedFFN(
+            model_dim=16,
+            ffn_hidden_dim=32,
+            swiglu=True,
+            rescale=True,
+            layer_id=2,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        assert ffn.fc1.bias is None
+        assert ffn.fc2.bias is None
+        assert ffn.fc3 is not None and ffn.fc3.bias is None
+        assert ffn.alpha is not None
+        assert ffn.alpha.shape == (16,)
+        np.testing.assert_array_equal(
+            np.asarray(ffn.alpha),
+            np.full(16, 0.025, dtype=np.float32),
+        )
+        assert any(leaf is ffn.alpha for leaf in jax.tree_util.tree_leaves(ffn))
+
     def test_two_hop_residual(self, random_seed: int) -> None:
         """Test NormalizedFFN with two-hop residual.
 
@@ -615,68 +1094,6 @@ class TestNormalizedFFN:
         # Two-hop should use residual_base, not x
         assert not jnp.allclose(out_normal, out_two_hop)
 
-    @pytest.mark.torch_ref
-    def test_ffn_parity(self, random_seed: int) -> None:
-        """Test NormalizedFFN parity with PyTorch reference.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        torch = pytest.importorskip("torch")
-        torch_modeling = require_torch_modeling()
-        TorchConfig = torch_modeling.MegalodonConfig
-        TorchFFN = torch_modeling.NormalizedFFN
-
-        model_dim, ffn_dim = 64, 128
-        batch, seq = 2, 16
-
-        # Create PyTorch config and FFN
-        torch_cfg = TorchConfig(
-            model_dim=model_dim,
-            ffn_hidden_dim=ffn_dim,
-            swiglu=False,
-            norm_eps=1e-5,
-            rescale_nffn=False,
-        )
-        torch_ffn = TorchFFN(torch_cfg, layer_id=0)
-        torch_ffn.eval()
-
-        # Create JAX FFN
-        key = jax.random.PRNGKey(random_seed)
-        jax_ffn = NormalizedFFN(
-            model_dim=model_dim,
-            ffn_hidden_dim=ffn_dim,
-            swiglu=False,
-            norm_eps=1e-5,
-            key=key,
-        )
-
-        # Copy weights from PyTorch to JAX
-        jax_ffn = eqx.tree_at(lambda m: m.norm.weight, jax_ffn, to_jax(torch_ffn.norm.weight))
-        jax_ffn = eqx.tree_at(lambda m: m.norm.bias, jax_ffn, to_jax(torch_ffn.norm.bias))
-        jax_ffn = eqx.tree_at(lambda m: m.fc1.weight, jax_ffn, to_jax(torch_ffn.fc1.weight))
-        jax_ffn = eqx.tree_at(lambda m: m.fc1.bias, jax_ffn, to_jax(torch_ffn.fc1.bias))
-        jax_ffn = eqx.tree_at(lambda m: m.fc2.weight, jax_ffn, to_jax(torch_ffn.fc2.weight))
-        jax_ffn = eqx.tree_at(lambda m: m.fc2.bias, jax_ffn, to_jax(torch_ffn.fc2.bias))
-
-        # Generate test input
-        x_torch = torch.randn(batch, seq, model_dim)
-        x_jax = to_jax(x_torch)
-
-        # Forward pass
-        with torch.no_grad():
-            y_torch = torch_ffn(x_torch)
-        y_jax = jax_ffn(x_jax)
-
-        # Compare - fp32 accumulation causes ~1e-3 drift over multiple operations
-        np.testing.assert_allclose(
-            np.array(y_jax),
-            y_torch.detach().numpy(),
-            rtol=5e-3,
-            atol=5e-3,
-            err_msg="NormalizedFFN output should match PyTorch reference",
-        )
-
 
 # -----------------------------------------------------------------------------
 # MegalodonAttention Tests
@@ -685,6 +1102,52 @@ class TestNormalizedFFN:
 
 class TestMegalodonAttention:
     """Tests for MegalodonAttention block."""
+
+    @pytest.mark.parametrize(
+        ("dropout", "attention_dropout", "hidden_dropout"),
+        [(0.2, 0.0, 0.0), (0.0, 0.2, 0.0), (0.0, 0.0, 0.2)],
+    )
+    def test_active_dropout_requires_key(
+        self,
+        dropout: float,
+        attention_dropout: float,
+        hidden_dropout: float,
+        random_seed: int,
+    ) -> None:
+        """Direct attention use must not silently skip any active stochastic path."""
+        module = MegalodonAttention(
+            model_dim=8,
+            z_dim=8,
+            value_dim=8,
+            num_heads=2,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=2,
+            dropout=dropout,
+            attention_dropout=attention_dropout,
+            hidden_dropout=hidden_dropout,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        with pytest.raises(ValueError, match="PRNG key required"):
+            module(jnp.ones((1, 2, 8)), deterministic=False)
+
+    def test_source_projection_bias_topology(self, random_seed: int) -> None:
+        """Only released attention projections retain bias parameters."""
+        module = MegalodonAttention(
+            model_dim=16,
+            z_dim=8,
+            value_dim=16,
+            num_heads=1,
+            cema_ndim=2,
+            chunk_size=4,
+            norm_num_groups=4,
+            key=jax.random.PRNGKey(random_seed),
+        )
+        assert module.wz.bias is not None
+        assert module.wv.bias is not None
+        assert module.wr.bias is not None
+        assert module.wh1.bias is not None
+        assert module.wh2.bias is None
 
     def test_forward_shapes(self, random_seed: int) -> None:
         """Test MegalodonAttention forward pass shapes.
@@ -858,26 +1321,6 @@ class TestMegalodonAttention:
 class TestPrecision:
     """Tests for bf16 precision handling."""
 
-    def test_attention_primitives_bf16(self, random_seed: int) -> None:
-        """Test attention primitives work with bf16 inputs.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, seq, heads, head_dim = 2, 16, 4, 32
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3 = jax.random.split(key, 3)
-
-        q = jax.random.normal(k1, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
-        k = jax.random.normal(k2, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
-        v = jax.random.normal(k3, (batch, seq, heads, head_dim)).astype(jnp.bfloat16)
-
-        out = attention_single_chunk(q, k, v)
-
-        assert out.dtype == jnp.bfloat16
-        assert not jnp.any(jnp.isnan(out))
-
     def test_attention_accum_dtype_override(self, random_seed: int) -> None:
         """Test attention primitives accept an accum_dtype override.
 
@@ -974,14 +1417,13 @@ class TestJITCompilation:
         chunk_size = 16
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         @eqx.filter_jit
@@ -1020,14 +1462,13 @@ class TestJITCompilation:
         chunk_size = 4
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2 = jax.random.split(key)
+        _, k2 = jax.random.split(key)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         @eqx.filter_jit
@@ -1117,62 +1558,8 @@ class TestJITCompilation:
 class TestStreamingEquivalence:
     """Tests for streaming (token-by-token) equivalence with batch processing."""
 
-    def test_chunked_attention_streaming_equivalence(
-        self, random_seed: int, force_fp32_matmul: None
-    ) -> None:
-        """Verify streaming with cache matches batch processing within a chunk.
-
-        :param int random_seed: Random seed fixture.
-        :param None force_fp32_matmul: Fixture enabling fp32 matmul precision.
-        :return None: None.
-        """
-        batch, heads, head_dim, value_dim = 1, 2, 16, 16
-        chunk_size = 8
-        seq_len = 6  # Within one chunk
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-
-        attn = ChunkedAttention(
-            num_heads=heads,
-            head_dim=head_dim,
-            value_head_dim=value_dim,
-            chunk_size=chunk_size,
-            key=k1,
-        )
-
-        # Generate full sequence Q/K/V
-        q_full = jax.random.normal(k2, (batch, seq_len, heads, head_dim))
-        k_full = jax.random.normal(k3, (batch, seq_len, heads, head_dim))
-        v_full = jax.random.normal(k4, (batch, seq_len, heads, value_dim))
-
-        # Batch processing (no cache)
-        out_batch, _, _ = attn(q_full, k_full, v_full, return_cache=False)
-
-        # Streaming processing (token by token with cache)
-        streaming_outputs = []
-        cache = None
-        for i in range(seq_len):
-            q_i = q_full[:, i : i + 1, :, :]
-            k_i = k_full[:, i : i + 1, :, :]
-            v_i = v_full[:, i : i + 1, :, :]
-
-            out_i, cache, _ = attn(q_i, k_i, v_i, cache=cache, return_cache=True)
-            streaming_outputs.append(out_i)
-
-        out_streaming = jnp.concatenate(streaming_outputs, axis=1)
-
-        # Outputs should match (within a single chunk)
-        np.testing.assert_allclose(
-            np.array(out_batch),
-            np.array(out_streaming),
-            rtol=1e-5,
-            atol=1e-5,
-            err_msg="Streaming output should match batch output within a single chunk",
-        )
-
-    def test_chunk_boundary_cache_reset(self, random_seed: int) -> None:
-        """Verify cache is reset at chunk boundaries.
+    def test_incompatible_cache_shape_is_rejected(self, random_seed: int) -> None:
+        """Cache schema mismatches fail instead of silently resizing state.
 
         :param int random_seed: Random seed fixture.
         :return None: None.
@@ -1181,53 +1568,14 @@ class TestStreamingEquivalence:
         chunk_size = 4
 
         key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
+        _, k2, k3, k4 = jax.random.split(key, 4)
 
         attn = ChunkedAttention(
             num_heads=heads,
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
-
-        # Process tokens 0-3 (first chunk), then tokens 4-5 (second chunk)
-        cache = None
-        for i in range(6):
-            q = jax.random.normal(jax.random.fold_in(k2, i), (batch, 1, heads, head_dim))
-            k = jax.random.normal(jax.random.fold_in(k3, i), (batch, 1, heads, head_dim))
-            v = jax.random.normal(jax.random.fold_in(k4, i), (batch, 1, heads, value_dim))
-
-            _, cache, position = attn(q, k, v, cache=cache, return_cache=True)
-
-            # Fixed-size buffer: shape is always max_cache_len
-            assert cache.k.shape[1] == chunk_size, (
-                f"Cache buffer should be fixed size {chunk_size}, got {cache.k.shape[1]}"
-            )
-            # The count tracks absolute position
-            assert cache.count == i + 1, f"Cache count should be {i + 1}, got {cache.count}"
-
-    def test_cache_resize_on_input(self, random_seed: int) -> None:
-        """Test that incoming caches are resized to fixed buffer size.
-
-        :param int random_seed: Random seed fixture.
-        :return None: None.
-        """
-        batch, heads, head_dim, value_dim = 1, 2, 8, 8
-        chunk_size = 4
-
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2, k3, k4 = jax.random.split(key, 4)
-
-        attn = ChunkedAttention(
-            num_heads=heads,
-            head_dim=head_dim,
-            value_head_dim=value_dim,
-            chunk_size=chunk_size,
-            key=k1,
-        )
-
-        from megalodon_jax.types import AttentionCache
 
         # Create a smaller-than-expected cache (2 entries, but chunk_size=4)
         # Simulates position 2 (has 2 cached entries from positions 0-1)
@@ -1240,15 +1588,27 @@ class TestStreamingEquivalence:
         k = jax.random.normal(jax.random.fold_in(k4, 1), (batch, 1, heads, head_dim))
         v = jax.random.normal(jax.random.fold_in(k4, 2), (batch, 1, heads, value_dim))
 
-        _, new_cache, new_pos = attn(q, k, v, cache=fake_cache, return_cache=True)
+        with pytest.raises(ValueError, match="cache shapes"):
+            attn(q, k, v, cache=fake_cache, return_cache=True)
 
-        # Output cache should be fixed size (chunk_size)
-        assert new_cache.k.shape[1] == chunk_size, (
-            f"Cache should be fixed size {chunk_size}, got {new_cache.k.shape[1]}"
+    def test_streaming_count_rejects_negative_and_overflow(self) -> None:
+        """A malformed or exhausted int32 ring position must fail before updating."""
+        attn = ChunkedAttention(
+            num_heads=1,
+            head_dim=2,
+            value_head_dim=2,
+            chunk_size=4,
         )
-        # Position should advance
-        assert new_pos == 3, f"Position should be 3, got {new_pos}"
-        assert new_cache.count == 3, f"Cache count should be 3, got {new_cache.count}"
+        q = k = v = jnp.zeros((1, 1, 1, 2), dtype=jnp.float32)
+        cache_k = jnp.zeros((1, 4, 1, 2), dtype=jnp.float32)
+        for count in (-1, np.iinfo(np.int32).max):
+            cache = AttentionCache(
+                k=cache_k,
+                v=cache_k,
+                count=jnp.asarray(count, dtype=jnp.int32),
+            )
+            with pytest.raises(Exception, match="non-negative.*overflow"):
+                attn(q, k, v, cache=cache, return_cache=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1277,7 +1637,6 @@ class TestParity:
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Generate full sequence Q/K/V
@@ -1330,7 +1689,6 @@ class TestParity:
             head_dim=head_dim,
             value_head_dim=value_dim,
             chunk_size=chunk_size,
-            key=k1,
         )
 
         # Generate a sequence that spans chunk boundary
@@ -1341,17 +1699,17 @@ class TestParity:
 
         # Start at position 2, so tokens will span positions 2,3 | 4,5,6,7
         # chunk boundary at position 4
-        from megalodon_jax.types import AttentionCache
-
         # Pre-fill cache with 2 tokens at positions 0-1
         init_k = jax.random.normal(jax.random.fold_in(k1, 0), (batch, 2, heads, head_dim))
         init_v = jax.random.normal(jax.random.fold_in(k1, 1), (batch, 2, heads, value_dim))
         # Apply RoPE to initial K
         init_k_rot, _ = attn.rotary(init_k, init_k, jnp.array(0))
-        cache = AttentionCache(k=init_k_rot, v=init_v, count=jnp.array(2, dtype=jnp.int32))
+        cache_k = jnp.zeros((batch, chunk_size, heads, head_dim)).at[:, :2].set(init_k_rot)
+        cache_v = jnp.zeros((batch, chunk_size, heads, value_dim)).at[:, :2].set(init_v)
+        cache = AttentionCache(k=cache_k, v=cache_v, count=jnp.array(2, dtype=jnp.int32))
 
         # Process multi-token call that spans boundary
-        out_multi, cache_multi, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
+        out_multi, _, pos_multi = attn(q, k, v, cache=cache, return_cache=True)
 
         # Now compare with token-by-token processing
         streaming_outputs = []
@@ -1385,168 +1743,8 @@ class TestParity:
 # -----------------------------------------------------------------------------
 
 
-class TestMegalodonAttentionParity:
-    """Parity tests for MegalodonAttention against PyTorch reference."""
-
-    @pytest.mark.torch_ref
-    def test_megalodon_attention_forward_parity(
-        self, random_seed: int, torch_device: torch.device
-    ) -> None:
-        """Test MegalodonAttention forward pass parity with PyTorch reference.
-
-        :param int random_seed: Random seed fixture.
-        :param torch.device torch_device: Torch device fixture.
-        :return None: None.
-        """
-        from tests.conftest import sync_and_clear_torch
-
-        torch = pytest.importorskip("torch")
-        torch_modeling = require_torch_modeling()
-        TorchMegalodonAttention = torch_modeling.MegalodonAttention
-        TorchConfig = torch_modeling.MegalodonConfig
-
-        # Config matching both implementations
-        batch, seq_len = 1, 8
-        model_dim = 32
-        z_dim = 16
-        value_dim = 16
-        num_heads = 2
-        cema_ndim = 2
-        chunk_size = 4
-        norm_num_groups = 2
-
-        # Create PyTorch module on same device as JAX (GPU if available)
-        torch_cfg = TorchConfig(
-            model_dim=model_dim,
-            num_heads=num_heads,
-            z_dim=z_dim,
-            value_dim=value_dim,
-            cema_ndim=cema_ndim,
-            chunk_size=chunk_size,
-            norm_num_groups=norm_num_groups,
-            norm_eps=1e-5,
-            norm_affine=True,
-            rope_base=10000.0,
-            dropout=0.0,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-        )
-        torch_attn = TorchMegalodonAttention(torch_cfg).to(torch_device)
-        torch_attn.eval()
-
-        # Create JAX module with same config
-        key = jax.random.PRNGKey(random_seed)
-        k1, k2 = jax.random.split(key)
-
-        jax_attn = MegalodonAttention(
-            model_dim=model_dim,
-            z_dim=z_dim,
-            value_dim=value_dim,
-            num_heads=num_heads,
-            cema_ndim=cema_ndim,
-            chunk_size=chunk_size,
-            norm_num_groups=norm_num_groups,
-            norm_eps=1e-5,
-            rope_base=10000.0,
-            dropout=0.0,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            key=k1,
-        )
-
-        # Copy weights from PyTorch to JAX
-        # TimestepNorm
-        jax_attn = eqx.tree_at(
-            lambda m: m.timenorm.weight, jax_attn, to_jax(torch_attn.timenorm.weight)
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.timenorm.bias, jax_attn, to_jax(torch_attn.timenorm.bias)
-        )
-
-        # ComplexEMA (alpha, delta, theta stored as real tensors)
-        jax_attn = eqx.tree_at(
-            lambda m: m.cema.alpha,
-            jax_attn,
-            to_jax(torch_attn.cema.alpha),
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.cema.delta,
-            jax_attn,
-            to_jax(torch_attn.cema.delta),
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.cema.theta,
-            jax_attn,
-            to_jax(torch_attn.cema.theta),
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.cema.gamma_real,
-            jax_attn,
-            to_jax(torch_attn.cema.gamma_real),
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.cema.gamma_imag,
-            jax_attn,
-            to_jax(torch_attn.cema.gamma_imag),
-        )
-        jax_attn = eqx.tree_at(
-            lambda m: m.cema.omega,
-            jax_attn,
-            to_jax(torch_attn.cema.omega),
-        )
-
-        # RMSNorm
-        jax_attn = eqx.tree_at(
-            lambda m: m.rmsnorm.gamma, jax_attn, to_jax(torch_attn.rmsnorm.gamma)
-        )
-
-        # Projections (both PyTorch and Equinox use (out_features, in_features) layout)
-        jax_attn = eqx.tree_at(lambda m: m.wz.weight, jax_attn, to_jax(torch_attn.wz.weight))
-        jax_attn = eqx.tree_at(lambda m: m.wz.bias, jax_attn, to_jax(torch_attn.wz.bias))
-        jax_attn = eqx.tree_at(lambda m: m.wv.weight, jax_attn, to_jax(torch_attn.wv.weight))
-        jax_attn = eqx.tree_at(lambda m: m.wv.bias, jax_attn, to_jax(torch_attn.wv.bias))
-        jax_attn = eqx.tree_at(lambda m: m.wr.weight, jax_attn, to_jax(torch_attn.wr.weight))
-        jax_attn = eqx.tree_at(lambda m: m.wr.bias, jax_attn, to_jax(torch_attn.wr.bias))
-        jax_attn = eqx.tree_at(lambda m: m.wh1.weight, jax_attn, to_jax(torch_attn.wh1.weight))
-        jax_attn = eqx.tree_at(lambda m: m.wh1.bias, jax_attn, to_jax(torch_attn.wh1.bias))
-        jax_attn = eqx.tree_at(lambda m: m.wh2.weight, jax_attn, to_jax(torch_attn.wh2.weight))
-        jax_attn = eqx.tree_at(lambda m: m.wh2.bias, jax_attn, to_jax(torch_attn.wh2.bias))
-
-        # Q/K affine parameters
-        jax_attn = eqx.tree_at(lambda m: m.gamma, jax_attn, to_jax(torch_attn.gamma))
-        jax_attn = eqx.tree_at(lambda m: m.beta, jax_attn, to_jax(torch_attn.beta))
-
-        # Inner attention rotary (copy from CPU tensor)
-        jax_attn = eqx.tree_at(
-            lambda m: m.inner.rotary.inv_freq,
-            jax_attn,
-            to_jax(torch_attn.inner.rope.inv_freq.cpu()),
-        )
-
-        # Generate input on JAX, convert to PyTorch on same device
-        x_jax = jax.random.normal(k2, (batch, seq_len, model_dim))
-        x_torch = to_torch(x_jax).to(torch_device)
-
-        # Run PyTorch forward on GPU, then move result to CPU
-        with torch.no_grad():
-            y_torch, _ = torch_attn(x_torch)
-            y_torch_cpu = y_torch.cpu().numpy()
-
-        # Clean up PyTorch GPU memory before JAX forward
-        del y_torch, x_torch, torch_attn
-        sync_and_clear_torch()
-
-        # Run JAX forward
-        y_jax, _ = jax_attn(x_jax, deterministic=True)
-
-        # Compare outputs (both ran on GPU with matching TF32 settings)
-        np.testing.assert_allclose(
-            np.array(y_jax),
-            y_torch_cpu,
-            rtol=1e-4,
-            atol=1e-4,
-            err_msg="MegalodonAttention output should match PyTorch reference",
-        )
+class TestMegalodonAttentionGradients:
+    """Gradient-flow tests for MegalodonAttention."""
 
     def test_megalodon_attention_gradient_flow(self, random_seed: int) -> None:
         """Verify gradients flow through all parameters without NaN.

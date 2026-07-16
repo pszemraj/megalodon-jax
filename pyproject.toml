@@ -33,9 +33,10 @@ classifiers = [
 dynamic = ["version"]
 requires-python = ">=3.11"
 dependencies = [
-  "jax>=0.7.0",
-  "equinox>=0.12.0",
+  "jax>=0.10.2,<0.11",
+  "equinox>=0.13.8,<0.14",
   "jaxtyping>=0.2",
+  "numpy>=2.0",
   "safetensors>=0.4",
 ]
 
@@ -44,12 +45,14 @@ Homepage = "https://github.com/pszemraj/megalodon-jax"
 Repository = "https://github.com/pszemraj/megalodon-jax"
 
 [project.optional-dependencies]
+cuda13 = [
+  "jax[cuda13]>=0.10.2,<0.11",
+]
 convert = [
   "torch>=2.6",
 ]
 dev = [
   "pytest>=7.0",
-  "megalodon-hf @ git+https://github.com/pszemraj/megalodon-hf.git@f85a47849d07d52982a2e6e4cf0297c2621e9916",
   "torch>=2.6",
   "ruff>=0.5",
 ]
@@ -63,19 +66,24 @@ include = ["megalodon_jax*"]
 
 [tool.setuptools_scm]
 write_to = "src/megalodon_jax/_version.py"
+# Sentinel for source trees without SCM metadata; release versions come from Git tags.
+fallback_version = "0.0.0"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 # Run all tests in tests/ directory
 testpaths = ["tests"]
 markers = [
-  "cuda: tests that require a CUDA-capable device",
-  "torch_ref: PyTorch reference tests (not run by default)",
+  "fast: authoritative CPU correctness gate intended for routine CI",
+  "torch_ref: independent PyTorch checks derived from the exact local released source",
 ]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.format]
+preview = true
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]

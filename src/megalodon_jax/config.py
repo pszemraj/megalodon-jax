@@ -13,13 +13,15 @@
 # limitations under the License.
 """Megalodon configuration."""
 
+import math
+import operator
 from dataclasses import dataclass
 from typing import Literal
 
 import jax.numpy as jnp
 
-InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
-GemmBackend = Literal["default"]
+InitMode = Literal["gaussian", "xavier", "he", "bert"]
+AttentionDropoutMode = Literal["post_softmax", "dropkey"]
 
 
 @dataclass(frozen=True)
@@ -41,38 +43,116 @@ class MegalodonConfig:
     value_dim: int = 2048
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16  # complex EMA orders per channel
-    chunk_size: int = 2048
-    max_cache_len: int | None = None  # defaults to chunk_size if None; must be >= chunk_size
-    cache_unbounded: bool = False
+    chunk_size: int = 2048  # Released chunk width; ignored by attention in sliding mode
+    # A positive width replaces chunk-local attention/cache semantics with the sliding extension.
+    attention_window: int | None = None
     norm_num_groups: int = 32
     norm_eps: float = 1e-5
     rope_base: float | None = None  # defaults to 10000.0 if None
     swiglu: bool = False
     rescale_nffn: bool = False
     scale_emb: bool = False
-    norm_affine: bool = True
+    share_emb: bool = False  # Explicit embedding/output tying; never inferred from shape
+    norm_affine: bool = True  # RMSNorm and FFN LayerNorm only; TimestepNorm is always affine
     dropout: float = 0.0
     attention_dropout: float = 0.0
+    attention_dropout_mode: AttentionDropoutMode = "post_softmax"
     hidden_dropout: float = 0.0
-    pad_token_id: int = 0
+    pad_token_id: int | None = None  # Metadata only; token IDs are never zero-masked implicitly
     bos_token_id: int = 1
     eos_token_id: int = 2
-    max_positions: int = 1_000_000
-    init_mode: InitMode = "gaussian"
+    init_mode: InitMode = "he"
     use_checkpoint: bool = False  # Enable gradient checkpointing (disables cache during training)
-    # Segmented CEMA path for packed sequences: parallel associative scan
-    # (fast, materializes (L, B, D, N) complex64 tensors) vs sequential scan
-    # (10-60x slower on GPU, O(1) extra memory). Only affects segment_ids runs.
+    # Segmented CEMA path for packed sequences. The associative scan is the
+    # production throughput path and materializes (L, B, D, N) complex64
+    # operands. The sequential fallback has a compact forward carry, but its
+    # autodiff temporaries must still be measured. Only affects segment_ids.
     use_associative_segment_scan: bool = True
-    output_size: int = -1  # LM head size; -1 ties to vocab_size
-    param_dtype: jnp.dtype = jnp.float32  # Parameter storage dtype
+    output_size: int = -1  # LM head width; -1 resolves to vocab_size
+    # Storage dtype for ordinary embedding/projection parameters. Precision-sensitive
+    # normalization, CEMA, and affine parameters remain FP32.
+    param_dtype: jnp.dtype = jnp.float32
     compute_dtype: jnp.dtype = jnp.float32  # Compute dtype for matmuls/activations
     accum_dtype: jnp.dtype = jnp.float32  # Accumulation dtype for GEMM/reductions
-    softmax_dtype: jnp.dtype = jnp.float32  # Softmax/log-softmax dtype
-    gemm_backend: GemmBackend = "default"
+    attention_softmax_dtype: jnp.dtype = jnp.float32
+    loss_softmax_dtype: jnp.dtype = jnp.float32
 
     def __post_init__(self) -> None:
         """Validate configuration constraints."""
+        boolean_fields = (
+            ("swiglu", self.swiglu),
+            ("rescale_nffn", self.rescale_nffn),
+            ("scale_emb", self.scale_emb),
+            ("share_emb", self.share_emb),
+            ("norm_affine", self.norm_affine),
+            ("use_checkpoint", self.use_checkpoint),
+            ("use_associative_segment_scan", self.use_associative_segment_scan),
+        )
+        for name, value in boolean_fields:
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be bool, got {value!r}")
+
+        integer_fields = (
+            ("vocab_size", self.vocab_size),
+            ("model_dim", self.model_dim),
+            ("num_layers", self.num_layers),
+            ("num_heads", self.num_heads),
+            ("z_dim", self.z_dim),
+            ("value_dim", self.value_dim),
+            ("ffn_hidden_dim", self.ffn_hidden_dim),
+            ("cema_ndim", self.cema_ndim),
+            ("chunk_size", self.chunk_size),
+            ("norm_num_groups", self.norm_num_groups),
+            ("output_size", self.output_size),
+            ("attention_window", self.attention_window),
+            ("pad_token_id", self.pad_token_id),
+            ("bos_token_id", self.bos_token_id),
+            ("eos_token_id", self.eos_token_id),
+        )
+        for name, value in integer_fields:
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be an integer, got {value!r}")
+            try:
+                normalized = operator.index(value)
+            except TypeError as error:
+                raise ValueError(f"{name} must be an integer, got {value!r}") from error
+            object.__setattr__(self, name, int(normalized))
+
+        float_fields = (
+            "norm_eps",
+            "rope_base",
+            "dropout",
+            "attention_dropout",
+            "hidden_dropout",
+        )
+        for name in float_fields:
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, float(value))
+        if self.vocab_size <= 0:
+            raise ValueError(f"vocab_size must be positive, got {self.vocab_size}")
+        if self.output_size < -1 or self.output_size == 0:
+            raise ValueError(f"output_size must be -1 or positive, got {self.output_size}")
+        if self.share_emb and self.effective_output_size != self.vocab_size:
+            raise ValueError("share_emb requires output_size to resolve to vocab_size")
+        for name, value in (
+            ("model_dim", self.model_dim),
+            ("z_dim", self.z_dim),
+            ("value_dim", self.value_dim),
+            ("ffn_hidden_dim", self.ffn_hidden_dim),
+            ("cema_ndim", self.cema_ndim),
+            ("norm_num_groups", self.norm_num_groups),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.num_layers < 0:
+            raise ValueError(f"num_layers must be non-negative, got {self.num_layers}")
+        if self.num_heads <= 0:
+            raise ValueError(f"num_heads must be positive, got {self.num_heads}")
+        if self.chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
         if self.z_dim % self.num_heads != 0:
             raise ValueError(
                 f"z_dim ({self.z_dim}) must be divisible by num_heads ({self.num_heads})"
@@ -81,40 +161,66 @@ class MegalodonConfig:
             raise ValueError(
                 f"value_dim ({self.value_dim}) must be divisible by num_heads ({self.num_heads})"
             )
+        if self.head_dim % 2 != 0:
+            raise ValueError(f"head_dim must be even for RoPE, got {self.head_dim}")
         if self.model_dim % self.norm_num_groups != 0:
             raise ValueError(
                 f"model_dim ({self.model_dim}) must be divisible by "
                 f"norm_num_groups ({self.norm_num_groups})"
             )
-        if self.norm_eps <= 0:
-            raise ValueError(f"norm_eps must be positive, got {self.norm_eps}")
-        if not 0.0 <= self.dropout <= 1.0:
-            raise ValueError(f"dropout must be in [0, 1], got {self.dropout}")
-        if not 0.0 <= self.attention_dropout <= 1.0:
-            raise ValueError(f"attention_dropout must be in [0, 1], got {self.attention_dropout}")
-        if not 0.0 <= self.hidden_dropout <= 1.0:
-            raise ValueError(f"hidden_dropout must be in [0, 1], got {self.hidden_dropout}")
-        if self.max_cache_len is not None and self.max_cache_len <= 0:
-            raise ValueError("max_cache_len must be positive when provided.")
-        if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
-            raise ValueError("max_cache_len must be >= chunk_size to preserve causal attention.")
+        if not math.isfinite(self.norm_eps) or self.norm_eps <= 0:
+            raise ValueError(f"norm_eps must be finite and positive, got {self.norm_eps}")
+        if self.rope_base is not None and (
+            not math.isfinite(self.rope_base) or self.rope_base <= 0
+        ):
+            raise ValueError(f"rope_base must be finite and positive, got {self.rope_base}")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
+        if not 0.0 <= self.attention_dropout < 1.0:
+            raise ValueError(f"attention_dropout must be in [0, 1), got {self.attention_dropout}")
+        if not 0.0 <= self.hidden_dropout < 1.0:
+            raise ValueError(f"hidden_dropout must be in [0, 1), got {self.hidden_dropout}")
+        if self.attention_dropout_mode not in ("post_softmax", "dropkey"):
+            raise ValueError(
+                "attention_dropout_mode must be 'post_softmax' or 'dropkey', got "
+                f"{self.attention_dropout_mode!r}"
+            )
+        if self.init_mode not in ("gaussian", "xavier", "he", "bert"):
+            raise ValueError(f"unsupported fresh-model init_mode: {self.init_mode!r}")
+        for name, token_id in (
+            ("pad_token_id", self.pad_token_id),
+            ("bos_token_id", self.bos_token_id),
+            ("eos_token_id", self.eos_token_id),
+        ):
+            if token_id is not None and not 0 <= token_id < self.vocab_size:
+                raise ValueError(
+                    f"{name} must be in [0, {self.vocab_size}) or None, got {token_id}"
+                )
+        if self.attention_window is not None and self.attention_window <= 0:
+            raise ValueError("attention_window must be positive when provided")
         for name, dtype in (
             ("param_dtype", self.param_dtype),
             ("compute_dtype", self.compute_dtype),
             ("accum_dtype", self.accum_dtype),
-            ("softmax_dtype", self.softmax_dtype),
+            ("attention_softmax_dtype", self.attention_softmax_dtype),
+            ("loss_softmax_dtype", self.loss_softmax_dtype),
         ):
             if not jnp.issubdtype(dtype, jnp.floating):
                 raise ValueError(f"{name} must be a floating dtype, got {dtype}")
             if dtype == jnp.float16:
                 raise ValueError("float16 is unsupported; use float32 or bfloat16 instead.")
-        if self.gemm_backend != "default":
-            raise ValueError(
-                f"gemm_backend must be 'default' until other backends are implemented, got "
-                f"{self.gemm_backend}"
-            )
-        if jnp.finfo(self.accum_dtype).bits < jnp.finfo(self.compute_dtype).bits:
-            raise ValueError("accum_dtype should be >= compute_dtype for stable accumulation.")
+        if self.param_dtype not in (jnp.float32, jnp.bfloat16):
+            raise ValueError("param_dtype must be float32 or bfloat16")
+        if self.compute_dtype not in (jnp.float32, jnp.bfloat16):
+            raise ValueError("compute_dtype must be float32 or bfloat16")
+        if self.accum_dtype != jnp.float32:
+            raise ValueError("accum_dtype must be float32")
+        for name, dtype in (
+            ("attention_softmax_dtype", self.attention_softmax_dtype),
+            ("loss_softmax_dtype", self.loss_softmax_dtype),
+        ):
+            if dtype not in (jnp.float32, jnp.bfloat16):
+                raise ValueError(f"{name} must be float32 or bfloat16")
 
     @property
     def head_dim(self) -> int:
@@ -141,28 +247,203 @@ class MegalodonConfig:
         return self.rope_base if self.rope_base is not None else 10000.0
 
     @property
-    def effective_max_cache_len(self) -> int:
-        """Max cache length, defaulting to chunk_size if not specified.
+    def cache_capacity(self) -> int:
+        """Return the fixed KV ring capacity for the selected attention mode."""
+        return self.chunk_size if self.attention_window is None else self.attention_window
 
-        :return int: max_cache_len if set, otherwise chunk_size.
+    @property
+    def effective_output_size(self) -> int:
+        """Resolve the language-model output width.
+
+        :return int: Vocabulary size when output_size is -1, otherwise output_size.
         """
-        return self.max_cache_len if self.max_cache_len is not None else self.chunk_size
+        return self.vocab_size if self.output_size == -1 else self.output_size
+
+    def parameter_count_breakdown(self) -> dict[str, int]:
+        """Return the exact trainable parameter count for this configuration."""
+        d = self.model_dim
+        z = self.z_dim
+        v = self.value_dim
+        f = self.ffn_hidden_dim
+        n = self.cema_ndim
+
+        timestep_norm = 2 * d
+        cema = 4 * d * n + 2 * d
+        rmsnorm = d if self.norm_affine else 0
+        attention_projections = (d * z + z) + (d * v + v) + (d * v + v) + (d * d + d) + (v * d)
+        qk_affine = 4 * z
+        ffn_norm = 2 * d if self.norm_affine else 0
+        ffn = 2 * d * f + (d * f if self.swiglu else 0)
+        ffn_rescale = d if self.rescale_nffn else 0
+        per_layer = (
+            timestep_norm
+            + cema
+            + rmsnorm
+            + attention_projections
+            + qk_affine
+            + ffn_norm
+            + ffn
+            + ffn_rescale
+        )
+        embedding = self.vocab_size * d
+        output_head = 0 if self.share_emb else self.effective_output_size * d
+        layers = self.num_layers * per_layer
+        final_norm = 2 * d
+        return {
+            "embedding": embedding,
+            "timestep_norm_per_layer": timestep_norm,
+            "cema_per_layer": cema,
+            "rmsnorm_per_layer": rmsnorm,
+            "attention_projections_per_layer": attention_projections,
+            "qk_affine_per_layer": qk_affine,
+            "ffn_norm_per_layer": ffn_norm,
+            "ffn_per_layer": ffn,
+            "ffn_rescale_per_layer": ffn_rescale,
+            "per_layer": per_layer,
+            "layers": layers,
+            "final_norm": final_norm,
+            "output_head": output_head,
+            "total": embedding + layers + final_norm + output_head,
+        }
 
     @classmethod
-    def from_7b(cls) -> "MegalodonConfig":
-        """Create configuration for 7B parameter model.
+    def from_upstream_mega200m(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released mega200M configuration.
 
-        :return MegalodonConfig: Config with 7B-scale hyperparameters.
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released mega200M configuration.
         """
         return cls(
-            model_dim=4096,
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=12,
+            model_dim=1024,
+            num_heads=1,
+            z_dim=256,
+            value_dim=2048,
+            ffn_hidden_dim=2560,
+            chunk_size=2048,
+            norm_num_groups=32,
+        )
+
+    @classmethod
+    def from_upstream_mega1_3b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released mega1.3B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released mega1.3B configuration.
+        """
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=24,
+            model_dim=2048,
+            num_heads=2,
+            z_dim=512,
+            value_dim=4096,
+            ffn_hidden_dim=4864,
+            chunk_size=2048,
+            norm_num_groups=64,
+        )
+
+    @classmethod
+    def from_upstream_mega1_3b_pg19(
+        cls, *, vocab_size: int, output_size: int = -1
+    ) -> "MegalodonConfig":
+        """Create the released tied PG-19 mega1.3B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released tied PG-19 mega1.3B configuration.
+        """
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=24,
+            model_dim=2048,
+            num_heads=2,
+            z_dim=512,
+            value_dim=4096,
+            ffn_hidden_dim=3584,
+            chunk_size=2048,
+            norm_num_groups=64,
+            swiglu=True,
+            scale_emb=True,
+            share_emb=True,
+        )
+
+    @classmethod
+    def from_upstream_mega7_1b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released non-SwiGLU mega7.1B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released non-SwiGLU mega7.1B configuration.
+        """
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
             num_layers=32,
+            model_dim=4096,
             num_heads=4,
             z_dim=1024,
             value_dim=8192,
             ffn_hidden_dim=11264,
+            chunk_size=2048,
+            norm_num_groups=64,
+        )
+
+    @classmethod
+    def from_upstream_mega7_3b(cls, *, vocab_size: int, output_size: int = -1) -> "MegalodonConfig":
+        """Create the released SwiGLU mega7.3B configuration.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Released SwiGLU mega7.3B configuration.
+        """
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=32,
+            model_dim=4096,
+            num_heads=4,
+            z_dim=1024,
+            value_dim=8192,
+            ffn_hidden_dim=8192,
+            chunk_size=2048,
+            norm_num_groups=64,
+            swiglu=True,
+        )
+
+    @classmethod
+    def from_paper_7b(cls, *, vocab_size: int = 32_000, output_size: int = -1) -> "MegalodonConfig":
+        """Create the distinct 7B training configuration reported in the paper.
+
+        :param int vocab_size: Input vocabulary size.
+        :param int output_size: Output width, or -1 to use ``vocab_size``.
+        :return MegalodonConfig: Training configuration reported for the paper's 7B model.
+        """
+        return cls(
+            vocab_size=vocab_size,
+            output_size=output_size,
+            num_layers=32,
+            model_dim=4096,
+            num_heads=4,
+            z_dim=1024,
+            value_dim=8192,
+            ffn_hidden_dim=8192,
             chunk_size=4096,
             norm_num_groups=64,
             rope_base=100_000.0,
             swiglu=True,
+        )
+
+    @classmethod
+    def from_7b(cls) -> "MegalodonConfig":
+        """Reject the historically ambiguous and incorrect 7B factory."""
+        raise ValueError(
+            "from_7b() was an invalid hybrid preset; choose from_paper_7b(), "
+            "from_upstream_mega7_1b(), or from_upstream_mega7_3b() explicitly"
         )

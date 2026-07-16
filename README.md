@@ -1,15 +1,16 @@
 # megalodon-jax
 
-A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801), ported from [megalodon-hf](https://github.com/pszemraj/megalodon-hf).
+A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801), aligned with the original released PyTorch/CUDA implementation.
 
 ## Features
 
 - Pure JAX/Equinox implementation in [src/megalodon_jax](src/megalodon_jax)
-- Core architecture: ComplexEMA (FFT + sequential paths), chunked rotary attention, streaming cache, RMS/Timestep norms
+- Core architecture: ComplexEMA, chunked rotary attention, fixed-capacity streaming caches, RMSNorm, and TimestepNorm
 - Packed-sequence training with full document isolation: `segment_ids` masks attention, resets EMA/norm state at boundaries, and excludes cross-document label pairs from the loss
 - JAX pytree caches for JIT-compatible streaming inference
-- Weight conversion utilities for PyTorch ↔ JAX interop
-- 150+ tests (200+ cases via parametrization) covering parity with the PyTorch reference
+- Strict native SafeTensors checkpoints plus exact original-upstream PyTorch checkpoint conversion
+- Source-transcribed PyTorch/JAX forward, all-parameter gradient, and optimizer consistency gates without building the fused CUDA extension
+- Official released tokenizer bundle in [assets/tokenizer](assets/tokenizer), versioned in-tree for paper and released-repository reproducibility
 
 ## Installation
 
@@ -19,19 +20,27 @@ Install with pip+git for the latest version:
 pip install "git+https://github.com/pszemraj/megalodon-jax.git"
 ```
 
-### development install
+On Linux with an NVIDIA CUDA 13-capable driver, install JAX's official bundled CUDA stack:
 
-For development, clone the repository and install with the `[dev]` extras:
+```sh
+pip install "megalodon-jax[cuda13] @ git+https://github.com/pszemraj/megalodon-jax.git"
+```
+
+The `cuda13` extra installs the matching JAX plugin, PJRT, CUDA, and cuDNN wheels. Keep `LD_LIBRARY_PATH` unset when using these bundled libraries; pointing it at another CUDA toolkit can make XLA load an incompatible library set.
+
+### Development install
+
+For development on an NVIDIA system, clone the repository and install the CUDA 13 and developer extras together:
 
 ```bash
 git clone https://github.com/pszemraj/megalodon-jax.git
 cd megalodon-jax
-pip install -e ".[dev]"
+pip install -e ".[cuda13,dev]"
 ```
 
-Requires Python 3.11+ with JAX 0.7.0+ (tested with 0.8.x), Equinox 0.12.0+. PyTorch is optional; install `.[convert]` for conversion utilities and `.[dev]` for conversion plus parity tests and dev tooling.
+Requires Python 3.11+, JAX `>=0.10.2,<0.11`, and Equinox `>=0.13.8,<0.14`. CPU-only development can use `pip install -e ".[dev]"`. PyTorch is optional; install `.[convert]` for original-upstream checkpoint conversion or `.[dev]` for conversion, parity tests, and developer tooling.
 
-## Quick Start
+## Quick start
 
 ```python
 import jax
@@ -55,7 +64,22 @@ logits, cache = model(input_ids, return_cache=True)
 print(logits.shape)  # (1, 128, 32000)
 ```
 
-### Streaming Inference
+### Exact named presets
+
+Preset names are explicit because the paper 7B configuration and the two released 7B configurations are not interchangeable. With `vocab_size=32_000`, the exact trainable counts are:
+
+| Factory | SwiGLU | Chunk | RoPE base | Tied | Parameters |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `from_upstream_mega200m` | no | 2,048 | 10,000 | no | 220,627,968 |
+| `from_upstream_mega1_3b` | no | 2,048 | 10,000 | no | 1,342,832,640 |
+| `from_upstream_mega1_3b_pg19` | yes | 2,048 | 10,000 | yes | 1,327,628,288 |
+| `from_upstream_mega7_1b` | no | 2,048 | 10,000 | no | 7,117,381,632 |
+| `from_upstream_mega7_3b` | yes | 2,048 | 10,000 | no | 7,385,817,088 |
+| `from_paper_7b` | yes | 4,096 | 100,000 | no | 7,385,817,088 |
+
+`from_7b()` intentionally raises because its historical definition mixed incompatible upstream presets. Use `config.parameter_count_breakdown()` for exact counts at another vocabulary size or output width. Output tying is controlled only by the explicit `share_emb` field; it is never inferred from matching shapes.
+
+### Streaming inference
 
 ```python
 # Continue from cache
@@ -68,18 +92,33 @@ from megalodon_jax.inference import generate
 
 # Autoregressive generation (sampling returns the next PRNG key)
 prompt_ids = jnp.array([[1, 2, 3]], dtype=jnp.int32)
-tokens, cache, key = generate(
+tokens, state, key = generate(
     model,
     prompt_ids,
     max_new_tokens=16,
     key=key,
     temperature=1.0,
+    return_state=True,
+)
+
+# Resume without replaying the final token. The returned key preserves the
+# exact stochastic sampling stream across calls.
+more_tokens, state, key = generate(
+    model,
+    jnp.empty((prompt_ids.shape[0], 0), dtype=jnp.int32),
+    max_new_tokens=16,
+    key=key,
+    temperature=1.0,
+    state=state,
+    return_state=True,
 )
 ```
 
-Note: when `attention_mask` contains padding, cached generation (`max_new_tokens > 1`, `return_cache=True`, or `cache` provided) is not supported.
+`GenerationState` contains the model cache, the logits for the next sampling decision, and per-row EOS status. A raw `ModelCache` returned with `return_cache=True` remains available for model-forward continuation, but is not sufficient to resume `generate()`. Generation-state persistence and cached-generation constraints are described in [JAX and PyTorch interoperability](docs/jax-torch.md#inference-state-persistence) and [Long-context streaming](docs/long-context-streaming.md#padding-and-generation).
 
-### Training with Loss
+Call `generate()` directly: it keeps validation eager and fail-closed, then dispatches the validated numerical transition through a private compiled core. There is intentionally no public `generate_jit`; repeated calls reuse compilation when array shapes and static generation controls match.
+
+### Training with loss
 
 ```python
 import equinox as eqx
@@ -87,17 +126,21 @@ import equinox as eqx
 labels = input_ids  # For causal LM, labels = input_ids
 loss = model.compute_loss(input_ids, labels)
 
+
 # Gradient computation
 @eqx.filter_grad
 def loss_fn(model, input_ids, labels):
     return model.compute_loss(input_ids, labels)
 
+
 grads = loss_fn(model, input_ids, labels)
 ```
 
-### Packed-Sequence Training
+When the full FP32 vocabulary logits limit training memory, opt into the rematerialized loss head with `model.compute_loss(input_ids, labels, loss_chunk_size=64)`. This bounds the number of shifted token states projected at once; ordinary `model(...)` calls still return complete logits. See [Dtypes and numerical stability](docs/dtypes-and-stability.md#memory-bounded-loss-head) for the tradeoff and benchmark procedure.
 
-Multiple documents can share one row with full isolation - attention, EMA state, and running norm statistics all reset at document boundaries, and the loss automatically skips cross-document label pairs:
+### Packed-sequence training
+
+Multiple documents can share one row by passing segment and position metadata:
 
 ```python
 # doc A (3 tokens) + doc B (4 tokens) + padding (1), packed in one row
@@ -117,84 +160,38 @@ loss = model.compute_loss(
 )
 ```
 
-Each packed document produces the same outputs (and gradients) as running it alone. Packed metadata is training-only: it is rejected whenever a cache is involved. Harnesses can detect support via `getattr(model, "supports_segment_reset", False)`. See [docs/dev.md](docs/dev.md#packed-sequence-state-isolation) for design notes and benchmarks.
+See [Packed-sequence training](docs/long-context-streaming.md#packed-sequence-training) for isolation, boundary, padding, cache, and loss semantics.
 
-## Architecture
+## Documentation
 
-### Key Design Decisions
+The [documentation index](docs/README.md) covers the normative upstream-parity and production contracts, streaming and packed execution, precision, ComplexEMA, checkpoint interoperability, paper/source differences, tests, and benchmarks.
 
-1. **JAX Pytree Caches**: All cache/state objects are registered as JAX pytrees. Position counters are JAX scalar arrays (not Python ints) to prevent recompilation.
-
-2. **Three-Path ComplexEMA**:
-   - FFT path: O(L log L), used during training when no state needed
-   - Sequential scan: O(L), maintains complex hidden state for streaming
-   - Segmented associative scan: O(L log L) work, resets state at document boundaries for packed training
-
-3. **Normalized Attention**: Q/K use per-head RMSNorm before affine transform. Attention uses `scale=1.0` (no `/sqrt(d_head)` scaling).
-
-4. **Two-Hop Residual**: FFN adds residual from block input, not post-attention activations.
-
-5. **Mask-Aware Loss**: Padding tokens are excluded from loss computation (matches PyTorch/HF).
-
-### Source Layout
+### Source layout
 
 ```
 src/megalodon_jax/
 ├── config.py          # MegalodonConfig (frozen dataclass)
+├── cache.py           # Cache schema and invariant checks
+├── checkpoint.py      # Strict native model/inference-state persistence
+├── convert.py         # Exact original-upstream checkpoint conversion
+├── inference.py       # Cache indexing, sampling, and generation
+├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM
+├── ops.py             # Dtype-aware linear algebra and dropout
+├── precision.py       # Sensitive-parameter dtype audit and repair
 ├── types.py           # Cache/state pytrees
 ├── utils.py           # Weight initialization
-├── model.py           # MegalodonBlock, MegalodonModel, MegalodonForCausalLM
-├── convert.py         # Weight conversion (PyTorch ↔ JAX)
 └── layers/
-    ├── norms.py       # RMSNorm
-    ├── rotary.py      # RotaryEmbedding
-    ├── timestep_norm.py  # TimestepNorm (streaming GroupNorm)
+    ├── attention.py      # ChunkedAttention, MegalodonAttention, NormalizedFFN
     ├── complex_ema.py    # ComplexEMA
-    └── attention.py      # ChunkedAttention, MegalodonAttention, NormalizedFFN
-```
-
-## Precision
-
-- Parameters use `param_dtype` (default float32); compute uses `compute_dtype` (default float32).
-- Set `compute_dtype=jnp.bfloat16` for AMP-style bf16 compute while keeping sensitive params in fp32.
-- Use `accum_dtype` and `softmax_dtype` to keep GEMM accumulation and loss math in fp32.
-- Use `megalodon_jax.precision.audit_sensitive_param_dtypes` to verify fp32-sensitive params.
-- Avoid blanket `jax.tree.map` casts to bf16; use the config dtypes or `ensure_sensitive_param_dtype`.
-- See `docs/dtypes-and-stability.md` for downstream training guidance.
-- **Never use float16** (EMA/FFT overflow)
-
-## Performance
-
-- **Sequence length padding**: JAX recompiles for each unique input shape. Pad sequences to consistent lengths (e.g., powers of 2) during training to avoid excessive recompilation.
-
-## Current Status
-
-- Core components + streaming cache utilities
-- Sampling + `generate()` loop for text generation
-- PyTorch ↔ JAX conversion (SafeTensors via PyTorch state dicts)
-
-## Limitations
-
-- Pure JAX implementation (no fused CUDA kernels)
-- Sequential CEMA path is slower than FFT; training uses FFT automatically (JAX is ~5x faster than PyTorch for both paths)
-- No 4D chunk parallelism (out of scope for single-device)
-- Cached decoding does not support padded batches
-- Packed-sequence metadata (`segment_ids`/`position_ids`) is training-only; rejected on cached/streaming calls
-- CEMA zeros masked positions before recurrence to avoid padding contamination (matches PyTorch)
-
-## Testing
-
-```bash
-pytest                          # All CPU tests
-pytest -m "not torch_ref"       # JAX-only tests
-pytest -m torch_ref             # PyTorch reference parity tests (requires torch + megalodon-hf)
-pytest tests/test_model.py -v   # Single file
+    ├── norms.py          # RMSNorm and plus-one LayerNorm
+    ├── rotary.py         # RotaryEmbedding
+    ├── segments.py       # Packed boundary and position helpers
+    └── timestep_norm.py  # TimestepNorm (streaming GroupNorm)
 ```
 
 ## Related
 
-- [megalodon-hf](https://github.com/pszemraj/megalodon-hf) - PyTorch/Transformers implementation
-- [Original Megalodon](https://github.com/XuezheMax/megalodon) - Reference CUDA implementation
+- [Original Megalodon](https://github.com/XuezheMax/megalodon) - Released PyTorch/CUDA source
 
 ## Citation
 

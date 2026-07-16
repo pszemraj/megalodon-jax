@@ -1,84 +1,166 @@
-# JAX and PyTorch Interop
+# JAX and original PyTorch interoperability
 
-This repo provides the JAX implementation. The PyTorch reference lives in [megalodon-hf](https://github.com/pszemraj/megalodon-hf) and is the target for deployment and parity checks.
+Conversion targets the exact released Megalodon PyTorch keyspace, not a Hugging Face port or an installed package with a similar name. A local upstream checkout is used to audit that mapping but is not required to load a checkpoint. Torch is optional at runtime; install `megalodon-jax[convert]` when conversion is needed.
 
-## Why the JAX version exists
+Conversion parity, intentional JAX extensions, and historical distributed-runtime details are separate concerns. Their normative boundary is defined in [Upstream parity and production contracts](upstream-parity-contract.md).
 
-- Fast training and experimentation with JIT compilation.
-- Clean parity path to PyTorch for production inference and tooling.
-- Explicit, readable kernels that are easy to audit for correctness.
+## Native JAX checkpoints
 
-## When to use which
-
-Use JAX for:
-
-- Training and large-scale ablations.
-- Research workflows where compile-time shape control matters.
-- Exporting checkpoints for downstream PyTorch use.
-
-Use PyTorch (megalodon-hf) for:
-
-- HuggingFace integration and generation APIs.
-- Deployment and production inference.
-- Compatibility with existing PyTorch tooling and ecosystems.
-
-## Conversion workflows
-
-Conversion utilities live in `megalodon_jax.convert` and require torch (install with `megalodon-jax[convert]`).
-
-### JAX -> PyTorch
-
-Use `convert_jax_to_torch` to get a PyTorch-style state dict, or `save_safetensors` to write a `.safetensors` file.
+Use the versioned SafeTensors format for JAX training and inference:
 
 ```python
-from megalodon_jax.convert import convert_jax_to_torch, save_safetensors
+import jax
 
-state_dict = convert_jax_to_torch(model)
-save_safetensors(model, "model.safetensors")
+from megalodon_jax import load_checkpoint, save_checkpoint
+
+save_checkpoint(model, "model.safetensors")
+restored = load_checkpoint("model.safetensors", key=jax.random.PRNGKey(1))
 ```
 
-Notes:
+Native format v2 stores the complete configuration, a configuration fingerprint, the tensor manifest, parameter names, and dtype policy. Loading is strict. Metadata-free files, legacy layouts, missing tensors, extra tensors, changed shapes, and changed dtypes are rejected.
 
-- `inner.rope.inv_freq` is not in the PyTorch state dict. The JAX exporter skips it by default. Use `include_rope_inv_freq=True` only if you need it for tooling (it will be an unexpected key under strict loading).
-- Use `dtype=` to export bf16 checkpoints (fp32 is the default and recommended).
-- Precision-sensitive parameters (CEMA params, norms, per-head Q/K affine) are exported in fp32 for stability.
+Model and inference-cache writes use a same-directory temporary file followed by atomic replacement.
 
-### PyTorch -> JAX
-
-Use `load_from_pretrained` for a checkpoint file, or `load_weights_from_torch` if you already have a state dict in memory.
+Partial restore is explicit and cannot silently fall back:
 
 ```python
-from megalodon_jax.convert import load_from_pretrained
+from megalodon_jax import load_partial_checkpoint
 
-model = load_from_pretrained(
+model, report = load_partial_checkpoint(
     "model.safetensors",
-    config=config,
-    key=key,
+    config,
+    include={"model.embed.weight"},
+    key=jax.random.PRNGKey(2),
 )
 ```
 
-Make sure the JAX config matches the PyTorch config (dims, layer count, swiglu, norm_affine, output_size, etc).
+The report lists restored and freshly initialized leaves plus source/target configuration fingerprints and an `exact_config_match` flag. A selection containing an unknown or unavailable name raises; intentional cross-config partial restores remain possible but cannot hide their provenance.
 
-Notes:
+## Training-state resume
 
-- Conversion paths require torch for `safetensors.torch` and `torch.load`.
+Native v2 checkpoints intentionally contain only model state. Persist an Optax state beside the model checkpoint with Equinox leaf serialization, and give the optimizer artifact a small sidecar containing the same configuration fingerprint:
 
-## Functional differences (current)
+```python
+import json
+from pathlib import Path
 
-- **Cache + padding**: JAX does not support padded inputs for cached generation; `generate()` rejects padded `attention_mask` when `max_new_tokens > 1`, `return_cache=True`, or a cache is provided. Use unpadded prompts or generate one token at a time.
-- **Cache sizing**: JAX uses a fixed-size ring buffer for KV cache (required for JIT). PyTorch can grow dynamically.
-- **Generation API**: JAX provides its own `generate` loop; it does not implement the full HuggingFace `GenerationMixin` surface.
-- **Compilation shapes**: JAX recompiles on new shapes. Pad sequences to a consistent length for throughput.
+import equinox as eqx
+import jax
 
-## Parity and compatibility notes
+from megalodon_jax import load_checkpoint, save_checkpoint
+from megalodon_jax.checkpoint import config_fingerprint
 
-- The torch fixes for masking, cache semantics, and per-batch positions do not add or rename parameters; weight mapping is unchanged.
-- `max_cache_len` must be `>= chunk_size` when provided (validated in config).
-- Loss masking uses `ignore_index=-100` and attention masks consistently, same as the PyTorch/HF convention.
-- Parity tests that rely on the external `megalodon-hf` package are marked with `@pytest.mark.torch_ref` in `tests/` for easy selection.
+step_dir = Path("checkpoints/step-000100")
+step_dir.mkdir(parents=True, exist_ok=False)
+save_checkpoint(model, step_dir / "model.safetensors")
+eqx.tree_serialise_leaves(step_dir / "optimizer.eqx", opt_state)
+(step_dir / "training-state.json").write_text(
+    json.dumps({
+        "format_version": 1,
+        "step": 100,
+        "config_fingerprint": config_fingerprint(model.config),
+    })
+    + "\n",
+    encoding="utf-8",
+)
+```
 
-## Quick parity checklist
+On restore, load the strict model checkpoint first, verify the sidecar fingerprint, reconstruct the identical optimizer and schedule, and initialize a template state from the restored model before deserializing:
 
-- Configs match (dims, layers, swiglu, norm_affine, output_size).
-- Export with `convert_jax_to_torch` and load in torch with `strict=True`.
-- Compare logits on a small batch in fp32 with deterministic settings.
+```python
+metadata = json.loads((step_dir / "training-state.json").read_text(encoding="utf-8"))
+restored_model = load_checkpoint(
+    step_dir / "model.safetensors",
+    key=jax.random.PRNGKey(1),
+)
+if metadata.get("format_version") != 1:
+    raise ValueError("unsupported training-state format")
+if metadata["config_fingerprint"] != config_fingerprint(restored_model.config):
+    raise ValueError("optimizer state belongs to a different model configuration")
+
+opt_state_template = optimizer.init(eqx.filter(restored_model, eqx.is_array))
+restored_opt_state = eqx.tree_deserialise_leaves(
+    step_dir / "optimizer.eqx",
+    opt_state_template,
+)
+```
+
+The template is the optimizer-state schema, so changing the optimizer transformation, schedule, parameter filtering, shape, or dtype invalidates the artifact. Record the exact optimizer and schedule configuration with the run metadata. Write each resume point into a fresh step directory and publish it only after the model, optimizer, and sidecar writes all succeed; never overwrite one member of an existing pair independently.
+
+## Original upstream to JAX
+
+For a world-size-one released checkpoint:
+
+```python
+from megalodon_jax.convert import load_upstream_checkpoint
+
+model = load_upstream_checkpoint(
+    "consolidated.pth",
+    config,
+    key=jax.random.PRNGKey(0),
+)
+```
+
+Directories produced by the original consolidation workflow are also accepted when they contain `consolidate_config.json` and the declared `consolidated.pth` or `consolidated.NN.pth` shards. Raw FSDP directories and SafeTensors from unrelated schemas are refused.
+
+The loader validates the complete exact key set, source tensor shapes, model-parallel merge axes, CEMA real/complex representation, RoPE frequencies, plus-one normalization storage, projection bias topology, tied-output equality, and configuration compatibility. When `share_emb=True`, the separately serialized embedding and output tensors must be bit-identical because they represent one logical upstream parameter; approximate equality is deliberately rejected.
+
+For an already loaded original state dictionary:
+
+```python
+from megalodon_jax.convert import load_upstream_state_dict
+
+model = load_upstream_state_dict(model, state_dict)
+```
+
+## JAX to original upstream
+
+Export the exact released world-size-one keyspace and save it with Torch:
+
+```python
+import torch
+from megalodon_jax.convert import export_upstream_state_dict
+
+state_dict = export_upstream_state_dict(model)
+torch.save(state_dict, "consolidated.pth")
+```
+
+Weights use the original `(out_features, in_features)` layout without speculative transposes. Ordinary tensors follow the model's `param_dtype` by default and may use the exporter's explicit `dtype` override; CEMA, normalization, RoPE, and other sensitive tensors remain FP32. CEMA gamma is reassembled as real/imag pairs, omega regains its singleton axis, and tied output weights are emitted as an equal clone so serialization does not depend on shared storage.
+
+## Compatibility boundary
+
+The historical `convert_jax_to_torch`, `load_weights_from_torch`, `load_from_pretrained`, and `save_safetensors` functions guessed between incompatible downstream and native schemas. They now raise with the explicit replacement API.
+
+Existing pre-v2 JAX checkpoints require an owner-controlled offline migration because their metadata does not identify RoPE coordinates, normalization storage, bias topology, tying intent, or preset identity. Runtime loading deliberately refuses to infer those choices. A safe migration must supply the original config and provenance, transform affected tensors, then write a v2 checkpoint and verify logits before deleting the source file.
+
+## Inference state persistence
+
+Model-forward caches have a separate versioned format:
+
+```python
+from megalodon_jax import load_inference_cache, save_inference_cache
+
+save_inference_cache(cache, "cache.safetensors", config)
+cache = load_inference_cache("cache.safetensors", config)
+```
+
+Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are model-forward continuation artifacts, not portable model checkpoints and not complete `generate()` continuation state.
+
+Persist `GenerationState` when generation itself must resume without replaying a token:
+
+```python
+from megalodon_jax import load_generation_state, save_generation_state
+
+save_generation_state(state, "generation-state.safetensors", config)
+state = load_generation_state("generation-state.safetensors", config)
+```
+
+Generation-state files use their own fail-closed format and add exact next-logit, finished-row, and EOS schemas on top of the validated cache payload. The sampling PRNG key remains the explicit third value returned by `generate()`; persist and restore that key separately when stochastic continuation must be bit-for-bit reproducible.
+
+## Parity gates
+
+The load-bearing core-math checks use independent NumPy references for TimestepNorm, RoPE, initialization statistics, and dense attention. They do not import `megalodon_jax` production implementations as their expected-value path.
+
+`tests/test_upstream_parity.py` uses a small differentiable Torch transcription of the released equations. It compares full logits, every trainable upstream-schema gradient, and short optimizer trajectories, but it was written alongside this JAX port and is not an independent oracle. Agreement demonstrates consistency between the two implementations; disagreement identifies a divergence that must be investigated rather than proving which side is correct.
+
+`tools/verify_modeling_correctness.py` additionally reads a local upstream source path when it is available; without one it runs repository-only checks and reports source-anchoring checks as skipped. The strict conversion regression uses a hand-authored released-source manifest for keys, shapes, dtypes, literal RoPE frequencies, and model-parallel partition axes. No check imports another Megalodon package or builds the fused extension, and no released trained checkpoint is available for a ground-truth logits comparison. Fused CUDA is checked at source level only.

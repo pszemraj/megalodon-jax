@@ -19,18 +19,86 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
-from typing import Any, ClassVar
+import operator
+from typing import Any, ClassVar, Literal
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
+from megalodon_jax.cache import (
+    CACHE_INVARIANT_MESSAGE,
+    cache_invariant_violation,
+    classify_model_cache,
+)
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
-from megalodon_jax.ops import matmul_3d_weight
+from megalodon_jax.layers.rotary import RotaryTable
+from megalodon_jax.layers.segments import (
+    SegmentMetadata,
+    derive_segment_metadata,
+    valid_segment_mask,
+)
+from megalodon_jax.ops import inverted_dropout, matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
-from megalodon_jax.utils import get_initializer, reinit_linear_weights
+from megalodon_jax.utils import get_boundary_initializer, reinit_linear_weights
+
+
+def _require_dropout_key(
+    config: MegalodonConfig,
+    deterministic: bool,
+    key: PRNGKeyArray | None,
+) -> None:
+    """Reject training-time dropout without an explicit PRNG key.
+
+    :param MegalodonConfig config: Configuration containing dropout probabilities.
+    :param bool deterministic: Whether the call disables stochastic operations.
+    :param PRNGKeyArray | None key: PRNG key supplied for stochastic execution.
+    :raises ValueError: If dropout is active during training and no key is supplied.
+    """
+    dropout_enabled = any(
+        rate > 0.0 for rate in (config.dropout, config.attention_dropout, config.hidden_dropout)
+    )
+    if not deterministic and key is None and dropout_enabled:
+        raise ValueError(
+            "PRNG key required when deterministic=False and dropout is enabled. "
+            "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
+        )
+
+
+def _loss_head_chunk(
+    model: "MegalodonForCausalLM",
+    hidden: Float[Array, "tokens dim"],
+    safe_labels: Int[Array, "tokens"],
+    valid_mask: Bool[Array, "tokens"],
+) -> Float[Array, "tokens"]:
+    """Project one hidden-state chunk and return its masked token losses.
+
+    :param MegalodonForCausalLM model: Language model supplying the output projection.
+    :param Float[Array, "tokens dim"] hidden: Hidden states for one token chunk.
+    :param Int[Array, "tokens"] safe_labels: In-range target token IDs.
+    :param Bool[Array, "tokens"] valid_mask: Tokens that contribute to the loss.
+    :return Float[Array, "tokens"]: Per-token negative log-likelihood, with zeros for invalid tokens.
+    """
+    logits = model._project_logits(hidden[None, :, :])[0]
+    softmax_dtype = model.config.loss_softmax_dtype
+    log_probs = jax.nn.log_softmax(logits.astype(softmax_dtype), axis=-1)
+    target_log_probs = jnp.take_along_axis(log_probs, safe_labels[:, None], axis=-1)[:, 0]
+    return -jnp.where(
+        valid_mask,
+        target_log_probs,
+        jnp.zeros((), dtype=softmax_dtype),
+    )
+
+
+# Inside a scan, preventing CSE adds overhead without protecting distinct Python
+# call sites. Rematerialization is the desired contract: vocabulary-sized chunk
+# intermediates are recomputed during backward rather than retained across chunks.
+_rematerialized_loss_head_chunk = eqx.filter_checkpoint(
+    _loss_head_chunk,
+    prevent_cse=False,
+)
 
 
 @eqx.filter_checkpoint
@@ -40,6 +108,8 @@ def _checkpointed_layer(
     mask: Bool[Array, "batch seq"] | None,
     segment_ids: Int[Array, "batch seq"] | None,
     position_ids: Int[Array, "batch seq"] | None,
+    segment_metadata: SegmentMetadata | None,
+    rotary_table: RotaryTable | None,
     key: PRNGKeyArray | None,
 ) -> Float[Array, "batch seq dim"]:
     """Execute layer without caching for gradient checkpointing.
@@ -54,6 +124,8 @@ def _checkpointed_layer(
     :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
         When omitted with segment_ids given, document-local positions
         (restarting at each segment start) are derived automatically.
+    :param SegmentMetadata | None segment_metadata: Shared packed-sequence metadata.
+    :param RotaryTable | None rotary_table: Shared rotary factors for this model call.
     :param PRNGKeyArray | None key: Optional dropout key.
     :return Float[Array, "batch seq dim"]: Output activations.
     """
@@ -66,6 +138,8 @@ def _checkpointed_layer(
         return_cache=False,
         deterministic=False,
         key=key,
+        _segment_metadata=segment_metadata,
+        _rotary_table=rotary_table,
     )
     return out
 
@@ -102,7 +176,6 @@ class MegalodonBlock(eqx.Module):
 
     attn: MegalodonAttention
     ffn: NormalizedFFN
-    layer_id: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -119,7 +192,6 @@ class MegalodonBlock(eqx.Module):
         :return None: None.
         """
         k1, k2 = jax.random.split(key)
-        self.layer_id = layer_id
 
         self.attn = MegalodonAttention(
             model_dim=config.model_dim,
@@ -132,15 +204,15 @@ class MegalodonBlock(eqx.Module):
             norm_eps=config.norm_eps,
             norm_affine=config.norm_affine,
             rope_base=config.effective_rope_base,
-            max_cache_len=config.effective_max_cache_len,
-            cache_unbounded=config.cache_unbounded,
+            attention_window=config.attention_window,
             dropout=config.dropout,
             attention_dropout=config.attention_dropout,
+            attention_dropout_mode=config.attention_dropout_mode,
             hidden_dropout=config.hidden_dropout,
             param_dtype=config.param_dtype,
             compute_dtype=config.compute_dtype,
             accum_dtype=config.accum_dtype,
-            gemm_backend=config.gemm_backend,
+            attention_softmax_dtype=config.attention_softmax_dtype,
             use_associative_segment_scan=config.use_associative_segment_scan,
             key=k1,
         )
@@ -158,7 +230,6 @@ class MegalodonBlock(eqx.Module):
             param_dtype=config.param_dtype,
             compute_dtype=config.compute_dtype,
             accum_dtype=config.accum_dtype,
-            gemm_backend=config.gemm_backend,
             key=k2,
         )
 
@@ -172,6 +243,10 @@ class MegalodonBlock(eqx.Module):
         return_cache: bool = False,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
+        *,
+        _cache_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
+        _rotary_table: RotaryTable | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Apply attention + FFN with two-hop residual.
 
@@ -185,8 +260,16 @@ class MegalodonBlock(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
+        :param bool _cache_validated: Internal signal that model cache counts were checked.
+        :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+        :param RotaryTable | None _rotary_table: Internal per-model-call rotary factors.
+        :raises ValueError: If cache state is requested during nondeterministic execution.
         :return tuple[Float[Array, "batch seq dim"], LayerCache | None]: Output and cache.
         """
+        if not deterministic and (cache is not None or return_cache):
+            raise ValueError(
+                "cache input and return_cache are inference-only; use deterministic=True"
+            )
         # CRITICAL: Two-hop residual - save BEFORE attention
         residual_base = x
 
@@ -206,6 +289,9 @@ class MegalodonBlock(eqx.Module):
             return_cache=return_cache,
             deterministic=deterministic,
             key=k_attn,
+            _cache_validated=_cache_validated,
+            _segment_metadata=_segment_metadata,
+            _rotary_table=_rotary_table,
         )
 
         # FFN with two-hop residual
@@ -264,8 +350,8 @@ class MegalodonModel(eqx.Module):
 
         # Split keys explicitly for each purpose (clearer allocation)
         # - k_embed: initial embedding weights
-        # - k_embed_reinit: embedding reinitialization (if init_mode != "none")
-        # - k_layer_reinit: layer reinitialization (if init_mode != "none")
+        # - k_embed_reinit: unconditional boundary-policy embedding reinitialization
+        # - k_layer_reinit: layer reinitialization
         # - layer_keys: one key per MegalodonBlock
         k_embed, k_embed_reinit, k_layer_reinit, k_layers = jax.random.split(key, 4)
         layer_keys = jax.random.split(k_layers, config.num_layers)
@@ -278,11 +364,15 @@ class MegalodonModel(eqx.Module):
             key=k_embed,
         )
 
-        # Apply init_mode to embedding weights
-        if config.init_mode != "none":
-            init_fn = get_initializer(config.init_mode, dim=config.model_dim)
-            new_embed_weight = init_fn(k_embed_reinit, embed.weight.shape, embed.weight.dtype)
-            embed = eqx.tree_at(lambda e: e.weight, embed, new_embed_weight)
+        # Boundary tensors use a fixed truncated-normal policy independent of
+        # the selected internal projection initializer.
+        boundary_init = get_boundary_initializer(config.model_dim)
+        new_embed_weight = boundary_init(
+            k_embed_reinit,
+            embed.weight.shape,
+            embed.weight.dtype,
+        )
+        embed = eqx.tree_at(lambda e: e.weight, embed, new_embed_weight)
         self.embed = embed
 
         # Initialize layers
@@ -290,23 +380,80 @@ class MegalodonModel(eqx.Module):
             MegalodonBlock(config, i, key=layer_keys[i]) for i in range(config.num_layers)
         )
 
-        # Apply init_mode to all Linear layers in blocks
-        if config.init_mode != "none":
-            layer_reinit_keys = jax.random.split(k_layer_reinit, len(layers))
-            # Match PyTorch: gaussian Linear init uses std=1.0 (dim=None).
-            linear_dim = None if config.init_mode == "gaussian" else config.model_dim
-            layers = tuple(
-                reinit_linear_weights(layer, config.init_mode, k, dim=linear_dim)
-                for layer, k in zip(layers, layer_reinit_keys)
-            )
+        # Apply init_mode to all Linear layers in blocks.
+        layer_reinit_keys = jax.random.split(k_layer_reinit, len(layers))
+        # Match PyTorch: gaussian Linear init uses std=1.0 (dim=None).
+        linear_dim = None if config.init_mode == "gaussian" else config.model_dim
+        layers = tuple(
+            reinit_linear_weights(layer, config.init_mode, k, dim=linear_dim)
+            for layer, k in zip(layers, layer_reinit_keys)
+        )
         self.layers = layers
 
         self.norm = TimestepNorm(
             num_features=config.model_dim,
             num_groups=config.norm_num_groups,
             eps=config.norm_eps,
-            affine=config.norm_affine,
         )
+
+    def _prepare_call_metadata(
+        self,
+        input_shape: tuple[int, int],
+        segment_ids: Int[Array, "batch seq"] | None,
+        position_ids: Int[Array, "batch seq"] | None,
+        cache: ModelCache | None,
+    ) -> tuple[SegmentMetadata | None, RotaryTable | None]:
+        """Derive packed metadata and one shared rotary table for the layer stack.
+
+        :param tuple[int, int] input_shape: Expected batch and sequence dimensions.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional packed-sequence IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+        :param ModelCache | None cache: Optional cache supplying the next absolute position.
+        :raises ValueError: If metadata shapes are invalid or the cache is incomplete.
+        :return tuple[SegmentMetadata | None, RotaryTable | None]: Packed-sequence metadata and shared rotary table, when applicable.
+        """
+        _, sequence_length = input_shape
+        segment_metadata = None
+        if segment_ids is not None:
+            if segment_ids.shape != input_shape:
+                raise ValueError(
+                    f"segment_ids must have shape {input_shape}, got {segment_ids.shape}"
+                )
+            segment_metadata = derive_segment_metadata(segment_ids)
+
+        if position_ids is not None and position_ids.shape != input_shape:
+            raise ValueError(
+                f"position_ids must have shape {input_shape}, got {position_ids.shape}"
+            )
+        if not self.layers:
+            return segment_metadata, None
+
+        if position_ids is not None:
+            rotary_positions = position_ids
+        elif segment_metadata is not None:
+            rotary_positions = segment_metadata.local_positions
+        else:
+            start = jnp.asarray(0, dtype=jnp.int32)
+            if cache is not None:
+                first_layer_cache = cache.layer_caches[0]
+                if first_layer_cache is None or first_layer_cache.attn is None:
+                    raise ValueError(CACHE_INVARIANT_MESSAGE)
+                start = first_layer_cache.attn.count
+            rotary_positions = jnp.arange(sequence_length, dtype=jnp.int32) + start
+
+        inner = self.layers[0].attn.inner
+        if inner.attention_window is None:
+            rotary_positions = rotary_positions % inner.chunk_size
+        rotary_table = inner.rotary.table_from_positions(rotary_positions)
+
+        # Preserve one materialized table across the unrolled layer stack,
+        # including rematerialized layers, instead of letting optimization
+        # clone identical transcendental expressions into each block.
+        rotary_table = RotaryTable(
+            cos=jax.lax.optimization_barrier(rotary_table.cos),
+            sin=jax.lax.optimization_barrier(rotary_table.sin),
+        )
+        return segment_metadata, rotary_table
 
     def __call__(
         self,
@@ -331,38 +478,72 @@ class MegalodonModel(eqx.Module):
         :param bool return_cache: Whether to return updated cache.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
-        :raises ValueError: If cache layer count does not match the model.
+        :raises ValueError: If cache structure or timeline does not match the model.
         :return tuple[Float[Array, "batch seq dim"], ModelCache | None]: Hidden states and cache.
         """
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
+        _require_dropout_key(self.config, deterministic, key)
+        if not deterministic and (cache is not None or return_cache):
+            raise ValueError(
+                "cache input and return_cache are inference-only; use deterministic=True"
+            )
+        if (
+            cache is not None
+            and classify_model_cache(
+                cache,
+                num_layers=len(self.layers),
+            )
+            == "sparse"
+        ):
+            # Canonicalize the public sparse initializer before tracing so it
+            # is exactly the same program as an omitted cache.
+            cache = None
         B, L = input_ids.shape
+        if cache is not None and (B == 0 or L == 0):
+            raise ValueError("cache input requires non-empty input_ids")
+        if cache is not None:
+            input_ids = eqx.error_if(
+                input_ids,
+                cache_invariant_violation(
+                    cache,
+                    self.config,
+                    batch_size=B,
+                    increment=L,
+                ),
+                CACHE_INVARIANT_MESSAGE,
+            )
+        if key is not None:
+            embedding_key, layers_key = jax.random.split(key)
+        else:
+            embedding_key = layers_key = None
 
         # Handle empty inputs gracefully (B=0 or L=0)
         # Use compute dtype to match model's output dtype.
         if B == 0 or L == 0:
             empty_hidden = jnp.zeros((B, L, self.config.model_dim), dtype=self.config.compute_dtype)
             if return_cache:
-                # Preserve any existing streaming state when input is empty.
-                empty_cache = (
-                    cache
-                    if cache is not None
-                    else ModelCache(tuple([None] * len(self.layers)), None)
-                )
+                empty_cache = ModelCache(tuple([None] * len(self.layers)), None)
             else:
                 empty_cache = None
             return empty_hidden, empty_cache
 
-        # Disable streaming cache updates during training (matches PyTorch behavior).
-        layer_return_cache = return_cache and deterministic
+        layer_return_cache = return_cache
+
+        if attention_mask is not None:
+            if attention_mask.shape != input_ids.shape:
+                raise ValueError(
+                    f"attention_mask must have shape {input_ids.shape}, got {attention_mask.shape}"
+                )
+            mask = attention_mask.astype(jnp.bool_)
+            # Physical positions determine chunk boundaries and RoPE phases.
+            # A False->True transition would therefore shift later valid tokens
+            # instead of behaving like removable padding.
+            has_non_right_padding = jnp.any((~mask[:, :-1]) & mask[:, 1:], axis=1)
+            attention_mask = eqx.error_if(
+                mask,
+                jnp.any(has_non_right_padding),
+                "attention_mask rows must contain a contiguous valid prefix followed by "
+                "optional right padding",
+            )
 
         # Validate token bounds - prevents silent incorrect embeddings from OOB indices
         # Note: Uses eqx.error_if for JIT-safe traced-value errors
@@ -380,14 +561,11 @@ class MegalodonModel(eqx.Module):
         if self.scale != 1.0:
             x = x * jnp.asarray(self.scale, dtype=x.dtype)
 
-        # Zero-mask pad tokens (matches PyTorch padding_idx behavior)
-        # This ensures pad tokens have zero embeddings and receive no gradient updates
-        # Use dtype-matched zero to avoid upcasting bf16 to float32
-        pad_mask = input_ids == self.config.pad_token_id
-        x = jnp.where(pad_mask[:, :, None], jnp.zeros((), dtype=x.dtype), x)
-
         if x.dtype != self.config.compute_dtype:
             x = x.astype(self.config.compute_dtype)
+        if not deterministic and self.config.dropout > 0.0:
+            assert embedding_key is not None
+            x = inverted_dropout(x, self.config.dropout, embedding_key)
 
         # Validate cache + padding constraint
         # Caching with padding is unsupported because:
@@ -396,9 +574,7 @@ class MegalodonModel(eqx.Module):
         # - ComplexEMA and TimestepNorm have mask support for prefill, but
         #   cache semantics assume autoregressive decode (no mid-sequence padding)
         # Guard both cache input AND output - streaming path is used in either case
-        # Packed metadata gates on raw return_cache, not layer_return_cache:
-        # with deterministic=False the layers skip caching, but a ModelCache is
-        # still assembled below and would carry segmented final-norm state.
+        # Cache use under nondeterministic execution is rejected at model entry.
         if (return_cache or cache is not None) and (
             segment_ids is not None or position_ids is not None
         ):
@@ -408,33 +584,29 @@ class MegalodonModel(eqx.Module):
             )
         uses_streaming = layer_return_cache or cache is not None
         if uses_streaming and attention_mask is not None:
-            # Check if any position is masked (False = padding)
-            # Use eqx.error_if for traced-value-safe conditional errors
-            has_padding = ~jnp.all(attention_mask)
-            x = eqx.error_if(
-                x,  # Value to pass through (and attach error to)
-                has_padding,
-                "Cannot use cache with padding in attention_mask. "
-                "Caching is only supported for autoregressive generation without padding. "
-                "Use cache=None and return_cache=False for padded prefill.",
+            raise ValueError(
+                "attention_mask is unsupported with cached calls; cached validity is not "
+                "inferred from token IDs. Use an unmasked generation batch or disable cache."
             )
 
         # Parse cache with validation
         if cache is not None:
-            if len(cache.layer_caches) != len(self.layers):
-                raise ValueError(
-                    f"Cache has {len(cache.layer_caches)} layer entries, "
-                    f"expected {len(self.layers)}"
-                )
             layer_caches = list(cache.layer_caches)
             final_norm_state = cache.final_norm
         else:
             layer_caches = [None] * len(self.layers)
             final_norm_state = None
 
+        segment_metadata, rotary_table = self._prepare_call_metadata(
+            input_ids.shape,
+            segment_ids,
+            position_ids,
+            cache,
+        )
+
         # Split keys for layers
-        if key is not None:
-            keys = list(jax.random.split(key, len(self.layers)))
+        if layers_key is not None:
+            keys = list(jax.random.split(layers_key, len(self.layers)))
         else:
             keys = [None] * len(self.layers)
 
@@ -447,7 +619,14 @@ class MegalodonModel(eqx.Module):
             if use_ckpt:
                 # Checkpointed path: disable cache during training
                 x = _checkpointed_layer(
-                    layer, x, attention_mask, segment_ids, position_ids, layer_key
+                    layer,
+                    x,
+                    attention_mask,
+                    segment_ids,
+                    position_ids,
+                    segment_metadata,
+                    rotary_table,
+                    layer_key,
                 )
                 new_caches.append(None)
             else:
@@ -461,12 +640,20 @@ class MegalodonModel(eqx.Module):
                     return_cache=layer_return_cache,
                     deterministic=deterministic,
                     key=layer_key,
+                    _cache_validated=cache is not None,
+                    _segment_metadata=segment_metadata,
+                    _rotary_table=rotary_table,
                 )
                 new_caches.append(new_cache)
 
         # Final TimestepNorm (segment-aware for packed sequences)
         x, final_norm_state = self.norm(
-            x, state=final_norm_state, mask=attention_mask, segment_ids=segment_ids
+            x,
+            state=final_norm_state,
+            mask=attention_mask,
+            segment_ids=segment_ids,
+            _state_validated=cache is not None,
+            _segment_metadata=segment_metadata,
         )
 
         # Build output cache with stop_gradient to prevent accidental backprop
@@ -491,9 +678,8 @@ class MegalodonModel(eqx.Module):
 class MegalodonForCausalLM(eqx.Module):
     """Megalodon decoder with LM head for causal language modeling.
 
-    Supports both tied and untied LM heads:
-    - When output_size == vocab_size or output_size == -1: weights are tied
-    - When output_size != vocab_size: separate lm_head is created
+    Supports explicitly tied and untied LM heads. Output width and sharing are
+    independent configuration decisions.
 
     For tied weights, logits are computed as: hidden @ embed.weight.T
     For untied weights, logits are computed via the lm_head Linear layer.
@@ -523,18 +709,14 @@ class MegalodonForCausalLM(eqx.Module):
         """
         self.config = config
 
-        # Determine output size and whether to tie weights
-        # output_size=-1 means "use vocab_size" (tied weights)
-        lm_out = config.vocab_size if config.output_size == -1 else config.output_size
-        self.tied = lm_out == config.vocab_size
+        lm_out = config.effective_output_size
+        self.tied = config.share_emb
+        k_model, k_head, k_head_reinit = jax.random.split(key, 3)
 
         if self.tied:
-            # Tied weights: only need key for model
-            self.model = MegalodonModel(config, key=key)
+            self.model = MegalodonModel(config, key=k_model)
             self.lm_head = None
         else:
-            # Untied weights: split keys for model, lm_head, and reinit
-            k_model, k_head, k_head_reinit = jax.random.split(key, 3)
             self.model = MegalodonModel(config, key=k_model)
 
             lm_head = eqx.nn.Linear(
@@ -544,13 +726,95 @@ class MegalodonForCausalLM(eqx.Module):
                 dtype=config.param_dtype,
                 key=k_head,
             )
-            # Apply init_mode to untied lm_head
-            # For gaussian init, match PyTorch reference: std = 1/sqrt(output_dim)
-            if config.init_mode != "none":
-                init_fn = get_initializer(config.init_mode, dim=lm_out)
-                new_weight = init_fn(k_head_reinit, lm_head.weight.shape, lm_head.weight.dtype)
-                lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
+            boundary_init = get_boundary_initializer(config.model_dim)
+            new_weight = boundary_init(
+                k_head_reinit,
+                lm_head.weight.shape,
+                lm_head.weight.dtype,
+            )
+            lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
             self.lm_head = lm_head
+
+    def _project_logits(
+        self,
+        hidden: Float[Array, "batch seq dim"],
+    ) -> Float[Array, "batch seq vocab"]:
+        """Project hidden states to the configured FP32 vocabulary output.
+
+        :param Float[Array, "batch seq dim"] hidden: Decoder hidden states.
+        :return Float[Array, "batch seq vocab"]: FP32 vocabulary logits.
+        """
+        weight = self.model.embed.weight if self.tied else self.lm_head.weight
+        return matmul_3d_weight(
+            hidden,
+            weight,
+            self.config.compute_dtype,
+            self.config.accum_dtype,
+            output_dtype=jnp.float32,
+        )
+
+    def _bounded_token_loss(
+        self,
+        hidden: Float[Array, "batch seq dim"],
+        safe_labels: Int[Array, "batch seq"],
+        valid_mask: Bool[Array, "batch seq"],
+        chunk_size: int,
+    ) -> Float[Array, "batch seq"]:
+        """Evaluate rematerialized vocabulary projections over static token chunks.
+
+        :param Float[Array, "batch seq dim"] hidden: Decoder hidden states.
+        :param Int[Array, "batch seq"] safe_labels: In-range target token IDs.
+        :param Bool[Array, "batch seq"] valid_mask: Tokens that contribute to the loss.
+        :param int chunk_size: Static number of tokens projected per scan step.
+        :return Float[Array, "batch seq"]: Per-token negative log-likelihood, with zeros for invalid tokens.
+        """
+        batch_size, sequence_length, hidden_dim = hidden.shape
+        token_count = batch_size * sequence_length
+        if token_count == 0:
+            return jnp.zeros(
+                (batch_size, sequence_length),
+                dtype=self.config.loss_softmax_dtype,
+            )
+
+        padding = (-token_count) % chunk_size
+        flat_hidden = hidden.reshape(token_count, hidden_dim)
+        flat_labels = safe_labels.reshape(token_count)
+        flat_mask = valid_mask.reshape(token_count)
+        if padding:
+            flat_hidden = jnp.pad(flat_hidden, ((0, padding), (0, 0)))
+            flat_labels = jnp.pad(flat_labels, ((0, padding),))
+            flat_mask = jnp.pad(flat_mask, ((0, padding),))
+
+        num_chunks = (token_count + padding) // chunk_size
+        hidden_chunks = flat_hidden.reshape(num_chunks, chunk_size, hidden_dim)
+        label_chunks = flat_labels.reshape(num_chunks, chunk_size)
+        mask_chunks = flat_mask.reshape(num_chunks, chunk_size)
+
+        def scan_chunk(
+            carry: None,
+            inputs: tuple[jax.Array, jax.Array, jax.Array],
+        ) -> tuple[None, jax.Array]:
+            """Evaluate the loss for one padded token chunk.
+
+            :param None carry: Unused scan carry.
+            :param tuple[jax.Array, jax.Array, jax.Array] inputs: Hidden states, target IDs, and validity mask for one chunk.
+            :return tuple[None, jax.Array]: Unchanged carry and per-token chunk losses.
+            """
+            hidden_chunk, label_chunk, mask_chunk = inputs
+            token_loss = _rematerialized_loss_head_chunk(
+                self,
+                hidden_chunk,
+                label_chunk,
+                mask_chunk,
+            )
+            return carry, token_loss
+
+        _, loss_chunks = jax.lax.scan(
+            scan_chunk,
+            None,
+            (hidden_chunks, label_chunks, mask_chunks),
+        )
+        return loss_chunks.reshape(-1)[:token_count].reshape(batch_size, sequence_length)
 
     def __call__(
         self,
@@ -578,16 +842,6 @@ class MegalodonForCausalLM(eqx.Module):
         :raises ValueError: If dropout is enabled without a PRNG key.
         :return tuple[Float[Array, "batch seq vocab"], ModelCache | None]: Logits and cache.
         """
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
         hidden, cache = self.model(
             input_ids,
             attention_mask=attention_mask,
@@ -599,29 +853,7 @@ class MegalodonForCausalLM(eqx.Module):
             key=key,
         )
 
-        compute_dtype = self.config.compute_dtype
-        accum_dtype = self.config.accum_dtype
-        gemm_backend = self.config.gemm_backend
-        if self.tied:
-            # Weight-tied projection
-            logits = matmul_3d_weight(
-                hidden,
-                self.model.embed.weight,
-                compute_dtype,
-                accum_dtype,
-                gemm_backend,
-            )
-        else:
-            # Separate LM head
-            logits = matmul_3d_weight(
-                hidden,
-                self.lm_head.weight,
-                compute_dtype,
-                accum_dtype,
-                gemm_backend,
-            )
-
-        return logits, cache
+        return self._project_logits(hidden), cache
 
     def compute_loss(
         self,
@@ -633,7 +865,10 @@ class MegalodonForCausalLM(eqx.Module):
         ignore_index: int = -100,
         deterministic: bool = True,
         key: PRNGKeyArray | None = None,
-    ) -> Float[Array, ""]:
+        reduction: Literal["mean", "sum", "none"] = "mean",
+        return_valid_count: bool = False,
+        loss_chunk_size: int | None = None,
+    ) -> Float[Array, "..."] | tuple[Float[Array, "..."], Int[Array, ""]]:
         """Compute causal LM loss with label shifting.
 
         Computes cross-entropy loss for next-token prediction.
@@ -643,13 +878,30 @@ class MegalodonForCausalLM(eqx.Module):
         computation, following HuggingFace Transformers convention. This allows
         padding tokens to be marked with -100 in the labels array.
 
+        ``attention_mask`` applies to the shifted target position only. A valid
+        target following a masked source still contributes; use ``ignore_index``
+        labels when a stricter loss exclusion contract is required.
+
         When segment_ids is provided, shifted pairs that cross a segment
         boundary and pairs targeting padding (segment id 0) are excluded
         automatically - callers do not need to pre-mask boundary labels.
 
+        ``reduction="none"`` returns the shifted per-token loss with excluded
+        positions set to zero. ``reduction="sum"`` is useful for exact gradient
+        accumulation across microbatches; set ``return_valid_count=True`` to
+        return the corresponding valid-token denominator alongside any reduction.
+
+        Set ``loss_chunk_size`` to a positive token count to avoid materializing
+        the full ``(batch, sequence, vocabulary)`` FP32 logits tensor. The model
+        body still runs once over the complete input; only the output projection
+        and cross-entropy are scanned over rematerialized token chunks. This is a
+        memory-throughput tradeoff intended for training shapes where logits are
+        the limiting activation. It does not change the logits-returning forward API.
+
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
-        :param Bool[Array, "batch seq"] | None attention_mask: Optional mask.
+        :param Bool[Array, "batch seq"] | None attention_mask: Optional target-position
+            loss mask, also used by the forward pass for attention validity.
         :param Int[Array, "batch seq"] | None segment_ids: Optional segment IDs.
         :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
             When omitted with segment_ids given, document-local positions
@@ -657,41 +909,65 @@ class MegalodonForCausalLM(eqx.Module):
         :param int ignore_index: Label value to ignore in loss computation.
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
-        :raises ValueError: If dropout is enabled without a PRNG key.
-        :return Float[Array, ""]: Scalar cross-entropy loss.
+        :param Literal["mean", "sum", "none"] reduction: Loss reduction.
+        :param bool return_valid_count: Whether to also return the number of valid targets.
+        :param int | None loss_chunk_size: Maximum shifted token states projected to the
+            vocabulary at once. ``None`` uses the ordinary full-logits path.
+        :raises TypeError: If labels do not have an integer dtype or loss_chunk_size is
+            not an integer.
+        :raises ValueError: If labels do not match the input shape, reduction is invalid,
+            loss_chunk_size is non-positive, or dropout lacks a key.
+        :return Float[Array, "..."] | tuple[Float[Array, "..."], Int[Array, ""]]:
+            Reduced or per-token cross-entropy, optionally paired with its valid-token count.
         """
-        # Validate PRNG key for dropout - prevent silent no-op when training
-        if not deterministic and key is None:
-            if (
-                self.config.dropout > 0.0
-                or self.config.attention_dropout > 0.0
-                or self.config.hidden_dropout > 0.0
-            ):
-                raise ValueError(
-                    "PRNG key required when deterministic=False and dropout is enabled. "
-                    "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
-                )
+        if labels.shape != input_ids.shape:
+            raise ValueError(
+                f"labels must have the same shape as input_ids; got {labels.shape} and "
+                f"{input_ids.shape}"
+            )
+        if not jnp.issubdtype(labels.dtype, jnp.integer):
+            raise TypeError(f"labels must have integer dtype, got {labels.dtype}")
+        if reduction not in ("mean", "sum", "none"):
+            raise ValueError(f"reduction must be 'mean', 'sum', or 'none', got {reduction!r}")
+        if isinstance(loss_chunk_size, bool):
+            raise TypeError("loss_chunk_size must be an integer or None, got bool")
+        if loss_chunk_size is not None:
+            try:
+                loss_chunk_size = operator.index(loss_chunk_size)
+            except TypeError as exc:
+                raise TypeError("loss_chunk_size must be an integer or None") from exc
+            if loss_chunk_size <= 0:
+                raise ValueError("loss_chunk_size must be positive")
 
-        logits, _ = self(
-            input_ids,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            position_ids=position_ids,
-            cache=None,
-            return_cache=False,
-            deterministic=deterministic,
-            key=key,
-        )
+        if loss_chunk_size is None:
+            logits, _ = self(
+                input_ids,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+                cache=None,
+                return_cache=False,
+                deterministic=deterministic,
+                key=key,
+            )
+            shifted_values = logits[:, :-1, :]
+        else:
+            hidden, _ = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+                cache=None,
+                return_cache=False,
+                deterministic=deterministic,
+                key=key,
+            )
+            shifted_values = hidden[:, :-1, :]
 
-        # Shift for causal LM: predict next token
-        shift_logits = logits[:, :-1, :]  # (B, L-1, V)
+        # Shift for causal LM: position i predicts position i+1.
         shift_labels = labels[:, 1:]  # (B, L-1)
 
-        # Guard against empty sequences (seq=0 or seq=1 after shift)
-        # jnp.mean() on empty array returns NaN, which would poison training
-        softmax_dtype = self.config.softmax_dtype
-        if shift_labels.shape[1] == 0:
-            return jnp.zeros((), dtype=softmax_dtype)
+        softmax_dtype = self.config.loss_softmax_dtype
 
         # Build valid mask: positions that contribute to loss
         # Excludes both ignore_index labels and attention-masked positions
@@ -704,11 +980,11 @@ class MegalodonForCausalLM(eqx.Module):
             # boundary and anything in padding (segment id 0), so packed loss
             # matches running each document alone
             same_segment = segment_ids[:, :-1] == segment_ids[:, 1:]
-            valid_mask = valid_mask & same_segment & (segment_ids[:, 1:] > 0)
+            valid_mask = valid_mask & same_segment & valid_segment_mask(segment_ids[:, 1:])
 
         # Validate label bounds only on positions that will be used
         # Prevents silent wrong gradients from JAX index wrapping
-        vocab_size = shift_logits.shape[-1]
+        vocab_size = self.config.effective_output_size
         # Check: any valid position has out-of-bounds label?
         has_invalid_labels = jnp.any(
             valid_mask & ((shift_labels < 0) | (shift_labels >= vocab_size))
@@ -722,23 +998,38 @@ class MegalodonForCausalLM(eqx.Module):
         # Replace ignored labels with 0 for safe indexing (will be masked out)
         safe_labels = jnp.where(valid_mask, shift_labels, 0)
 
-        # Cross-entropy loss
-        shift_logits_softmax = shift_logits.astype(softmax_dtype)
-        log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
-        B, L, V = log_probs.shape
+        if loss_chunk_size is None:
+            shift_logits_softmax = shifted_values.astype(softmax_dtype)
+            log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
+            batch_size, sequence_length, _ = log_probs.shape
+            batch_index = jnp.arange(batch_size)[:, None]
+            sequence_index = jnp.arange(sequence_length)[None, :]
+            target_log_probs = log_probs[batch_index, sequence_index, safe_labels]
+            token_loss = -jnp.where(
+                valid_mask,
+                target_log_probs,
+                jnp.zeros((), dtype=softmax_dtype),
+            )
+        else:
+            token_loss = self._bounded_token_loss(
+                shifted_values,
+                safe_labels,
+                valid_mask,
+                loss_chunk_size,
+            )
+        valid_count = valid_mask.sum()
+        if reduction == "none":
+            loss = token_loss
+        elif reduction == "sum":
+            loss = token_loss.sum()
+        else:
+            # Avoid division by zero: an empty target set has zero mean loss.
+            denominator = jnp.maximum(
+                valid_count.astype(softmax_dtype),
+                jnp.array(1.0, dtype=softmax_dtype),
+            )
+            loss = token_loss.sum() / denominator
 
-        # Gather log prob of correct token
-        batch_idx = jnp.arange(B)[:, None]
-        seq_idx = jnp.arange(L)[None, :]
-        target_log_probs = log_probs[batch_idx, seq_idx, safe_labels]
-
-        # Apply valid mask and compute mean over valid positions only
-        target_log_probs = jnp.where(
-            valid_mask, target_log_probs, jnp.zeros((), dtype=softmax_dtype)
-        )
-
-        num_valid = valid_mask.sum().astype(softmax_dtype)
-        # Avoid division by zero (return 0 loss if no valid positions)
-        num_valid = jnp.maximum(num_valid, jnp.array(1.0, dtype=softmax_dtype))
-        loss = -target_log_probs.sum() / num_valid
+        if return_valid_count:
+            return loss, valid_count
         return loss

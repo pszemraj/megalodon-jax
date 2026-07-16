@@ -19,49 +19,19 @@ Python ints inside jax.lax.scan become static and cause recompilation on each ne
 All cache/state dataclasses are registered as JAX pytrees to work with jit/scan.
 """
 
-from dataclasses import dataclass, field, fields
-from typing import Any, TypeVar
+from dataclasses import dataclass, field
+from functools import partial
 
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Complex, Float, Int
-
-T = TypeVar("T")
+from jaxtyping import Array, Bool, Complex, Float, Int
 
 
-def _register_pytree(cls: type[T]) -> type[T]:
-    """Register a dataclass as a JAX pytree node.
-
-    This decorator enables JAX transformations (jit, vmap, scan) to work with
-    the decorated dataclass by defining how to flatten and unflatten it.
-
-    :param type[T] cls: Dataclass type to register.
-    :return type[T]: The class registered as a pytree node.
-    """
-
-    def flatten(obj: T) -> tuple[tuple[Any, ...], None]:
-        """Flatten dataclass to (children, aux_data).
-
-        :param T obj: Dataclass instance to flatten.
-        :return tuple[tuple[Any, ...], None]: Field values and empty aux data.
-        """
-        children = tuple(getattr(obj, f.name) for f in fields(obj))
-        return children, None
-
-    def unflatten(aux_data: None, children: tuple[Any, ...]) -> T:
-        """Reconstruct dataclass from children.
-
-        :param None aux_data: Unused auxiliary data (always None).
-        :param tuple[Any, ...] children: Field values in declaration order.
-        :return T: Reconstructed dataclass instance.
-        """
-        return cls(*children)
-
-    jax.tree_util.register_pytree_node(cls, flatten, unflatten)
-    return cls
-
-
-@_register_pytree
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("k", "v", "count"),
+    meta_fields=(),
+)
 @dataclass
 class AttentionCache:
     """Cache for streaming attention.
@@ -82,7 +52,11 @@ class AttentionCache:
     count: Int[Array, ""]  # JAX scalar - total tokens seen
 
 
-@_register_pytree
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("count", "mean", "var"),
+    meta_fields=(),
+)
 @dataclass
 class NormState:
     """Running statistics for TimestepNorm (Welford's algorithm).
@@ -97,7 +71,11 @@ class NormState:
     var: Float[Array, "batch groups"]  # running variance estimate
 
 
-@_register_pytree
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("h",),
+    meta_fields=(),
+)
 @dataclass
 class EMAState:
     """Complex exponential moving average hidden state.
@@ -117,13 +95,18 @@ def _default_position() -> Int[Array, ""]:
     return jnp.array(0, dtype=jnp.int32)
 
 
-@_register_pytree
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("attn", "norm", "ema", "position"),
+    meta_fields=(),
+)
 @dataclass
 class LayerCache:
     """Combined cache for a single transformer layer.
 
-    Groups attention cache, norm state, and EMA state together with
-    the absolute position for RoPE computation.
+    Groups attention cache, norm state, and EMA state. ``position`` is retained
+    as a schema-level compatibility mirror of ``AttentionCache.count``; cached
+    attention uses ``attn.count`` as the authoritative RoPE/ring position.
     """
 
     attn: AttentionCache | None = None
@@ -132,7 +115,11 @@ class LayerCache:
     position: Int[Array, ""] = field(default_factory=_default_position)
 
 
-@_register_pytree
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("layer_caches", "final_norm"),
+    meta_fields=(),
+)
 @dataclass
 class ModelCache:
     """Full model cache: layer caches + final norm state.
@@ -146,3 +133,25 @@ class ModelCache:
 
     layer_caches: tuple[LayerCache | None, ...]
     final_norm: NormState | None = None
+
+
+@partial(
+    jax.tree_util.register_dataclass,
+    data_fields=("cache", "next_logits", "finished"),
+    meta_fields=("eos_token_id",),
+)
+@dataclass
+class GenerationState:
+    """Complete state required to resume autoregressive generation.
+
+    ``cache`` includes every token emitted so far, while ``next_logits`` are
+    the logits produced by the final cached token and are therefore ready for
+    the next sampling decision. ``finished`` preserves per-row EOS status for
+    fixed-shape batched continuation. The EOS token is static metadata so a
+    resumed call cannot silently change the meaning of ``finished``.
+    """
+
+    cache: ModelCache
+    next_logits: Float[Array, "batch vocab"]
+    finished: Bool[Array, "batch"]
+    eos_token_id: int | None = None

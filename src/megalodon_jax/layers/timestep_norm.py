@@ -11,85 +11,232 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Streaming TimestepNorm for Megalodon JAX.
+"""Source-compatible causal TimestepNorm for Megalodon JAX."""
 
-TimestepNorm is a streaming variant of GroupNorm that computes cumulative
-statistics (Welford's algorithm) to avoid leaking future information in
-autoregressive models.
-"""
+import math
+from typing import NamedTuple
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
+from jaxtyping import Array, Bool, Float, Int
 
-from megalodon_jax.layers.segments import segment_boundaries
+from megalodon_jax.layers.segments import SegmentMetadata, derive_segment_metadata
 from megalodon_jax.types import NormState
 
-# Variance floor to prevent division instability in early training
-VARIANCE_FLOOR = 1e-6
+
+def _block_moments(x: Array) -> tuple[Array, Array]:
+    """Return stable population moments over the final feature axis.
+
+    :param Array x: Grouped input values.
+    :return tuple[Array, Array]: Population mean and variance for each group.
+    """
+    mean = jnp.mean(x, axis=-1)
+    var = jnp.mean(jnp.square(x - mean[..., None]), axis=-1)
+    return mean, var
+
+
+class _MomentSummary(NamedTuple):
+    """Equal-sized token-block moments with an unnormalized second moment."""
+
+    count: Array
+    mean: Array
+    m2: Array
+
+
+class _SegmentedSummary(NamedTuple):
+    """Moment summary plus whether its interval contains a reset."""
+
+    count: Array
+    mean: Array
+    m2: Array
+    has_reset: Array
+
+
+def _merge_m2(left: _MomentSummary, right: _MomentSummary) -> _MomentSummary:
+    """Associatively merge Chan--Golub--LeVeque block summaries.
+
+    :param _MomentSummary left: Summary for the earlier interval.
+    :param _MomentSummary right: Summary for the later interval.
+    :return _MomentSummary: Summary for the concatenated interval.
+    """
+    count_a, mean_a, m2_a = left
+    count_b, mean_b, m2_b = right
+    count = count_a + count_b
+    count_a_f = count_a.astype(jnp.float32)
+    count_b_f = count_b.astype(jnp.float32)
+    count_f = jnp.maximum(count.astype(jnp.float32), 1.0)
+    delta = mean_b - mean_a
+    merged_mean = mean_a + delta * (count_b_f / count_f)
+    merged_m2 = m2_a + m2_b + jnp.square(delta) * (count_a_f * count_b_f / count_f)
+
+    left_empty = count_a == 0
+    right_empty = count_b == 0
+    mean = jnp.where(right_empty, mean_a, jnp.where(left_empty, mean_b, merged_mean))
+    m2 = jnp.where(right_empty, m2_a, jnp.where(left_empty, m2_b, merged_m2))
+    return _MomentSummary(count=count, mean=mean, m2=m2)
+
+
+def _merge_segmented_m2(
+    left: _SegmentedSummary,
+    right: _SegmentedSummary,
+) -> _SegmentedSummary:
+    """Merge summaries while discarding everything before a right-hand reset.
+
+    :param _SegmentedSummary left: Summary for the earlier interval.
+    :param _SegmentedSummary right: Summary for the later interval.
+    :return _SegmentedSummary: Reset-aware summary for the concatenated interval.
+    """
+    merged = _merge_m2(
+        _MomentSummary(left.count, left.mean, left.m2),
+        _MomentSummary(right.count, right.mean, right.m2),
+    )
+    choose_right = right.has_reset
+    return _SegmentedSummary(
+        count=jnp.where(choose_right, right.count, merged.count),
+        mean=jnp.where(choose_right, right.mean, merged.mean),
+        m2=jnp.where(choose_right, right.m2, merged.m2),
+        has_reset=left.has_reset | right.has_reset,
+    )
+
+
+def _shifted_cumsum_prefix(
+    block_mean: Array,
+    block_var: Array,
+    initial: NormState,
+) -> tuple[Array, Array, Array]:
+    """Compute an unmasked prefix from one shifted first/second-moment cumsum.
+
+    "Shifted" refers to subtracting a numerical anchor from the moments; it
+    does not shift values along the sequence axis.
+
+    :param Array block_mean: Per-token population means by group.
+    :param Array block_var: Per-token population variances by group.
+    :param NormState initial: Incoming causal normalization state.
+    :return tuple[Array, Array, Array]: Prefix counts, means, and population variances.
+    """
+    _, length, groups = block_mean.shape
+    anchor = jnp.where(initial.count[:, None] > 0, initial.mean, block_mean[:, 0])
+    anchor = jax.lax.stop_gradient(anchor)
+    shifted_mean = block_mean - anchor[:, None, :]
+    shifted_second = block_var + jnp.square(shifted_mean)
+    prefix_moments = jax.lax.cumsum(
+        jnp.concatenate((shifted_mean, shifted_second), axis=-1),
+        axis=1,
+    )
+    prefix_first = prefix_moments[..., :groups]
+    prefix_second = prefix_moments[..., groups:]
+
+    initial_count_f = initial.count.astype(jnp.float32)[:, None]
+    initial_offset = initial.mean - anchor
+    initial_first = initial_count_f * initial_offset
+    initial_second = initial_count_f * (initial.var + jnp.square(initial_offset))
+
+    steps = jnp.arange(1, length + 1, dtype=jnp.int32)[None, :, None]
+    count = initial.count[:, None, None] + steps
+    count_f = count.astype(jnp.float32)
+    offset = (initial_first[:, None, :] + prefix_first) / count_f
+    mean = anchor[:, None, :] + offset
+    var = (initial_second[:, None, :] + prefix_second) / count_f - jnp.square(offset)
+    return count, mean, var
 
 
 class TimestepNorm(eqx.Module):
-    """Streaming group-wise normalization across time with optional state.
+    """Normalize each group over all valid scalars observed up to a timestep.
 
-    At position t, normalizes using only statistics from positions 0..t,
-    enabling causal/autoregressive processing.
+    State count follows the released implementation and counts equal-sized valid
+    token blocks. Each block contributes its population mean and variance over
+    the features in a group, which is algebraically equivalent to counting every
+    scalar in the paper equation.
 
-    Attributes:
-        num_features: Total number of feature channels D.
-        num_groups: Number of groups for group-wise statistics.
-        group_size: Features per group (num_features // num_groups).
-        eps: Numerical epsilon for variance stability.
-        affine: Whether to include learnable affine parameters.
-        weight: Scale parameter (effective scale = weight + 1.0), or None if affine=False.
-        bias: Shift parameter, or None if affine=False.
+    Stored affine scale uses the released plus-one parameterization:
+    effective_scale = weight + 1.
     """
 
     num_features: int = eqx.field(static=True)
     num_groups: int = eqx.field(static=True)
     group_size: int = eqx.field(static=True)
+    prior_count: int = eqx.field(static=True)
     eps: float = eqx.field(static=True)
-    affine: bool = eqx.field(static=True)
-    weight: Float[Array, "dim"] | None
-    bias: Float[Array, "dim"] | None
+    prior_mean: Float[Array, "groups"] | None
+    prior_logv: Float[Array, "groups"] | None
+    weight: Float[Array, "dim"]
+    bias: Float[Array, "dim"]
 
     def __init__(
         self,
         num_features: int,
-        num_groups: int,
+        num_groups: int | None = None,
+        prior_count: int = 0,
         eps: float = 1e-5,
         affine: bool = True,
-        *,
-        key: PRNGKeyArray | None = None,
     ):
         """Initialize TimestepNorm.
 
-        :param int num_features: Total number of feature channels.
-        :param int num_groups: Number of groups for statistics computation.
-        :param float eps: Numerical epsilon for variance stability.
-        :param bool affine: Whether to include learnable affine parameters.
-        :param PRNGKeyArray | None key: PRNG key (unused).
-        :raises ValueError: If num_features is not divisible by num_groups.
-        :return None: None.
+        :param int num_features: Total feature width.
+        :param int | None num_groups: Number of statistic groups. None or
+            num_features selects featurewise TimestepNorm.
+        :param int prior_count: Number of learned-prior observations.
+        :param float eps: Numerical epsilon added to population variance.
+        :param bool affine: Compatibility argument; must be true because released
+            TimestepNorm is always affine.
+        :raises ValueError: If dimensions, prior count, epsilon, or affine mode are invalid.
         """
-        del key  # unused
-        if num_features % num_groups != 0:
+        if num_features <= 0:
+            raise ValueError(f"num_features must be positive, got {num_features}")
+        if prior_count < 0:
+            raise ValueError(f"prior_count must be non-negative, got {prior_count}")
+        if prior_count > jnp.iinfo(jnp.int32).max:
+            raise ValueError("prior_count exceeds the supported int32 state range")
+        if not math.isfinite(eps) or eps <= 0.0:
+            raise ValueError(f"eps must be finite and positive, got {eps}")
+        if not affine:
+            raise ValueError("TimestepNorm is always affine in the released architecture")
+
+        featurewise = num_groups is None or num_groups == num_features
+        resolved_groups = num_features if featurewise else num_groups
+        assert resolved_groups is not None
+        if featurewise and prior_count <= 1:
+            raise ValueError("featurewise TimestepNorm requires prior_count > 1")
+        if num_features % resolved_groups != 0:
             raise ValueError(
-                f"num_features ({num_features}) must be divisible by num_groups ({num_groups})"
+                f"num_features ({num_features}) must be divisible by num_groups ({resolved_groups})"
             )
+
         self.num_features = num_features
-        self.num_groups = num_groups
-        self.group_size = num_features // num_groups
+        self.num_groups = resolved_groups
+        self.group_size = num_features // resolved_groups
+        self.prior_count = prior_count
         self.eps = eps
-        self.affine = affine
-        if affine:
-            # Initialize weight to zeros (effective scale = weight + 1.0 = 1.0)
-            self.weight = jnp.zeros(num_features, dtype=jnp.float32)
-            self.bias = jnp.zeros(num_features, dtype=jnp.float32)
+        if prior_count > 0:
+            self.prior_mean = jnp.zeros(resolved_groups, dtype=jnp.float32)
+            self.prior_logv = jnp.zeros(resolved_groups, dtype=jnp.float32)
         else:
-            self.weight = None
-            self.bias = None
+            self.prior_mean = None
+            self.prior_logv = None
+        self.weight = jnp.zeros(num_features, dtype=jnp.float32)
+        self.bias = jnp.zeros(num_features, dtype=jnp.float32)
+
+    def _prior_state(self, batch_size: int) -> NormState:
+        """Create the source-compatible initial state for a batch.
+
+        :param int batch_size: Number of rows in the batch.
+        :return NormState: Broadcast learned prior or default zero-history state.
+        """
+        count = jnp.full((batch_size,), self.prior_count, dtype=jnp.int32)
+        if self.prior_mean is None:
+            mean = jnp.zeros((batch_size, self.num_groups), dtype=jnp.float32)
+            var = jnp.ones((batch_size, self.num_groups), dtype=jnp.float32)
+        else:
+            assert self.prior_logv is not None
+            mean = jnp.broadcast_to(
+                self.prior_mean.astype(jnp.float32), (batch_size, self.num_groups)
+            )
+            var = jnp.broadcast_to(
+                jnp.exp(self.prior_logv.astype(jnp.float32)),
+                (batch_size, self.num_groups),
+            )
+        return NormState(count=count, mean=mean, var=var)
 
     def __call__(
         self,
@@ -97,227 +244,202 @@ class TimestepNorm(eqx.Module):
         state: NormState | None = None,
         mask: Bool[Array, "batch seq"] | None = None,
         segment_ids: Int[Array, "batch seq"] | None = None,
+        *,
+        _state_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], NormState]:
-        """Normalize x while carrying forward streaming statistics.
+        """Normalize a sequence and return its final causal statistic state.
 
-        When segment_ids is given (packed sequences), the running statistics
-        reset at each segment boundary so every packed document normalizes
-        exactly as if run alone with a fresh state. The returned state is
-        anchored at each row's last valid (non-padding, unmasked) token, so
-        trailing padding does not blank it; rows with no valid tokens return
-        the fresh-state baseline (count=0, mean=0, var=1).
+        Public masks use True for valid tokens. Segment id zero is padding;
+        every contiguous nonzero segment is normalized as an independent sequence.
+        Masked outputs are exactly zero after affine transformation.
 
-        :param Float[Array, "batch seq dim"] x: Input tensor.
-        :param NormState | None state: Previous running statistics.
+        :param Float[Array, "batch seq dim"] x: Input activations.
+        :param NormState | None state: Optional continuation state.
         :param Bool[Array, "batch seq"] | None mask: Valid-token mask.
-        :param Int[Array, "batch seq"] | None segment_ids: Optional per-token segment IDs
-            (0 = padding) for packed-sequence stat resets. Training-only:
-            incompatible with an incoming state.
-        :raises ValueError: If input dimension doesn't match num_features, or if
-            segment_ids is combined with an incoming state.
-        :raises TypeError: If input dtype is float16.
-        :return tuple[Float[Array, "batch seq dim"], NormState]: Normalized output and state.
+        :param Int[Array, "batch seq"] | None segment_ids: Packed-sequence ids.
+        :param bool _state_validated: Internal model-path signal that cache state was checked.
+        :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+        :raises ValueError: If shapes or continuation values are invalid, or packed resets are
+            combined with state.
+        :raises TypeError: If float16 input is provided.
+        :return tuple: Normalized output and final population-statistic state.
         """
-        B, L, D = x.shape
-        G = self.num_groups
-        gs = self.group_size
-
-        # Reject fp16 for numerical stability (matches PyTorch reference)
-        if x.dtype == jnp.float16:
-            raise TypeError(
-                "TimestepNorm does not support float16 inputs due to numerical "
-                "stability concerns. Use float32 or bfloat16 instead."
-            )
-
+        if x.ndim != 3:
+            raise ValueError(f"TimestepNorm expects rank-3 input, got shape {x.shape}")
+        batch_size, length, dim = x.shape
+        if dim != self.num_features:
+            raise ValueError(f"TimestepNorm expected {self.num_features} features, got {dim}")
+        if x.dtype not in (jnp.float32, jnp.bfloat16):
+            raise TypeError("TimestepNorm supports only float32 and bfloat16")
         if segment_ids is not None and state is not None:
-            raise ValueError(
-                "segment_ids is not supported together with an incoming NormState "
-                "(state). Packed-sequence resets are a training-only, non-streaming "
-                "feature."
-            )
+            raise ValueError("segment_ids cannot be combined with an incoming NormState")
 
-        if D != self.num_features:
-            raise ValueError(
-                f"TimestepNorm expected input with {self.num_features} features, "
-                f"got {D}. Input shape: {tuple(x.shape)}"
-            )
-
-        # Initialize state if not provided
+        prior = self._prior_state(batch_size)
         if state is None:
-            prev_count = jnp.zeros(B, dtype=jnp.int32)
-            prev_mean = jnp.zeros((B, G), dtype=jnp.float32)
-            prev_var = jnp.ones((B, G), dtype=jnp.float32)
+            initial = prior
         else:
-            prev_count = state.count
-            prev_mean = state.mean.astype(jnp.float32)
-            prev_var = state.var.astype(jnp.float32)
-
-        # Default mask: all valid
-        if mask is None:
-            mask = jnp.ones((B, L), dtype=jnp.bool_)
-
-        # Handle empty sequence
-        if L == 0:
-            new_state = NormState(
-                count=prev_count,
-                mean=prev_mean,
-                var=prev_var,
+            expected_mean_shape = (batch_size, self.num_groups)
+            if state.count.shape != (batch_size,):
+                raise ValueError(
+                    f"NormState.count must have shape {(batch_size,)}, got {state.count.shape}"
+                )
+            if state.mean.shape != expected_mean_shape or state.var.shape != expected_mean_shape:
+                raise ValueError(
+                    f"NormState mean/var must have shape {expected_mean_shape}, "
+                    f"got {state.mean.shape} and {state.var.shape}"
+                )
+            initial = NormState(
+                count=state.count.astype(jnp.int32),
+                mean=state.mean.astype(jnp.float32),
+                var=state.var.astype(jnp.float32),
             )
-            return x, new_state
 
-        # Always compute statistics in float32 for numerical stability
-        stats_dtype = jnp.float32
+        valid: Array | None = None
+        if mask is not None:
+            if mask.shape != (batch_size, length):
+                raise ValueError(f"mask must have shape {(batch_size, length)}, got {mask.shape}")
+            valid = mask.astype(jnp.bool_)
 
-        # Reshape to (B, L, G, gs) for per-group statistics
-        x_groups = x.reshape(B, L, G, gs).astype(stats_dtype)
-        prev_mean_f = prev_mean.astype(stats_dtype)
-        prev_var_f = prev_var.astype(stats_dtype)
-        prev_count_f = prev_count.astype(stats_dtype)
-
-        # Valid mask for weighting
-        valid = mask.astype(stats_dtype)  # (B, L)
+        boundaries: Array | None = None
         if segment_ids is not None:
-            # Padding (segment 0) must not contribute to statistics
-            valid = valid * (segment_ids > 0).astype(stats_dtype)
-        valid_exp = valid[:, :, None]  # (B, L, 1)
+            if segment_ids.shape != (batch_size, length):
+                raise ValueError(
+                    f"segment_ids must have shape {(batch_size, length)}, got {segment_ids.shape}"
+                )
+            if _segment_metadata is None:
+                _segment_metadata = derive_segment_metadata(segment_ids)
+            # Anchor continuation at the last real token, matching ComplexEMA.
+            segment_valid = _segment_metadata.valid
+            valid = segment_valid if valid is None else valid & segment_valid
+            boundaries = _segment_metadata.boundaries
 
-        # Per-group means at each position: (B, L, G)
-        group_means = x_groups.mean(axis=-1)
-
-        if segment_ids is None:
-            # Cumulative sums for vectorized Welford
-            prev_sum = prev_mean_f * prev_count_f[:, None]  # (B, G)
-            cumsum_means = jnp.cumsum(group_means * valid_exp, axis=1)  # (B, L, G)
-            sum_t = prev_sum[:, None, :] + cumsum_means  # (B, L, G)
-
-            # Cumulative valid counts
-            count_t = prev_count_f[:, None] + jnp.cumsum(valid, axis=1)  # (B, L)
-            count_clamped = jnp.maximum(count_t, 1.0)
-
-            # Mean at each position
-            mean_t = jnp.where(
-                count_t[:, :, None] > 0.0,
-                sum_t / count_clamped[:, :, None],
-                prev_mean_f[:, None, :],
-            )  # (B, L, G)
-
-            # Welford variance: use delta from previous mean and current mean
-            # mean_prev[t] = mean_t[t-1] for t>0, prev_mean for t=0
-            mean_prev = jnp.concatenate(
-                [prev_mean_f[:, None, :], mean_t[:, :-1, :]], axis=1
-            )  # (B, L, G)
-            delta = group_means - mean_prev
-            delta2 = group_means - mean_t
-
-            # M2 accumulator
-            prev_count_clamped = jnp.maximum(prev_count_f, 1.0)
-            prev_m2 = prev_var_f * prev_count_clamped[:, None]  # (B, G)
-            delta_term = delta * delta2 * valid_exp  # (B, L, G)
-            m2_t = prev_m2[:, None, :] + jnp.cumsum(delta_term, axis=1)  # (B, L, G)
-
-            # Variance at each position
-            var_t = jnp.where(
-                count_t[:, :, None] > 0.0,
-                m2_t / count_clamped[:, :, None],
-                prev_var_f[:, None, :],
-            )  # (B, L, G)
-
-            # Floor variance to prevent instability
-            var_t = jnp.maximum(var_t, VARIANCE_FLOOR)
-        else:
-            # Segment-local Welford: restart statistics at every boundary,
-            # reproducing exactly a fresh state (count=0, mean=0, var=1 <=>
-            # M2 baseline 1.0) per doc.
-            is_boundary = segment_boundaries(segment_ids)  # (B, L)
-
-            def _segmented_cumsum(z: Float[Array, "batch seq *rest"]) -> Float[Array, "..."]:
-                """Inclusive cumsum that restarts at segment boundaries.
-
-                Uses a reset-carrying associative scan rather than subtracting
-                a global cumsum at each boundary: the subtraction is exact
-                algebraically but catastrophically cancels in fp32 once earlier
-                segments' magnitudes dwarf the local sums (and it leaves a
-                gradient path across the boundary). The reset flag hard-blocks
-                other segments' values from ever entering a segment's sum.
-
-                :param Float[Array, "batch seq *rest"] z: Per-position addends.
-                :return Float[Array, "..."]: Segment-local inclusive cumsum.
-                """
-                flags = is_boundary if z.ndim == 2 else is_boundary[:, :, None]
-                flags = jnp.broadcast_to(flags, z.shape)
-
-                def combine(
-                    left: tuple[Float[Array, "..."], Bool[Array, "..."]],
-                    right: tuple[Float[Array, "..."], Bool[Array, "..."]],
-                ) -> tuple[Float[Array, "..."], Bool[Array, "..."]]:
-                    """Compose two segment-sum elements (earlier left, later right).
-
-                    :param tuple left: (partial sum, contains-reset flag) of earlier span.
-                    :param tuple right: (partial sum, contains-reset flag) of later span.
-                    :return tuple: Combined (sum, flag) for the joined span.
-                    """
-                    v_l, f_l = left
-                    v_r, f_r = right
-                    return jnp.where(f_r, v_r, v_l + v_r), f_l | f_r
-
-                vals, _ = jax.lax.associative_scan(combine, (z, flags), axis=1)
-                return vals
-
-            count_t = _segmented_cumsum(valid)  # (B, L)
-            count_clamped = jnp.maximum(count_t, 1.0)
-
-            # Segment-local mean (zero while count is 0, matching fresh state)
-            sum_t = _segmented_cumsum(group_means * valid_exp)
-            mean_t = sum_t / count_clamped[:, :, None]  # (B, L, G)
-
-            # mean_prev[t] = mean_t[t-1] within a segment, 0 at segment starts
-            mean_t_shifted = jnp.concatenate(
-                [jnp.zeros((B, 1, G), dtype=stats_dtype), mean_t[:, :-1, :]], axis=1
+        if state is not None and not _state_validated:
+            max_increment = (
+                jnp.asarray(length, dtype=jnp.int32)
+                if valid is None
+                else valid.astype(jnp.int32).sum(axis=1)
             )
-            mean_prev = jnp.where(is_boundary[:, :, None], 0.0, mean_t_shifted)
-            delta = group_means - mean_prev
-            delta2 = group_means - mean_t
+            initial_count = eqx.error_if(
+                initial.count,
+                jnp.any(
+                    (initial.count < 0) | (initial.count > jnp.iinfo(jnp.int32).max - max_increment)
+                )
+                | jnp.any(~jnp.isfinite(initial.mean))
+                | jnp.any(~jnp.isfinite(initial.var))
+                | jnp.any(initial.var < 0.0),
+                "TimestepNorm state count must be non-negative and must not overflow int32; "
+                "mean/var must be finite and variance must be non-negative",
+            )
+            initial = NormState(count=initial_count, mean=initial.mean, var=initial.var)
 
-            # M2 baseline is 1.0 per segment: fresh state has var=1, count=0,
-            # so prev_m2 = prev_var * max(prev_count, 1) = 1
-            delta_term = delta * delta2 * valid_exp  # (B, L, G)
-            m2_t = 1.0 + _segmented_cumsum(delta_term)  # (B, L, G)
+        if length == 0:
+            return x, initial
 
-            # Variance (count==0 yields m2/1 = 1.0, matching fresh state)
-            var_t = jnp.maximum(m2_t / count_clamped[:, :, None], VARIANCE_FLOOR)
+        if state is None and self.prior_count > jnp.iinfo(jnp.int32).max - length:
+            raise ValueError("TimestepNorm int32 count would overflow")
 
-        # Normalize: (B, L, G, gs)
-        mean_b = mean_t[:, :, :, None]  # (B, L, G, 1)
-        var_b = var_t[:, :, :, None]  # (B, L, G, 1)
-        x_hat = (x_groups - mean_b) * jax.lax.rsqrt(var_b + self.eps)
+        groups = self.num_groups
+        group_size = self.group_size
+        x_groups = x.astype(jnp.float32).reshape(batch_size, length, groups, group_size)
+        prior_count = prior.count
+        prior_mean = prior.mean
+        prior_var = prior.var
 
-        # Apply affine transform with +1 reparameterization (if affine=True)
-        if self.affine and self.weight is not None and self.bias is not None:
-            scale = (self.weight + 1.0).reshape(1, 1, G, gs).astype(stats_dtype)
-            bias = self.bias.reshape(1, 1, G, gs).astype(stats_dtype)
-            y = (x_hat * scale + bias).reshape(B, L, D).astype(x.dtype)
+        moment_groups = (
+            x_groups if valid is None else jnp.where(valid[..., None, None], x_groups, 0.0)
+        )
+        block_mean, block_var = _block_moments(moment_groups)
+        if valid is None and state is None and self.prior_count == 0:
+            # The fresh, unmasked training path is safe to reduce as shifted
+            # moments because its first token supplies a nearby anchor. An
+            # incoming or learned prior may be arbitrarily far from a long
+            # continuation, so those paths use the cancellation-resistant
+            # associative moment merge below.
+            cumulative_count, cumulative_mean, cumulative_var = _shifted_cumsum_prefix(
+                block_mean,
+                block_var,
+                initial,
+            )
         else:
-            y = x_hat.reshape(B, L, D).astype(x.dtype)
+            summary_valid = (
+                jnp.ones((batch_size, length), dtype=jnp.bool_) if valid is None else valid
+            )
+            token_summary = _MomentSummary(
+                count=summary_valid[..., None].astype(jnp.int32),
+                mean=jnp.where(summary_valid[..., None], block_mean, 0.0),
+                m2=jnp.where(summary_valid[..., None], block_var, 0.0),
+            )
+            if boundaries is None:
+                prefix = jax.lax.associative_scan(_merge_m2, token_summary, axis=1)
+            else:
+                prefix_segmented = jax.lax.associative_scan(
+                    _merge_segmented_m2,
+                    _SegmentedSummary(
+                        count=token_summary.count,
+                        mean=token_summary.mean,
+                        m2=token_summary.m2,
+                        has_reset=boundaries[..., None],
+                    ),
+                    axis=1,
+                )
+                prefix = _MomentSummary(
+                    prefix_segmented.count,
+                    prefix_segmented.mean,
+                    prefix_segmented.m2,
+                )
 
-        # Output state from final position. Under segmentation the trajectory is
-        # local to the last segment, so the count must be too - a whole-row count
-        # would corrupt the Welford sufficient statistic (m2 = var * count).
+            initial_count_expanded = initial.count[:, None, None]
+            initial_summary = _MomentSummary(
+                count=initial_count_expanded,
+                mean=initial.mean[:, None, :],
+                m2=initial.var[:, None, :] * initial_count_expanded.astype(jnp.float32),
+            )
+            cumulative = _merge_m2(initial_summary, prefix)
+            cumulative_count = cumulative.count
+            cumulative_mean = cumulative.mean
+            cumulative_var = jnp.where(
+                cumulative_count > 0,
+                cumulative.m2 / jnp.maximum(cumulative_count.astype(jnp.float32), 1.0),
+                initial.var[:, None, :],
+            )
+
+        centered = moment_groups - cumulative_mean[..., None]
+        # Preserve released normalization semantics: eps is added at normalization time, with
+        # no variance floor or clamp. Incoming cache validation rejects negative state variance.
+        normalized = centered * jax.lax.rsqrt(cumulative_var[..., None] + self.eps)
+        scale = (self.weight + 1.0).reshape(groups, group_size)
+        bias = self.bias.reshape(groups, group_size)
+        outputs = normalized * scale + bias
+        if valid is not None:
+            outputs = jnp.where(valid[..., None, None], outputs, 0.0)
+
         if segment_ids is None:
-            new_count = prev_count + mask.astype(jnp.int32).sum(axis=1)
-            mean_out = mean_t[:, -1, :]
-            var_out = var_t[:, -1, :]
+            final_count = cumulative_count[:, -1, 0]
+            final_mean = cumulative_mean[:, -1]
+            final_var = cumulative_var[:, -1]
         else:
-            # Anchor at each row's last real token: trailing padding (id 0)
-            # starts its own run, so stats at position L-1 would be the
-            # fresh-reset baseline instead of the last document's.
-            positions = jnp.arange(L, dtype=jnp.int32)
-            last_valid = jnp.max(jnp.where(valid > 0, positions[None, :], -1), axis=1)  # (B,)
+            assert valid is not None
+            positions = jnp.arange(length, dtype=jnp.int32)[None, :]
+            last_valid = jnp.max(jnp.where(valid, positions, -1), axis=1)
+            gather_index = jnp.maximum(last_valid, 0)
+            final_count = jnp.take_along_axis(
+                cumulative_count[..., 0], gather_index[:, None], axis=1
+            )[:, 0]
+            final_mean = jnp.take_along_axis(
+                cumulative_mean,
+                gather_index[:, None, None],
+                axis=1,
+            )[:, 0]
+            final_var = jnp.take_along_axis(
+                cumulative_var,
+                gather_index[:, None, None],
+                axis=1,
+            )[:, 0]
             has_valid = last_valid >= 0
-            idx = jnp.maximum(last_valid, 0)
-            batch_idx = jnp.arange(B)
-            new_count = jnp.where(has_valid, count_t[batch_idx, idx], 0.0).astype(jnp.int32)
-            mean_out = jnp.where(has_valid[:, None], mean_t[batch_idx, idx], 0.0)
-            var_out = jnp.where(has_valid[:, None], var_t[batch_idx, idx], 1.0)
+            final_count = jnp.where(has_valid, final_count, prior_count)
+            final_mean = jnp.where(has_valid[:, None], final_mean, prior_mean)
+            final_var = jnp.where(has_valid[:, None], final_var, prior_var)
 
-        new_state = NormState(count=new_count, mean=mean_out, var=var_out)
-        return y, new_state
+        y = outputs.reshape(batch_size, length, dim).astype(x.dtype)
+        return y, NormState(count=final_count, mean=final_mean, var=final_var)
