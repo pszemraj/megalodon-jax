@@ -194,7 +194,18 @@ The retained default was revalidated on 2026-07-15 with JAX 0.10.2 on an RTX 509
 |---|---:|---:|---:|---:|
 | `B=8, D=1024, N=16, L=2048` | 31.40 ms | 45.68 ms | 5,302 MB | 4,901 MB |
 | `B=4, D=1024, N=32, L=2048` | 15.50 ms | 41.34 ms | 3,944 MB | 4,733 MB |
+| `B=1, D=4096, N=16, L=4096` | 26.53 ms | 69.89 ms | 3,926 MB | 4,902 MB |
+| `B=2, D=4096, N=16, L=4096` | 62.31 ms | 83.03 ms | 11,273 MB | 9,801 MB |
 
-Both isolated runs differentiated with respect to the CEMA parameters and input and produced finite values and gradients. The canonical 171,475,968-parameter model also passed packed `B=4, L=2048` forward/backward with gradient checkpointing, BF16 compute, FP32 parameter storage, finite gradients for every parameter, and the packed-versus-independent loss reference. Its synchronized single-iteration runtime was 541.49 ms, compiler-reported peak was 3.38 GB, and measured peak device bytes in use were 3.46 GB.
+Every completed isolated run differentiated with respect to the CEMA parameters and input and produced finite values and gradients. At exact paper width, local `B=4` associative forward/backward exceeded the single process's available device memory while requesting a 21.00 GiB allocation; the isolated sequential fallback completed with finite gradients in 107.5 ms and a 19,600 MB compiler temporary. This is a measured local-shard boundary, not evidence that packed CEMA is unusable: the production default remains faster at the representative downstream shapes and exact-width local batches 1 and 2, while a paper-7B deployment must report its actual batch/model sharding because local `B=4` on one device is not the relevant full-model topology.
+
+The canonical 171,475,968-parameter model also passed packed `B=4, L=2048` forward/backward with gradient checkpointing and BF16 compute under both ordinary-parameter storage policies. Both runs produced finite loss and gradients for every parameter and passed the packed-versus-independent loss reference.
+
+| Ordinary parameter storage | Parameter bytes | Compiler peak | Measured peak device bytes | Synchronized runtime |
+|---|---:|---:|---:|---:|
+| FP32 | 685,903,872 | 3,384,683,324 | 3,457,565,184 | 541.49 ms |
+| BF16 | 344,725,504 | 2,710,714,684 | 2,948,102,400 | 544.81 ms |
+
+Compact BF16 storage cut model parameter bytes by 49.7% and reduced the compiler-reported and observed peaks without a meaningful runtime regression in this CEMA-dominated one-iteration gate. The BF16 row retains the configured FP32-sensitive CEMA, normalization, affine, and residual-scale leaves; it is not a blanket-cast model.
 
 Benchmark JSON records the installed JAX CUDA plugin/PJRT and CUDA library wheels, NVIDIA driver and `nvidia-smi` output, compiler-affecting paths and environment variables, and `jax.print_environment_info()`. Add `--profile-dir PATH` to capture one extra synchronized iteration per case as an XProf trace without contaminating timing samples; select a narrow operation and shape matrix when profiling.

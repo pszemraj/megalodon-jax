@@ -53,6 +53,17 @@ config = MegalodonConfig(
 )
 ```
 
+The split keeps FP32 where it is numerically useful without materially eroding compact storage. In the exact paper-7B configuration, the sensitive subset is 9,445,376 of 7,385,817,088 parameters (0.127885%). Keeping that subset FP32 costs 18,890,752 bytes, about 18 MiB, over an unsupported all-BF16 tree.
+
+A canonical packed `B=4, L=2048` forward/backward audit with gradient checkpointing and BF16 compute measured the storage choice directly. Both policies produced finite loss and every gradient and passed the independent packed-loss reference. GB below means 10^9 bytes.
+
+| Ordinary parameter storage | Parameter storage | Compiler peak | Compiler temporary | Measured peak device | Synchronized runtime |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FP32 | 0.686 GB | 3.385 GB | 2.013 GB | 3.458 GB | 541.486 ms |
+| BF16 | 0.345 GB | 2.711 GB | 2.021 GB | 2.948 GB | 544.811 ms |
+
+These single-iteration measurements are decision evidence for the canonical model and tested device, not portable memory limits or performance guarantees. They show that compact storage nearly halves parameter bytes and lowers observed total memory without materially changing runtime; compiler temporaries remain dominated by execution rather than parameter storage.
+
 These choices are explicit model configuration, not ambient autocast state. Native checkpoints serialize every dtype field and restore it automatically when loaded.
 
 Use BF16 only on accelerators with native BF16 support. There is no FP16 fallback for older GPUs; use FP32 instead.
@@ -92,9 +103,13 @@ assert not audit_sensitive_param_dtypes(model)
 
 ## Training loop
 
-The model owns compute casting; token IDs remain `int32`, and optimizer state should be initialized from the model's mixed parameter tree. The example uses Optax, which is not a runtime dependency (`pip install optax`).
+The model owns compute casting; token IDs remain `int32`. The model does not own optimizer state: initialize it according to the downstream policy and preserve each model leaf's configured dtype after updates. The example uses Optax, which is not a runtime dependency (`pip install optax`).
 
 Released upstream training applies one uniform AdamW decay to the entire trainable parameter tree, with no exclusions for embeddings, biases, normalization parameters, TimestepNorm priors, CEMA parameters, or per-head affine parameters. For upstream-faithful training, set `weight_decay=0.1` explicitly and do not pass an Optax mask. The [released plus-one normalization storage](paper-deviations.md#released-source-compatibility-choices) is load-bearing under this policy: decay moves a stored scale offset toward zero, which moves its effective scale toward one rather than zero.
+
+Bare Optax AdamW initializes both moment trees from the parameter tree's leaf dtypes. Its `mu_dtype` option can override only the first moment; the second moment still follows the corresponding parameter dtype. AdamW stores moments and a step count, not FP32 master parameters. Compact-storage training must therefore choose and test its optimizer-state dtypes and update-cast behavior deliberately rather than assuming that AdamW supplies hidden FP32 update fidelity.
+
+The minimal loop below deliberately chooses the memory-first policy by initializing AdamW from the mixed model tree. Ordinary parameters, gradients, moments, and applied updates remain BF16; the sensitive subset remains FP32. This is a supported compact policy, not a claim of upstream optimizer-trajectory parity or hidden FP32 master weights.
 
 ```python
 import equinox as eqx
@@ -108,6 +123,7 @@ config = MegalodonConfig(
     ...,
     param_dtype=jnp.bfloat16,
     compute_dtype=jnp.bfloat16,
+    accum_dtype=jnp.float32,
     attention_softmax_dtype=jnp.float32,
     loss_softmax_dtype=jnp.float32,
 )
@@ -163,7 +179,7 @@ model, opt_state, loss = compiled_train_step(model, opt_state, input_ids, labels
 
 `eqx.filter_shard` applies the JAX sharding only to array leaves, leaves static Python metadata alone, and preserves every leaf's configured dtype. This example assumes one host and a batch whose leading dimension divides evenly over its local devices; multi-host input assembly also needs process-aware data loading.
 
-Compact BF16 storage is intentional pure-BF16 updating for ordinary parameters: their gradients and applied updates are quantized to BF16. An optimizer may retain some or all accumulator state in FP32, but that does not create an FP32 master copy of the parameters. Use `param_dtype=jnp.float32` with BF16 compute when FP32 master-parameter update fidelity is required.
+Compact BF16 storage is intentional pure-BF16 updating for ordinary parameters: their gradients and applied updates are quantized to BF16. Promoting optimizer accumulators does not create an FP32 master copy of the parameters. Use `param_dtype=jnp.float32` with BF16 compute when FP32 master-parameter update fidelity is required.
 
 ## Checkpoint dtypes
 
