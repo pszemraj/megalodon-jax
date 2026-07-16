@@ -95,7 +95,14 @@ class RotaryEmbedding(eqx.Module):
         start_index: Int[Array, ""],
         position_ids: Int[Array, "batch seq"] | None,
     ) -> RotaryTable:
-        """Resolve implicit or explicit positions into rotary factors."""
+        """Resolve implicit or explicit positions into rotary factors.
+
+        :param int batch_size: Number of input sequences.
+        :param int seq_len: Number of tokens per sequence.
+        :param Int[Array, ""] start_index: Absolute offset for implicit positions.
+        :param Int[Array, "batch seq"] | None position_ids: Optional explicit positions.
+        :return RotaryTable: Broadcast-ready FP32 cosine and sine factors.
+        """
         if position_ids is None:
             positions = jnp.arange(seq_len, dtype=jnp.float32) + start_index.astype(jnp.float32)
         else:

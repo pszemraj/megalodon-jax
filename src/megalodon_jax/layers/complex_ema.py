@@ -265,7 +265,13 @@ class ComplexEMA(eqx.Module):
     def _power_chunk(
         cls, q: Complex[Array, "dim ndim"], start: int, end: int
     ) -> Complex[Array, "dim ndim chunk"]:
-        """Return stable complex powers for a static interval."""
+        """Return stable complex powers for a static interval.
+
+        :param Complex[Array, "dim ndim"] q: Complex decay coefficients.
+        :param int start: Starting exponent, inclusive.
+        :param int end: Ending exponent, exclusive.
+        :return Complex[Array, "dim ndim chunk"]: Powers for the requested interval.
+        """
         return cls._power_block(q, start, end - start)
 
     def _forward_fft_with_coeffs(
@@ -290,6 +296,12 @@ class ComplexEMA(eqx.Module):
         gamma_p = gamma * p
 
         def kernel_chunk(start: int, end: int) -> Complex[Array, "dim chunk"]:
+            """Construct the convolution kernel over a static interval.
+
+            :param int start: Starting exponent, inclusive.
+            :param int end: Ending exponent, exclusive.
+            :return Complex[Array, "dim chunk"]: Kernel values for the interval.
+            """
             powers = self._power_chunk(q, start, end)
             return (gamma_p[:, :, None] * powers).sum(axis=1)
 
@@ -300,6 +312,11 @@ class ComplexEMA(eqx.Module):
             block_size = math.ceil(length / num_blocks)
 
             def kernel_block(block_index: Array) -> Complex[Array, "dim block"]:
+                """Construct one fixed-size convolution-kernel block.
+
+                :param Array block_index: Zero-based block index.
+                :return Complex[Array, "dim block"]: Kernel values for the block.
+                """
                 powers = self._power_block(q, block_index * block_size, block_size)
                 return (gamma_p[:, :, None] * powers).sum(axis=1)
 
@@ -344,6 +361,12 @@ class ComplexEMA(eqx.Module):
         projected = h_init * gamma[None, :, :] * q[None, :, :]
 
         def bias_chunk(start: Array | int, size: int) -> Float[Array, "batch dim chunk"]:
+            """Project the incoming state over one interval.
+
+            :param Array | int start: Starting exponent.
+            :param int size: Static number of timesteps.
+            :return Float[Array, "batch dim chunk"]: Initial-state contribution.
+            """
             powers = self._power_block(q, start, size)
             return (
                 projected.real[:, :, :, None] * powers.real[None, :, :, :]
@@ -357,6 +380,11 @@ class ComplexEMA(eqx.Module):
         block_size = math.ceil(length / num_blocks)
 
         def bias_block(block_index: Array) -> Float[Array, "batch dim block"]:
+            """Project the incoming state over one fixed-size block.
+
+            :param Array block_index: Zero-based block index.
+            :return Float[Array, "batch dim block"]: Initial-state contribution for the block.
+            """
             return bias_chunk(block_index * block_size, block_size)
 
         block_ids = jnp.arange(num_blocks, dtype=jnp.int32)
@@ -395,7 +423,12 @@ class ComplexEMA(eqx.Module):
             values: Float[Array, "batch dim block"],
             powers: Complex[Array, "dim ndim block"],
         ) -> Complex[Array, "batch dim ndim"]:
-            """Reduce one time block into its final-state contribution."""
+            """Reduce one time block into its final-state contribution.
+
+            :param Float[Array, "batch dim block"] values: Reversed input values.
+            :param Complex[Array, "dim ndim block"] powers: Decay powers for the block.
+            :return Complex[Array, "batch dim ndim"]: Complex state contribution.
+            """
             real = (values[:, :, None, :] * powers.real[None, :, :, :]).sum(axis=-1)
             imag = (values[:, :, None, :] * powers.imag[None, :, :, :]).sum(axis=-1)
             return real + 1j * imag
@@ -412,6 +445,12 @@ class ComplexEMA(eqx.Module):
             def reduce_block(
                 carry: Complex[Array, "batch dim ndim"], block_index: Array
             ) -> tuple[Complex[Array, "batch dim ndim"], None]:
+                """Accumulate one block into the driven final state.
+
+                :param Complex[Array, "batch dim ndim"] carry: Accumulated state contribution.
+                :param Array block_index: Zero-based block index.
+                :return tuple[Complex[Array, "batch dim ndim"], None]: Updated state and no output.
+                """
                 start = block_index * block_size
                 values = jax.lax.dynamic_slice_in_dim(padded_x, start, block_size, axis=-1)
                 powers = self._power_block(q, start, block_size)

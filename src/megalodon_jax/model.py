@@ -73,7 +73,14 @@ def _loss_head_chunk(
     safe_labels: Int[Array, "tokens"],
     valid_mask: Bool[Array, "tokens"],
 ) -> Float[Array, "tokens"]:
-    """Project one hidden-state chunk and return its masked token losses."""
+    """Project one hidden-state chunk and return its masked token losses.
+
+    :param MegalodonForCausalLM model: Language model supplying the output projection.
+    :param Float[Array, "tokens dim"] hidden: Hidden states for one token chunk.
+    :param Int[Array, "tokens"] safe_labels: In-range target token IDs.
+    :param Bool[Array, "tokens"] valid_mask: Tokens that contribute to the loss.
+    :return Float[Array, "tokens"]: Per-token negative log-likelihood, with zeros for invalid tokens.
+    """
     logits = model._project_logits(hidden[None, :, :])[0]
     softmax_dtype = model.config.loss_softmax_dtype
     log_probs = jax.nn.log_softmax(logits.astype(softmax_dtype), axis=-1)
@@ -396,7 +403,15 @@ class MegalodonModel(eqx.Module):
         position_ids: Int[Array, "batch seq"] | None,
         cache: ModelCache | None,
     ) -> tuple[SegmentMetadata | None, RotaryTable | None]:
-        """Derive packed metadata and one shared rotary table for the layer stack."""
+        """Derive packed metadata and one shared rotary table for the layer stack.
+
+        :param tuple[int, int] input_shape: Expected batch and sequence dimensions.
+        :param Int[Array, "batch seq"] | None segment_ids: Optional packed-sequence IDs.
+        :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
+        :param ModelCache | None cache: Optional cache supplying the next absolute position.
+        :raises ValueError: If metadata shapes are invalid or the cache is incomplete.
+        :return tuple[SegmentMetadata | None, RotaryTable | None]: Packed-sequence metadata and shared rotary table, when applicable.
+        """
         _, sequence_length = input_shape
         segment_metadata = None
         if segment_ids is not None:
@@ -724,7 +739,11 @@ class MegalodonForCausalLM(eqx.Module):
         self,
         hidden: Float[Array, "batch seq dim"],
     ) -> Float[Array, "batch seq vocab"]:
-        """Project hidden states to the configured FP32 vocabulary output."""
+        """Project hidden states to the configured FP32 vocabulary output.
+
+        :param Float[Array, "batch seq dim"] hidden: Decoder hidden states.
+        :return Float[Array, "batch seq vocab"]: FP32 vocabulary logits.
+        """
         weight = self.model.embed.weight if self.tied else self.lm_head.weight
         return matmul_3d_weight(
             hidden,
@@ -741,7 +760,14 @@ class MegalodonForCausalLM(eqx.Module):
         valid_mask: Bool[Array, "batch seq"],
         chunk_size: int,
     ) -> Float[Array, "batch seq"]:
-        """Evaluate rematerialized vocabulary projections over static token chunks."""
+        """Evaluate rematerialized vocabulary projections over static token chunks.
+
+        :param Float[Array, "batch seq dim"] hidden: Decoder hidden states.
+        :param Int[Array, "batch seq"] safe_labels: In-range target token IDs.
+        :param Bool[Array, "batch seq"] valid_mask: Tokens that contribute to the loss.
+        :param int chunk_size: Static number of tokens projected per scan step.
+        :return Float[Array, "batch seq"]: Per-token negative log-likelihood, with zeros for invalid tokens.
+        """
         batch_size, sequence_length, hidden_dim = hidden.shape
         token_count = batch_size * sequence_length
         if token_count == 0:
@@ -768,6 +794,12 @@ class MegalodonForCausalLM(eqx.Module):
             carry: None,
             inputs: tuple[jax.Array, jax.Array, jax.Array],
         ) -> tuple[None, jax.Array]:
+            """Evaluate the loss for one padded token chunk.
+
+            :param None carry: Unused scan carry.
+            :param tuple[jax.Array, jax.Array, jax.Array] inputs: Hidden states, target IDs, and validity mask for one chunk.
+            :return tuple[None, jax.Array]: Unchanged carry and per-token chunk losses.
+            """
             hidden_chunk, label_chunk, mask_chunk = inputs
             token_loss = _rematerialized_loss_head_chunk(
                 self,

@@ -45,7 +45,12 @@ def _runs_and_local_positions(
     segment_ids: Int[Array, "batch seq"],
     boundaries: Bool[Array, "batch seq"],
 ) -> tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]:
-    """Derive run IDs and local positions from precomputed boundaries."""
+    """Derive run IDs and local positions from precomputed boundaries.
+
+    :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs.
+    :param Bool[Array, "batch seq"] boundaries: True where a contiguous run starts.
+    :return tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]: Run IDs and run-local positions.
+    """
     run_ids = jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
     positions = jnp.arange(segment_ids.shape[1], dtype=segment_ids.dtype)[None, :]
     run_starts = jax.lax.cummax(jnp.where(boundaries, positions, 0), axis=1)

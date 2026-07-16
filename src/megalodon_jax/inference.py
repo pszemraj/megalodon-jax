@@ -283,7 +283,15 @@ def _sample_token_validated(
     top_k: int | None,
     top_p: float | None,
 ) -> Int[Array, "batch"]:
-    """Sample after the eager public boundary has validated static controls."""
+    """Sample after the eager public boundary has validated static controls.
+
+    :param Float[Array, "batch vocab"] logits: Logits for sampling.
+    :param PRNGKeyArray key: PRNG key for categorical sampling.
+    :param float temperature: Validated sampling temperature.
+    :param int | None top_k: Validated top-k filter.
+    :param float | None top_p: Validated top-p filter.
+    :return Int[Array, "batch"]: Sampled token IDs.
+    """
 
     if temperature == 0.0:
         return greedy_token(logits)
