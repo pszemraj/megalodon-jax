@@ -21,8 +21,8 @@ The recurrence is:
     y[t] = Re(sum(h[t] * gamma))
 
 Three computation paths are provided:
-- FFT: O(L log L) convolution for training (no state needed)
-- Sequential: O(L) scan for streaming inference (state needed)
+- FFT: O(L log L) convolution for training and long cached chunks
+- Sequential: O(L) scan for short streaming-inference chunks
 - Segmented: parallel associative scan for packed sequences (segment_ids),
   resetting the state at segment boundaries; a sequential low-memory
   fallback is also available.
@@ -39,6 +39,10 @@ from megalodon_jax.layers.segments import segment_boundaries, valid_segment_mask
 
 # Chunk size for kernel computation to bound memory usage
 FFT_KERNEL_CHUNK = 4096
+
+# Below the released fused FFT kernel's lower bound, a recurrent scan is faster
+# and avoids constructing a convolution kernel for tokenwise decoding.
+FFT_RECURRENT_MIN_LENGTH = 32
 
 
 class ComplexEMA(eqx.Module):
@@ -232,74 +236,187 @@ class ComplexEMA(eqx.Module):
         # Return fp32 - caller handles dtype conversion
         return y, h_final
 
-    def _forward_fft(self, x: Float[Array, "batch dim seq"]) -> Float[Array, "batch dim seq"]:
-        """FFT-based convolution for training.
+    @staticmethod
+    def _power_block(
+        q: Complex[Array, "dim ndim"], start: Array | int, size: int
+    ) -> Complex[Array, "dim ndim block"]:
+        """Return stable complex powers ``q**j`` for one fixed-size block.
 
-        Uses O(L log L) FFT convolution when no streaming state is needed.
+        :param Complex[Array, "dim ndim"] q: Complex decay coefficients.
+        :param Array | int start: Starting exponent.
+        :param int size: Static number of exponents.
+        :return Complex[Array, "dim ndim block"]: Powers for the requested interval.
+        """
+        exponents = jnp.asarray(start, dtype=jnp.float32) + jnp.arange(size, dtype=jnp.float32)
+        radius = jnp.abs(q).clip(max=1.0)
+        phase = jnp.angle(q)
+        magnitude = radius[:, :, None] ** exponents[None, None, :]
+        rotation = jnp.exp(1j * phase[:, :, None] * exponents[None, None, :])
+        return magnitude * rotation
+
+    @classmethod
+    def _power_chunk(
+        cls, q: Complex[Array, "dim ndim"], start: int, end: int
+    ) -> Complex[Array, "dim ndim chunk"]:
+        """Return stable complex powers for a static interval."""
+        return cls._power_block(q, start, end - start)
+
+    def _forward_fft_with_coeffs(
+        self,
+        x: Float[Array, "batch dim seq"],
+        p: Float[Array, "dim ndim"],
+        q: Complex[Array, "dim ndim"],
+        gamma: Complex[Array, "dim ndim"],
+    ) -> Float[Array, "batch dim seq"]:
+        """Apply FFT convolution using already-computed EMA coefficients.
 
         :param Float[Array, "batch dim seq"] x: Input tensor.
-        :return Float[Array, "batch dim seq"]: Output tensor.
+        :param Float[Array, "dim ndim"] p: Real input coefficients.
+        :param Complex[Array, "dim ndim"] q: Complex decay coefficients.
+        :param Complex[Array, "dim ndim"] gamma: Complex output coefficients.
+        :return Float[Array, "batch dim seq"]: FP32 convolution output.
         """
-        B, D, L = x.shape
+        batch, dim, length = x.shape
+        if length == 0:
+            return jnp.zeros((batch, dim, length), dtype=jnp.float32)
 
-        if L == 0:
-            return jnp.zeros((B, D, L), dtype=x.dtype)
+        gamma_p = gamma * p
 
-        # Get coefficients
-        p, q, gamma = self._coeffs()  # p: (D, N), q: (D, N) complex, gamma: (D, N) complex
+        def kernel_chunk(start: int, end: int) -> Complex[Array, "dim chunk"]:
+            powers = self._power_chunk(q, start, end)
+            return (gamma_p[:, :, None] * powers).sum(axis=1)
 
-        # gamma * p for kernel computation
-        gp = gamma * p  # (D, N) complex
-
-        # Compute q^j via magnitude/phase for stability
-        radius = jnp.abs(q).clip(max=1.0)  # (D, N)
-        phi = jnp.angle(q)  # (D, N)
-
-        # Build kernel in chunks to bound memory
-        def compute_kernel_chunk(start: int, end: int) -> Complex[Array, "dim chunk"]:
-            """Compute a slice of the EMA kernel from position start to end.
-
-            Computes q^j for j in [start, end) where q = magnitude * exp(i*phi).
-            Uses magnitude/phase representation for numerical stability.
-
-            :param int start: Starting position index (inclusive).
-            :param int end: Ending position index (exclusive).
-            :return Complex[Array, "dim chunk"]: Complex kernel slice.
-            """
-            j = jnp.arange(start, end, dtype=jnp.float32)  # (chunk,)
-            # q^j = radius^j * exp(i * phi * j)
-            mag_chunk = radius[:, :, None] ** j[None, None, :]  # (D, N, chunk)
-            phase_chunk = jnp.exp(1j * phi[:, :, None] * j[None, None, :])  # (D, N, chunk)
-            q_pows = mag_chunk * phase_chunk  # (D, N, chunk) complex
-            # Sum over N dimension
-            return (gp[:, :, None] * q_pows).sum(axis=1)  # (D, chunk) complex
-
-        # Compute full kernel
-        if L <= FFT_KERNEL_CHUNK:
-            kernel = compute_kernel_chunk(0, L)
+        if length <= FFT_KERNEL_CHUNK:
+            kernel = kernel_chunk(0, length)
         else:
-            kernel = jnp.concatenate(
-                [
-                    compute_kernel_chunk(start, min(start + FFT_KERNEL_CHUNK, L))
-                    for start in range(0, L, FFT_KERNEL_CHUNK)
-                ],
-                axis=-1,
-            )  # (D, L) complex
+            num_blocks = math.ceil(length / FFT_KERNEL_CHUNK)
+            block_size = math.ceil(length / num_blocks)
 
-        # FFT convolution using rfft for efficiency (x is real)
-        fft_len = 1 << int(2 * L - 1).bit_length()
-        x_f32 = x.astype(jnp.float32)
+            def kernel_block(block_index: Array) -> Complex[Array, "dim block"]:
+                powers = self._power_block(q, block_index * block_size, block_size)
+                return (gamma_p[:, :, None] * powers).sum(axis=1)
 
-        # Only kernel.real contributes to real output
-        kernel_real = kernel.real  # (D, L)
+            block_ids = jnp.arange(num_blocks, dtype=jnp.int32)
+            blocks = jax.lax.map(jax.checkpoint(kernel_block), block_ids)
+            kernel = blocks.transpose(1, 0, 2).reshape(dim, num_blocks * block_size)[:, :length]
 
-        X = jnp.fft.rfft(x_f32, n=fft_len, axis=-1)  # (B, D, fft_len//2+1)
-        K = jnp.fft.rfft(kernel_real, n=fft_len, axis=-1)  # (D, fft_len//2+1)
-        Y = X * K[None, :, :]
-        y = jnp.fft.irfft(Y, n=fft_len, axis=-1)[..., :L]
+        fft_len = 1 << int(2 * length - 1).bit_length()
+        inputs_fft = jnp.fft.rfft(x.astype(jnp.float32), n=fft_len, axis=-1)
+        kernel_fft = jnp.fft.rfft(kernel.real, n=fft_len, axis=-1)
+        return jnp.fft.irfft(inputs_fft * kernel_fft[None, :, :], n=fft_len, axis=-1)[..., :length]
 
-        # Return fp32 - caller handles dtype conversion
-        return y
+    def _forward_fft(self, x: Float[Array, "batch dim seq"]) -> Float[Array, "batch dim seq"]:
+        """Apply source-compatible FFT convolution.
+
+        :param Float[Array, "batch dim seq"] x: Input tensor.
+        :return Float[Array, "batch dim seq"]: FP32 convolution output.
+        """
+        if x.shape[-1] == 0:
+            return jnp.zeros(x.shape, dtype=jnp.float32)
+        return self._forward_fft_with_coeffs(x, *self._coeffs())
+
+    def _initial_state_bias(
+        self,
+        h_init: Complex[Array, "batch dim ndim"],
+        q: Complex[Array, "dim ndim"],
+        gamma: Complex[Array, "dim ndim"],
+        length: int,
+    ) -> Float[Array, "batch dim seq"]:
+        """Project the incoming recurrent state across a sequence.
+
+        At timestep ``j`` the contribution is
+        ``Re(sum(gamma * h_init * q ** (j + 1), axis=-1))``. Explicit
+        real/imaginary reductions avoid an XLA complex batched-dot temporary.
+
+        :param Complex[Array, "batch dim ndim"] h_init: Incoming recurrent state.
+        :param Complex[Array, "dim ndim"] q: Complex decay coefficients.
+        :param Complex[Array, "dim ndim"] gamma: Complex output coefficients.
+        :param int length: Number of output timesteps.
+        :return Float[Array, "batch dim seq"]: FP32 initial-state contribution.
+        """
+        projected = h_init * gamma[None, :, :] * q[None, :, :]
+
+        def bias_chunk(start: Array | int, size: int) -> Float[Array, "batch dim chunk"]:
+            powers = self._power_block(q, start, size)
+            return (
+                projected.real[:, :, :, None] * powers.real[None, :, :, :]
+                - projected.imag[:, :, :, None] * powers.imag[None, :, :, :]
+            ).sum(axis=2)
+
+        if length <= FFT_KERNEL_CHUNK:
+            return bias_chunk(0, length)
+
+        num_blocks = math.ceil(length / FFT_KERNEL_CHUNK)
+        block_size = math.ceil(length / num_blocks)
+
+        def bias_block(block_index: Array) -> Float[Array, "batch dim block"]:
+            return bias_chunk(block_index * block_size, block_size)
+
+        block_ids = jnp.arange(num_blocks, dtype=jnp.int32)
+        blocks = jax.lax.map(jax.checkpoint(bias_block), block_ids)
+        return blocks.transpose(1, 2, 0, 3).reshape(
+            h_init.shape[0], h_init.shape[1], num_blocks * block_size
+        )[..., :length]
+
+    def _final_state_parallel(
+        self,
+        x: Float[Array, "batch dim seq"],
+        h_init: Complex[Array, "batch dim ndim"] | None,
+        p: Float[Array, "dim ndim"],
+        q: Complex[Array, "dim ndim"],
+    ) -> Complex[Array, "batch dim ndim"]:
+        """Compute the final recurrent state with parallel reductions.
+
+        Evaluates ``q**L * h_init + p * sum(x[L-1-j] * q**j, j)``. This is the
+        closed form used by the released parallel ``ema_hidden`` kernel.
+
+        :param Float[Array, "batch dim seq"] x: Input sequence.
+        :param Complex[Array, "batch dim ndim"] | None h_init: Incoming state.
+        :param Float[Array, "dim ndim"] p: Real input coefficients.
+        :param Complex[Array, "dim ndim"] q: Complex decay coefficients.
+        :return Complex[Array, "batch dim ndim"]: Final complex64 state.
+        """
+        batch, dim, length = x.shape
+        if length == 0:
+            if h_init is None:
+                return jnp.zeros((batch, dim, self.ndim), dtype=jnp.complex64)
+            return h_init
+
+        reversed_x = x.astype(jnp.float32)[..., ::-1]
+
+        def state_contribution(
+            values: Float[Array, "batch dim block"],
+            powers: Complex[Array, "dim ndim block"],
+        ) -> Complex[Array, "batch dim ndim"]:
+            """Reduce one time block into its final-state contribution."""
+            real = (values[:, :, None, :] * powers.real[None, :, :, :]).sum(axis=-1)
+            imag = (values[:, :, None, :] * powers.imag[None, :, :, :]).sum(axis=-1)
+            return real + 1j * imag
+
+        if length <= FFT_KERNEL_CHUNK:
+            driven = state_contribution(reversed_x, self._power_chunk(q, 0, length))
+        else:
+            num_blocks = math.ceil(length / FFT_KERNEL_CHUNK)
+            block_size = math.ceil(length / num_blocks)
+            padded_length = num_blocks * block_size
+            padded_x = jnp.pad(reversed_x, ((0, 0), (0, 0), (0, padded_length - length)))
+            block_ids = jnp.arange(num_blocks, dtype=jnp.int32)
+
+            def reduce_block(
+                carry: Complex[Array, "batch dim ndim"], block_index: Array
+            ) -> tuple[Complex[Array, "batch dim ndim"], None]:
+                start = block_index * block_size
+                values = jax.lax.dynamic_slice_in_dim(padded_x, start, block_size, axis=-1)
+                powers = self._power_block(q, start, block_size)
+                return carry + state_contribution(values, powers), None
+
+            initial = jnp.zeros((batch, dim, self.ndim), dtype=jnp.complex64)
+            driven, _ = jax.lax.scan(jax.checkpoint(reduce_block), initial, block_ids)
+        h_final = p[None, :, :] * driven
+        if h_init is not None:
+            q_to_length = self._power_chunk(q, length, length + 1)[..., 0]
+            h_final = h_final + q_to_length[None, :, :] * h_init
+        return h_final
 
     def _forward_sequential(
         self,
@@ -392,19 +509,23 @@ class ComplexEMA(eqx.Module):
         # Return fp32 - caller handles dtype conversion
         return y, h_final
 
-    def _final_state_sequential(
+    def _final_state_sequential_with_coeffs(
         self,
         x: Float[Array, "batch dim seq"],
         h_init: Complex[Array, "batch dim ndim"] | None = None,
+        *,
+        p: Float[Array, "dim ndim"],
+        q: Complex[Array, "dim ndim"],
     ) -> Complex[Array, "batch dim ndim"]:
-        """Advance only the compact recurrent state without emitting outputs.
+        """Advance only the compact state using precomputed coefficients.
 
         :param Float[Array, "batch dim seq"] x: Input sequence.
         :param Complex[Array, "batch dim ndim"] | None h_init: Optional incoming EMA state.
+        :param Float[Array, "dim ndim"] p: Real input coefficients.
+        :param Complex[Array, "dim ndim"] q: Complex decay coefficients.
         :return Complex[Array, "batch dim ndim"]: Final recurrent state.
         """
         batch, dim, _ = x.shape
-        p, q, _ = self._coeffs()
         if h_init is None:
             h_init = jnp.zeros((batch, dim, self.ndim), dtype=jnp.complex64)
         p_b = p[None, :, :]
@@ -427,6 +548,20 @@ class ComplexEMA(eqx.Module):
         )
         return h_final
 
+    def _final_state_sequential(
+        self,
+        x: Float[Array, "batch dim seq"],
+        h_init: Complex[Array, "batch dim ndim"] | None = None,
+    ) -> Complex[Array, "batch dim ndim"]:
+        """Advance only the compact recurrent state without emitting outputs.
+
+        :param Float[Array, "batch dim seq"] x: Input sequence.
+        :param Complex[Array, "batch dim ndim"] | None h_init: Optional incoming EMA state.
+        :return Complex[Array, "batch dim ndim"]: Final recurrent state.
+        """
+        p, q, _ = self._coeffs()
+        return self._final_state_sequential_with_coeffs(x, h_init, p=p, q=q)
+
     def __call__(
         self,
         x: Float[Array, "batch dim seq"],
@@ -438,10 +573,12 @@ class ComplexEMA(eqx.Module):
     ) -> tuple[Float[Array, "batch dim seq"], Complex[Array, "batch dim ndim"] | None]:
         """Apply EMA and optionally return final state.
 
-        Automatically selects FFT path (faster) when no state is needed,
-        or sequential path when streaming. When segment_ids is given (packed
-        sequences), the state resets at segment boundaries via a parallel
-        associative scan; the FFT path cannot express resets and is bypassed.
+        Uses FFT convolution for training and long non-segmented chunks, with
+        a parallel closed-form state reduction when continuation state is
+        requested. Short streaming chunks use a sequential scan. When
+        segment_ids is given (packed sequences), the state resets at segment
+        boundaries via a parallel associative scan; the FFT path cannot
+        express resets and is bypassed.
 
         :param Float[Array, "batch dim seq"] x: Input tensor.
         :param Complex[Array, "batch dim ndim"] | None h_init: Initial EMA state.
@@ -495,13 +632,44 @@ class ComplexEMA(eqx.Module):
                 y, h_final = self._forward_sequential(x, None, segment_ids=segment_ids)
             return (y + residual).astype(input_dtype), h_final if return_state else None
 
-        if h_init is None:
-            # Pristine prefill can evaluate every output with FFT convolution.
-            # Returning continuation state only needs the compact (B, D, N)
-            # recurrence; it must not force the output path into a token scan.
-            y = self._forward_fft(x)  # already returns fp32 internally
-            h_final = self._final_state_sequential(x) if return_state else None
-            return (y + residual).astype(input_dtype), h_final
+        length = x.shape[-1]
+        if length == 0:
+            if return_state:
+                if h_init is None:
+                    h_final = jnp.zeros((x.shape[0], x.shape[1], self.ndim), dtype=jnp.complex64)
+                else:
+                    h_final = h_init
+            else:
+                h_final = None
+            return residual.astype(input_dtype), h_final
 
-        y, h_final = self._forward_sequential(x, h_init)  # already returns fp32 internally
-        return (y + residual).astype(input_dtype), h_final if return_state else None
+        # Tokenwise decoding and very short cached chunks are faster as one
+        # recurrent scan. The length is shape-static, so this does not add a
+        # traced data-dependent branch.
+        if h_init is not None and length < FFT_RECURRENT_MIN_LENGTH:
+            y, h_final = self._forward_sequential(x, h_init)
+            return (y + residual).astype(input_dtype), h_final if return_state else None
+
+        # Released long-chunk decomposition: FFT convolution for the driven
+        # response, plus a projected initial-state bias when history exists.
+        # Compute coefficients once for the output and optional final state.
+        p, q, gamma = self._coeffs()
+        y = self._forward_fft_with_coeffs(x, p, q, gamma)
+        state_q = q
+        if h_init is not None:
+            bias_q = jax.lax.optimization_barrier(q)
+            y = y + self._initial_state_bias(h_init, bias_q, gamma, length)
+            state_q = jax.lax.optimization_barrier(bias_q)
+        elif return_state and length >= FFT_RECURRENT_MIN_LENGTH:
+            state_q = jax.lax.optimization_barrier(q)
+
+        h_final = None
+        if return_state:
+            if length < FFT_RECURRENT_MIN_LENGTH:
+                h_final = self._final_state_sequential_with_coeffs(x, p=p, q=q)
+            else:
+                # The FFT, optional bias, and state reduction use the same
+                # powers. Recomputing them lets XLA release each chunk instead
+                # of retaining a (D, N, chunk) complex buffer across the FFT.
+                h_final = self._final_state_parallel(x, h_init, p, state_q)
+        return (y + residual).astype(input_dtype), h_final

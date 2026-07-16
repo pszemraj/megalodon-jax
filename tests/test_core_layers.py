@@ -971,42 +971,113 @@ class TestComplexEMA:
     """Recurrence and state-continuation tests for ComplexEMA."""
 
     @pytest.mark.fast
-    def test_pristine_prefill_matches_sequential_recurrence(self, random_seed: int) -> None:
-        """FFT outputs plus compact final state match the full recurrence.
+    @pytest.mark.parametrize("seq", [1, 31, 32, 33])
+    @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+    def test_hybrid_matches_sequential_recurrence(
+        self, random_seed: int, seq: int, dtype: Any
+    ) -> None:
+        """Both sides of the FFT/scan threshold match the full recurrence.
 
         :param int random_seed: Random seed fixture.
+        :param int seq: Sequence length around the static dispatch threshold.
+        :param Any dtype: Input dtype under test.
         :return None: None.
         """
-        dim = 64
-        ndim = 16
-
         key = jax.random.PRNGKey(random_seed)
-        k1, k2 = jax.random.split(key)
+        k_ema, k_x, k_hr, k_hi = jax.random.split(key, 4)
+        ema = ComplexEMA(16, 4, key=k_ema)
+        x = jax.random.normal(k_x, (2, 16, seq)).astype(dtype)
+        h_init = (
+            jax.random.normal(k_hr, (2, 16, 4)) + 1j * jax.random.normal(k_hi, (2, 16, 4))
+        ).astype(jnp.complex64) * 0.05
+        mask = jnp.ones((2, seq), dtype=jnp.bool_)
+        if seq > 1:
+            mask = mask.at[:, -2:].set(False)
+        masked_x = jnp.where(mask[:, None, :], x, jnp.zeros((), dtype=dtype))
+        residual = masked_x.astype(jnp.float32) * ema.omega[None, :, None]
 
-        jax_ema = ComplexEMA(dim, ndim, key=k1)
+        output_tol = 1e-2 if dtype == jnp.bfloat16 else 2e-4
+        for initial in (None, h_init):
+            actual_y, actual_h = ema(
+                x,
+                h_init=initial,
+                return_state=True,
+                mask=mask,
+            )
+            reference_y, reference_h = ema._forward_sequential(masked_x, initial)  # noqa: SLF001
+            reference_y = (reference_y + residual).astype(dtype)
 
-        # Generate test input
-        batch, seq = 2, 32
-        x = jax.random.normal(k2, (batch, dim, seq))
+            assert actual_y.dtype == dtype
+            assert actual_h is not None and actual_h.dtype == jnp.complex64
+            np.testing.assert_allclose(
+                np.asarray(actual_y, dtype=np.float32),
+                np.asarray(reference_y, dtype=np.float32),
+                rtol=output_tol,
+                atol=output_tol,
+            )
+            np.testing.assert_allclose(
+                np.asarray(actual_h),
+                np.asarray(reference_h),
+                rtol=3e-5,
+                atol=3e-6,
+            )
 
-        y_prefill, h_prefill = jax_ema(x, return_state=True)
-        y_recurrence, h_recurrence = jax_ema._forward_sequential(x, None)  # noqa: SLF001
-        residual = x.astype(jnp.float32) * jax_ema.omega[None, :, None]
-        y_recurrence = (y_recurrence + residual).astype(x.dtype)
+            output_only, omitted_state = ema(
+                x,
+                h_init=initial,
+                return_state=False,
+                mask=mask,
+            )
+            assert omitted_state is None
+            np.testing.assert_array_equal(np.asarray(output_only), np.asarray(actual_y))
+
+    def test_empty_sequence_preserves_state_contract(self, random_seed: int) -> None:
+        """An empty sequence returns empty output and leaves incoming state unchanged."""
+        key = jax.random.PRNGKey(random_seed)
+        k_ema, k_hr, k_hi = jax.random.split(key, 3)
+        ema = ComplexEMA(8, 4, key=k_ema)
+        x = jnp.zeros((2, 8, 0), dtype=jnp.bfloat16)
+        h_init = (
+            jax.random.normal(k_hr, (2, 8, 4)) + 1j * jax.random.normal(k_hi, (2, 8, 4))
+        ).astype(jnp.complex64)
+
+        pristine_y, pristine_h = ema(x, return_state=True)
+        continuation_y, continuation_h = ema(x, h_init=h_init, return_state=True)
+        output_only, omitted_state = ema(x, h_init=h_init, return_state=False)
+
+        assert pristine_y.shape == continuation_y.shape == output_only.shape == x.shape
+        assert pristine_y.dtype == continuation_y.dtype == output_only.dtype == x.dtype
+        assert pristine_h is not None
+        np.testing.assert_array_equal(np.asarray(pristine_h), np.zeros((2, 8, 4), np.complex64))
+        np.testing.assert_array_equal(np.asarray(continuation_h), np.asarray(h_init))
+        assert omitted_state is None
+
+    def test_nonmultiple_long_block_matches_sequential(self, random_seed: int) -> None:
+        """Mapped power blocks pad and slice a nonmultiple length without changing semantics."""
+        key = jax.random.PRNGKey(random_seed)
+        k_ema, k_x, k_hr, k_hi = jax.random.split(key, 4)
+        ema = ComplexEMA(4, 2, key=k_ema)
+        seq = 4099
+        x = jax.random.normal(k_x, (1, 4, seq)).astype(jnp.bfloat16)
+        h_init = (
+            jax.random.normal(k_hr, (1, 4, 2)) + 1j * jax.random.normal(k_hi, (1, 4, 2))
+        ).astype(jnp.complex64) * 0.05
+        mask = jnp.arange(seq)[None, :] < seq - 7
+        masked_x = jnp.where(mask[:, None, :], x, jnp.zeros((), dtype=x.dtype))
+
+        actual_y, actual_h = ema(x, h_init=h_init, return_state=True, mask=mask)
+        reference_y, reference_h = ema._forward_sequential(masked_x, h_init)  # noqa: SLF001
+        residual = masked_x.astype(jnp.float32) * ema.omega[None, :, None]
+        reference_y = (reference_y + residual).astype(x.dtype)
 
         np.testing.assert_allclose(
-            np.array(y_prefill),
-            np.array(y_recurrence),
-            rtol=1e-4,
-            atol=1e-5,
-            err_msg="FFT and sequential paths should produce equivalent outputs",
+            np.asarray(actual_y, dtype=np.float32),
+            np.asarray(reference_y, dtype=np.float32),
+            rtol=1e-2,
+            atol=1e-2,
         )
         np.testing.assert_allclose(
-            np.asarray(h_prefill),
-            np.asarray(h_recurrence),
-            rtol=2e-5,
-            atol=2e-6,
-            err_msg="State-only recurrence must match the full recurrence",
+            np.asarray(actual_h), np.asarray(reference_h), rtol=3e-5, atol=3e-6
         )
 
     @pytest.mark.fast
@@ -1025,15 +1096,16 @@ class TestComplexEMA:
         jax_ema = ComplexEMA(dim, ndim, key=k1)
 
         # Generate test input
-        batch, seq = 2, 32
+        batch, seq = 2, 66
         x = jax.random.normal(k2, (batch, dim, seq))
 
-        # Full sequence with FFT
-        y_full, _ = jax_ema(x, return_state=False)
+        # Full sequence with FFT and parallel final-state reduction.
+        y_full, h_full = jax_ema(x, return_state=True)
 
-        # Two chunks with state passing
-        y1, h1 = jax_ema(x[:, :, :16], return_state=True)
-        y2, _ = jax_ema(x[:, :, 16:], h_init=h1, return_state=True)
+        # Both 33-token chunks select the long-chunk path, including the
+        # initial-state FFT bias on the second call.
+        y1, h1 = jax_ema(x[:, :, :33], return_state=True)
+        y2, h2 = jax_ema(x[:, :, 33:], h_init=h1, return_state=True)
         y_chunked = jnp.concatenate([y1, y2], axis=-1)
 
         # Should match (within numerical tolerance)
@@ -1044,6 +1116,66 @@ class TestComplexEMA:
             atol=1e-5,
             err_msg="Chunked processing should match full sequence",
         )
+        np.testing.assert_allclose(np.asarray(h2), np.asarray(h_full), rtol=2e-5, atol=2e-6)
+
+    @pytest.mark.fast
+    def test_long_continuation_gradients_match_sequential(self, random_seed: int) -> None:
+        """FFT bias and parallel-state gradients match the recurrent oracle."""
+        key = jax.random.PRNGKey(random_seed)
+        k_ema, k_x, k_hr, k_hi, k_y, k_sr, k_si = jax.random.split(key, 7)
+        ema = ComplexEMA(8, 4, key=k_ema)
+        x = jax.random.normal(k_x, (1, 8, 33))
+        h_init = (
+            jax.random.normal(k_hr, (1, 8, 4)) + 1j * jax.random.normal(k_hi, (1, 8, 4))
+        ).astype(jnp.complex64) * 0.05
+        output_weight = jax.random.normal(k_y, x.shape)
+        state_real_weight = jax.random.normal(k_sr, h_init.shape)
+        state_imag_weight = jax.random.normal(k_si, h_init.shape)
+
+        def objective(
+            module: ComplexEMA,
+            values: jax.Array,
+            initial: jax.Array,
+            *,
+            sequential: bool,
+        ) -> jax.Array:
+            """Weight both sequence output and returned state."""
+            if sequential:
+                output, state = module._forward_sequential(values, initial)  # noqa: SLF001
+                residual = values.astype(jnp.float32) * module.omega[None, :, None]
+                output = (output + residual).astype(values.dtype)
+            else:
+                output, state = module(values, h_init=initial, return_state=True)
+                assert state is not None
+            return (
+                jnp.sum(output.astype(jnp.float32) * output_weight)
+                + jnp.sum(state.real * state_real_weight)
+                + jnp.sum(state.imag * state_imag_weight)
+            )
+
+        hybrid = jax.value_and_grad(
+            lambda module, values, initial: objective(module, values, initial, sequential=False),
+            argnums=(0, 1, 2),
+        )
+        recurrent = jax.value_and_grad(
+            lambda module, values, initial: objective(module, values, initial, sequential=True),
+            argnums=(0, 1, 2),
+        )
+        value_hybrid, grads_hybrid = hybrid(ema, x, h_init)
+        value_recurrent, grads_recurrent = recurrent(ema, x, h_init)
+
+        np.testing.assert_allclose(
+            np.asarray(value_hybrid), np.asarray(value_recurrent), rtol=2e-4, atol=2e-4
+        )
+        for actual, expected in zip(
+            jax.tree.leaves(grads_hybrid), jax.tree.leaves(grads_recurrent), strict=True
+        ):
+            np.testing.assert_allclose(
+                np.asarray(actual),
+                np.asarray(expected),
+                rtol=8e-4,
+                atol=8e-5,
+            )
 
     def test_q_magnitude_bounded(self, random_seed: int) -> None:
         """Test that |q| < 1 by construction (ensures decaying impulse response).
@@ -1225,6 +1357,48 @@ class TestComplexEMASegmentReset:
             atol=1e-5,
             err_msg="Final states of both reset paths should agree",
         )
+
+    @pytest.mark.fast
+    def test_associative_matches_sequential_gradients(self, random_seed: int) -> None:
+        """Packed implementations agree for full parameter and input gradients."""
+        key = jax.random.PRNGKey(random_seed)
+        k_ema, k_x, k_weight = jax.random.split(key, 3)
+        ema = ComplexEMA(16, 4, key=k_ema)
+        x = jax.random.normal(k_x, (2, 16, 20))
+        weight = jax.random.normal(k_weight, x.shape)
+        segment_ids = jnp.asarray(
+            [[1] * 7 + [2] * 8 + [0] * 5, [1] * 5 + [2] * 6 + [1] * 9],
+            dtype=jnp.int32,
+        )
+
+        def objective(module: ComplexEMA, values: jax.Array, associative: bool) -> jax.Array:
+            """Return a weighted packed output objective."""
+            output, _ = module(
+                values,
+                segment_ids=segment_ids,
+                use_associative_segment_scan=associative,
+            )
+            return jnp.sum(output.astype(jnp.float32) * weight)
+
+        value_assoc, grads_assoc = jax.value_and_grad(
+            lambda module, values: objective(module, values, True), argnums=(0, 1)
+        )(ema, x)
+        value_seq, grads_seq = jax.value_and_grad(
+            lambda module, values: objective(module, values, False), argnums=(0, 1)
+        )(ema, x)
+
+        np.testing.assert_allclose(
+            np.asarray(value_assoc), np.asarray(value_seq), rtol=1e-5, atol=2e-5
+        )
+        for actual, expected in zip(
+            jax.tree.leaves(grads_assoc), jax.tree.leaves(grads_seq), strict=True
+        ):
+            np.testing.assert_allclose(
+                np.asarray(actual),
+                np.asarray(expected),
+                rtol=2e-4,
+                atol=1e-5,
+            )
 
     @pytest.mark.parametrize("use_associative", [True, False])
     def test_single_segment_matches_fft(self, random_seed: int, use_associative: bool) -> None:
@@ -1424,8 +1598,13 @@ class TestPrecisionPolicy:
         # FFT path
         y_fft, _ = jax_ema_bf16(x_bf16, return_state=False)
 
-        # Sequential path
-        y_seq, _ = jax_ema_bf16(x_bf16, return_state=True)
+        # Explicit sequential oracle. ``return_state=True`` no longer implies
+        # sequential output for a pristine prefill.
+        y_seq, _ = jax_ema_bf16._forward_sequential(x_bf16, None)  # noqa: SLF001
+        residual = (
+            x_bf16.astype(jnp.float32) * jax_ema_bf16.omega.astype(jnp.float32)[None, :, None]
+        )
+        y_seq = (y_seq + residual).astype(jnp.bfloat16)
 
         # Both should be bf16
         assert y_fft.dtype == jnp.bfloat16
