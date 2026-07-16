@@ -11,9 +11,141 @@ import pytest
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.layers import RMSNorm, RotaryEmbedding
 from megalodon_jax.layers.norms import BatchedLayerNorm
+from megalodon_jax.ops import _matmul_3d, bf16_f32_dot_precision
 from megalodon_jax.types import LayerCache
 
 pytestmark = pytest.mark.fast
+
+
+class TestDotPrecision:
+    """Regression gates for mixed-precision contraction result buffers."""
+
+    def test_projection_result_dtypes_are_call_site_specific(self) -> None:
+        """Only biasless BF16 projections return directly into BF16 buffers."""
+        x_bf16 = jnp.zeros((1, 4, 8), dtype=jnp.bfloat16)
+        weight_bf16 = jnp.zeros((16, 8), dtype=jnp.bfloat16)
+        bias_bf16 = jnp.zeros((16,), dtype=jnp.bfloat16)
+
+        def lower(function: object, *args: jax.Array) -> str:
+            return str(jax.jit(function).lower(*args).compiler_ir(dialect="stablehlo"))
+
+        biasless_hlo = lower(
+            lambda x, weight: _matmul_3d(
+                x,
+                weight,
+                jnp.bfloat16,
+                jnp.float32,
+                jnp.bfloat16,
+            ),
+            x_bf16,
+            weight_bf16,
+        )
+        biasful_hlo = lower(
+            lambda x, weight, bias: _matmul_3d(
+                x,
+                weight,
+                jnp.bfloat16,
+                jnp.float32,
+                jnp.bfloat16,
+                bias,
+            ),
+            x_bf16,
+            weight_bf16,
+            bias_bf16,
+        )
+        fp32_hlo = lower(
+            lambda x, weight: _matmul_3d(
+                x,
+                weight,
+                jnp.float32,
+                jnp.float32,
+                jnp.float32,
+            ),
+            x_bf16.astype(jnp.float32),
+            weight_bf16.astype(jnp.float32),
+        )
+
+        biasless_dot = next(line for line in biasless_hlo.splitlines() if "dot_general" in line)
+        biasful_dot = next(line for line in biasful_hlo.splitlines() if "dot_general" in line)
+        fp32_dot = next(line for line in fp32_hlo.splitlines() if "dot_general" in line)
+
+        assert "lhs_precision_type = bf16" in biasless_dot
+        assert "rhs_precision_type = bf16" in biasless_dot
+        assert "accumulation_type = f32" in biasless_dot
+        assert "-> tensor<1x4x16xbf16>" in biasless_dot
+        assert "algorithm =" not in biasful_dot
+        assert "-> tensor<1x4x16xf32>" in biasful_dot
+        assert "algorithm =" not in fp32_dot
+        assert "precision = [HIGHEST, HIGHEST]" in fp32_dot
+        assert "tensor<1x4x8xf32>" in fp32_dot
+        assert "-> tensor<1x4x16xf32>" in fp32_dot
+
+    def test_biasless_projection_matches_wide_result_reference_and_gradients(self) -> None:
+        """Direct BF16 results equal the former FP32-result-then-cast policy."""
+        x_key, weight_key, coefficient_key = jax.random.split(jax.random.PRNGKey(9), 3)
+        x = jax.random.normal(x_key, (2, 5, 8), dtype=jnp.bfloat16)
+        weight = jax.random.normal(weight_key, (16, 8), dtype=jnp.bfloat16)
+        coefficients = jax.random.normal(
+            coefficient_key,
+            (2, 5, 16),
+            dtype=jnp.bfloat16,
+        )
+
+        def direct_loss(values: jax.Array, matrix: jax.Array) -> jax.Array:
+            output = _matmul_3d(
+                values,
+                matrix,
+                jnp.bfloat16,
+                jnp.float32,
+                jnp.bfloat16,
+            )
+            return jnp.sum(output.astype(jnp.float32) * coefficients.astype(jnp.float32))
+
+        def wide_result_loss(values: jax.Array, matrix: jax.Array) -> jax.Array:
+            output = jnp.matmul(
+                values,
+                matrix.T,
+                precision=bf16_f32_dot_precision(jnp.bfloat16),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            return jnp.sum(output.astype(jnp.float32) * coefficients.astype(jnp.float32))
+
+        actual_loss, actual_grads = jax.value_and_grad(direct_loss, argnums=(0, 1))(x, weight)
+        expected_loss, expected_grads = jax.value_and_grad(wide_result_loss, argnums=(0, 1))(
+            x,
+            weight,
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual_loss), np.asarray(expected_loss))
+        for actual, expected in zip(actual_grads, expected_grads, strict=True):
+            np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+    def test_biasful_projection_adds_bias_before_bf16_rounding(self) -> None:
+        """Biasful projections retain the FP32 result until after bias addition."""
+        x_key, weight_key, bias_key = jax.random.split(jax.random.PRNGKey(17), 3)
+        x = jax.random.normal(x_key, (2, 5, 8), dtype=jnp.bfloat16)
+        weight = jax.random.normal(weight_key, (16, 8), dtype=jnp.bfloat16)
+        bias = jax.random.normal(bias_key, (16,), dtype=jnp.bfloat16)
+
+        actual = _matmul_3d(
+            x,
+            weight,
+            jnp.bfloat16,
+            jnp.float32,
+            jnp.bfloat16,
+            bias,
+        )
+        wide_result = jnp.matmul(
+            x,
+            weight.T,
+            precision=bf16_f32_dot_precision(jnp.bfloat16),
+            preferred_element_type=jnp.float32,
+        )
+        expected = (wide_result + bias).astype(jnp.bfloat16)
+        prematurely_rounded = (wide_result.astype(jnp.bfloat16) + bias).astype(jnp.bfloat16)
+
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+        assert bool(jnp.any(actual != prematurely_rounded))
 
 
 class TestMegalodonConfig:

@@ -77,7 +77,8 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 - RoPE angles are generated in FP32 and are derived data, not trainable leaves.
 - Fresh BF16 ordinary parameters are sampled with the configured initializer in FP32 and then cast to BF16, avoiding the coarse random grid produced by direct BF16 sampling.
 - FP32 matrix contractions request JAX's per-operation `HIGHEST` precision, so NVIDIA GPUs do not silently substitute TensorFloat-32 products. BF16 contractions retain BF16 inputs with FP32 accumulation.
-- Attention scores and softmax are FP32 by default. The resulting probabilities return to `compute_dtype` before dropout and the value contraction, matching the released mixed-precision boundary.
+- BF16 result buffers are selected by consumer. Biasless projections whose public output is BF16 and the attention probability-times-value contraction return BF16 directly while using the explicit `BF16_BF16_F32` contraction algorithm. Biasful projections retain an FP32 result through bias addition and downcast once afterward. The language-model head also retains its required FP32 output.
+- Attention QK scores remain FP32 because masking and the default softmax consume FP32. The resulting probabilities return to `compute_dtype` before dropout and the value contraction, matching the released mixed-precision boundary; producing BF16 QK scores would add a conversion back to FP32 and change the softmax input.
 - KV cache tensors follow `compute_dtype`; norm state remains FP32 and EMA state remains complex64.
 - Returned logits are always FP32, matching the original released model.
 - Parameter gradients follow parameter storage: ordinary gradients are BF16 in compact storage mode, while sensitive gradients remain FP32.

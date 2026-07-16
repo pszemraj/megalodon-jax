@@ -193,12 +193,17 @@ class TestAttentionPrimitives:
     def test_fp32_softmax_returns_probabilities_to_bf16_before_values(
         self, random_seed: int
     ) -> None:
-        """FP32 softmax probabilities are BF16 operands for the value contraction."""
+        """The direct-BF16 value contraction matches the former wide-result policy."""
         key = jax.random.PRNGKey(random_seed)
-        q_key, k_key, v_key = jax.random.split(key, 3)
+        q_key, k_key, v_key, coefficient_key = jax.random.split(key, 4)
         q = jax.random.normal(q_key, (1, 8, 2, 8), dtype=jnp.bfloat16)
         k = jax.random.normal(k_key, (1, 8, 2, 8), dtype=jnp.bfloat16)
         v = jax.random.normal(v_key, (1, 8, 2, 16), dtype=jnp.bfloat16)
+        coefficients = jax.random.normal(
+            coefficient_key,
+            v.shape,
+            dtype=jnp.bfloat16,
+        )
 
         actual = attention_single_chunk(q, k, v, causal=False)
         scores = jnp.einsum(
@@ -218,6 +223,68 @@ class TestAttentionPrimitives:
         ).astype(jnp.bfloat16)
 
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+        def direct_loss(q_value: jax.Array, k_value: jax.Array, v_value: jax.Array) -> jax.Array:
+            output = attention_single_chunk(q_value, k_value, v_value, causal=False)
+            return jnp.sum(output.astype(jnp.float32) * coefficients.astype(jnp.float32))
+
+        def wide_result_loss(
+            q_value: jax.Array,
+            k_value: jax.Array,
+            v_value: jax.Array,
+        ) -> jax.Array:
+            score = jnp.einsum(
+                "bqhd,bkhd->bhqk",
+                q_value,
+                k_value,
+                precision=dot_precision(q_value.dtype),
+                preferred_element_type=jnp.float32,
+            )
+            probability = jax.nn.softmax(score, axis=-1).astype(jnp.bfloat16)
+            output = jnp.einsum(
+                "bhqk,bkhd->bqhd",
+                probability,
+                v_value,
+                precision=dot_precision(q_value.dtype),
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            return jnp.sum(output.astype(jnp.float32) * coefficients.astype(jnp.float32))
+
+        actual_loss, actual_grads = jax.value_and_grad(direct_loss, argnums=(0, 1, 2))(q, k, v)
+        expected_loss, expected_grads = jax.value_and_grad(
+            wide_result_loss,
+            argnums=(0, 1, 2),
+        )(q, k, v)
+        np.testing.assert_array_equal(np.asarray(actual_loss), np.asarray(expected_loss))
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            np.testing.assert_array_equal(np.asarray(actual_grad), np.asarray(expected_grad))
+
+    def test_bf16_attention_lowering_keeps_qk_fp32_and_pv_bf16(self) -> None:
+        """QK keeps its FP32 score buffer while PV returns BF16 with FP32 accumulation."""
+        q = jnp.zeros((1, 4, 2, 8), dtype=jnp.bfloat16)
+        k = jnp.zeros_like(q)
+        v = jnp.zeros((1, 4, 2, 16), dtype=jnp.bfloat16)
+
+        lowered = jax.jit(
+            lambda query, key, value: attention_single_chunk(
+                query,
+                key,
+                value,
+                causal=False,
+            )
+        ).lower(q, k, v)
+        stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
+        dot_lines = [line for line in stablehlo.splitlines() if "dot_general" in line]
+
+        assert len(dot_lines) == 2
+        qk_dot, pv_dot = dot_lines
+        assert "algorithm =" not in qk_dot
+        assert "tensor<1x4x2x8xbf16>" in qk_dot
+        assert "-> tensor<1x2x4x4xf32>" in qk_dot
+        assert "lhs_precision_type = bf16" in pv_dot
+        assert "rhs_precision_type = bf16" in pv_dot
+        assert "accumulation_type = f32" in pv_dot
+        assert "-> tensor<1x2x16x4xbf16>" in pv_dot
 
     def test_post_softmax_and_dropkey_semantics(self) -> None:
         """The two released attention-dropout placements remain explicit."""

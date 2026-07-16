@@ -39,7 +39,12 @@ from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
 from megalodon_jax.layers.rotary import RotaryEmbedding
 from megalodon_jax.layers.segments import segment_runs_and_local_positions, valid_segment_mask
 from megalodon_jax.layers.timestep_norm import TimestepNorm
-from megalodon_jax.ops import dot_precision, inverted_dropout, linear_3d
+from megalodon_jax.ops import (
+    bf16_f32_dot_precision,
+    dot_precision,
+    inverted_dropout,
+    linear_3d,
+)
 from megalodon_jax.types import AttentionCache, EMAState, LayerCache
 
 # -----------------------------------------------------------------------------
@@ -196,8 +201,10 @@ def attention_single_chunk(
         "bhqk,bkhd->bqhd",
         attn_weights,
         v,
-        precision=dot_precision(q.dtype),
-        preferred_element_type=accum_dtype,
+        precision=bf16_f32_dot_precision(q.dtype),
+        preferred_element_type=(
+            None if jnp.dtype(q.dtype) == jnp.dtype(jnp.bfloat16) else accum_dtype
+        ),
     )
 
     return out.astype(q.dtype)

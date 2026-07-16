@@ -45,6 +45,20 @@ def dot_precision(compute_dtype: jnp.dtype) -> jax.lax.Precision | None:
     return None
 
 
+def bf16_f32_dot_precision(
+    compute_dtype: jnp.dtype,
+) -> jax.lax.Precision | jax.lax.DotAlgorithmPreset | None:
+    """Select explicit FP32 accumulation for BF16 result-buffer contractions.
+
+    :param jnp.dtype compute_dtype: Matrix-product compute dtype.
+    :return jax.lax.Precision | jax.lax.DotAlgorithmPreset | None: BF16 operands with
+        FP32 accumulation for BF16 compute, otherwise the existing precision policy.
+    """
+    if jnp.dtype(compute_dtype) == jnp.dtype(jnp.bfloat16):
+        return jax.lax.DotAlgorithmPreset.BF16_BF16_F32
+    return dot_precision(compute_dtype)
+
+
 def _matmul_3d(
     x: Array,
     weight: Array,
@@ -63,11 +77,20 @@ def _matmul_3d(
     :param Array | None bias: Optional output-feature bias.
     :return Array: Projected tensor in ``output_dtype``.
     """
+    direct_bf16_result = (
+        bias is None
+        and jnp.dtype(compute_dtype) == jnp.dtype(jnp.bfloat16)
+        and jnp.dtype(output_dtype) == jnp.dtype(jnp.bfloat16)
+    )
     y = jnp.matmul(
         x.astype(compute_dtype),
         weight.astype(compute_dtype).T,
-        precision=dot_precision(compute_dtype),
-        preferred_element_type=accum_dtype,
+        precision=(
+            bf16_f32_dot_precision(compute_dtype)
+            if direct_bf16_result
+            else dot_precision(compute_dtype)
+        ),
+        preferred_element_type=None if direct_bf16_result else accum_dtype,
     )
     if bias is not None:
         # Match upstream Linear semantics by adding bias before the final downcast.
