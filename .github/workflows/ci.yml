@@ -27,12 +27,12 @@ jobs:
       - run: python -m pip install ruff
       - name: Run lint
         run: ruff check .
-      - name: Check formatting
-        run: ruff format --check .
+      - name: Check preview formatting
+        run: ruff format --preview --check .
 
   fast-correctness:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

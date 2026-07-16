@@ -82,6 +82,9 @@ markers = [
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.format]
+preview = true
+
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP"]
 # F722: jaxtyping uses string annotations that ruff doesn't understand
