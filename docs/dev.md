@@ -174,6 +174,21 @@ Remove the temporary worktree after preserving the reports:
 conda run --name mega-jax git worktree remove /tmp/megalodon-jax-baseline
 ```
 
+### BF16 contraction result-buffer gate
+
+BF16 contractions use call-site-specific result dtypes. Attention QK scores, biasful projections, and the language-model head retain FP32 results for their FP32 consumers or bias epilogues. Attention probability-times-value and biasless projections whose public output is BF16 use `BF16_BF16_F32` with no FP32 preferred result, so StableHLO must show BF16 operands, FP32 accumulation, and a BF16 result. The FP32 reference path must continue to show genuine FP32 operands/results with `HIGHEST` precision and no BF16 algorithm metadata.
+
+The retained policy was isolated against its immediate predecessor on 2026-07-16 with JAX 0.10.2 and an RTX 5090. A contraction probe used BF16 projection operands shaped `(4, 512, 1024) @ (4096, 1024).T` and a PV contraction shaped `(4, 8, 256, 512) @ (4, 512, 8, 128)`. Direct BF16 projection and PV outputs were bit-identical to FP32-result-then-downcast outputs. Projection forward/backward improved from 0.521 ms to 0.350 ms, process peak allocation fell from 260.0 MB to 180.4 MB, and the largest allocation fell from 134.2 MB to 58.7 MB. The compiler's abstract temporary-size report did not expose that allocator difference, so both measurements are retained rather than treating either one as the complete memory picture.
+
+The end-to-end comparison used clean worktrees, the canonical 171,475,968-parameter model with FP32 ordinary storage, BF16 compute, FP32 accumulation/softmax, gradient checkpointing, `B=1`, `L=512`, two warmups, ten synchronized iterations per run, and both repository orders. Each row pools twenty samples. A resident 2.76 GB background process was idle at 0% GPU utilization, so these are order-balanced latency and per-process allocation results, not clean-device capacity limits.
+
+| Forward/backward mode | FP32-result baseline | Direct-BF16 result | Runtime reduction | Baseline compiler peak | Candidate compiler peak | Baseline runtime peak | Candidate runtime peak |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Plain | 16.332 ms | 15.641 ms | 4.23% | 1,627.7 MB | 1,625.6 MB | 2,416.8 MB | 2,412.6 MB |
+| Packed | 32.034 ms | 30.999 ms | 3.23% | 1,517.0 MB | 1,517.0 MB | 2,309.5 MB | 2,309.5 MB |
+
+Both full-model modes passed finite-loss and all-gradient checks. Separate fixed-seed three-step GPU trajectories compared the exact pre-change and candidate revisions for plain and packed inputs: maximum loss drift was `1.07e-3`, maximum gradient drift was `5.86e-3`, maximum updated-parameter drift was `1.27e-5`, and every loss, gradient, parameter, and final logit remained within the predefined BF16 `rtol=atol=5e-2` envelope. Changes to this policy must repeat lowering, negative-control, trajectory, cache/generation, and end-to-end gates; a microbenchmark alone is insufficient.
+
 ### Packed CEMA gate
 
 Use `benchmarks/benchmark_cema_reset.py` for the isolated FFT, associative packed, and sequential CEMA paths. Benchmark representative sequence shapes and masks: an all-valid `attention_mask` intentionally exercises the general masked path, while `attention_mask=None` selects the unmasked path described in [Long-context streaming](long-context-streaming.md#padding-and-generation).
