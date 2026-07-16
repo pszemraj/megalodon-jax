@@ -11,7 +11,11 @@ import numpy as np
 import pytest
 
 from megalodon_jax.layers import ComplexEMA, TimestepNorm
-from megalodon_jax.layers.segments import segment_boundaries, segment_runs_and_local_positions
+from megalodon_jax.layers.segments import (
+    derive_segment_metadata,
+    segment_boundaries,
+    segment_runs_and_local_positions,
+)
 from megalodon_jax.layers.timestep_norm import (
     _block_moments,
     _merge_m2,
@@ -62,6 +66,20 @@ class TestSegmentHelpers:
         run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
         np.testing.assert_array_equal(np.array(run_ids), [[1, 1, 2, 2, 2, 3, 4, 4]])
         np.testing.assert_array_equal(np.array(local_positions), [[0, 1, 0, 1, 2, 0, 0, 1]])
+
+    def test_derived_metadata_matches_individual_helpers(self) -> None:
+        """The shared pytree preserves every established packed-sequence predicate."""
+        segment_ids = jnp.asarray(
+            [[1, 1, 2, 2, 1, 0], [3, 3, 3, 4, 4, 4]],
+            dtype=jnp.int32,
+        )
+        metadata = derive_segment_metadata(segment_ids)
+        run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
+
+        np.testing.assert_array_equal(metadata.valid, segment_ids > 0)
+        np.testing.assert_array_equal(metadata.boundaries, segment_boundaries(segment_ids))
+        np.testing.assert_array_equal(metadata.run_ids, run_ids)
+        np.testing.assert_array_equal(metadata.local_positions, local_positions)
 
 
 class TestTimestepNorm:

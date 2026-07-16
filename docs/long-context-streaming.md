@@ -94,6 +94,7 @@ flowchart TD
 ```
 
 - The cache tracks absolute token count. Released chunk-local mode derives RoPE position as `absolute_position % chunk_size`, matching the source's per-chunk coordinate restart. Sliding-window mode uses absolute positions so retained keys and new queries remain in one coordinate system.
+- The model resolves those positions once per call, evaluates one FP32 cosine/sine table, and passes the derived table through every layer. An optimization barrier keeps the table outside rematerialized blocks instead of cloning the same transcendental work per layer. This changes neither coordinates nor checkpoint contents: standalone attention modules still derive the same factors locally, and cached model calls build the table from the already-validated shared cache timeline.
 
 ## Training and inference
 
@@ -103,6 +104,8 @@ flowchart TD
 ## Packed-sequence training
 
 `segment_ids` isolates contiguous documents across attention, CEMA, TimestepNorm, RoPE, gradients, and shifted loss pairs. Positive values identify real tokens and zero identifies padding. Raw IDs may be reused for non-adjacent documents because boundaries are defined by changes between neighboring IDs, not by global ID equality.
+
+At model entry, `segment_ids` is converted once into a small derived pytree containing validity, reset boundaries, contiguous-run IDs, and run-local positions. Every layer's attention, CEMA, and TimestepNorm plus the final TimestepNorm consume that same pytree. This is an internal reuse optimization rather than a second metadata contract; direct layer calls derive identical values locally, and the regression suite compares outputs and parameter gradients between the shared and layer-local paths.
 
 A minimal one-row packing recipe is below. Documents must already be tokenized and include any desired BOS/EOS tokens; packing does not manufacture boundary tokens. A production bin-packer can choose document groups for each row, then apply the same metadata construction.
 

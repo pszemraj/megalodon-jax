@@ -520,6 +520,30 @@ class TestRotaryEmbeddingParity:
         np.testing.assert_array_equal(np.asarray(offset_q), np.asarray(explicit_q))
         np.testing.assert_array_equal(np.asarray(offset_k), np.asarray(explicit_k))
 
+    def test_precomputed_table_matches_on_demand_rotation(self) -> None:
+        """A singleton-batch table broadcasts without changing rotary outputs."""
+        rope = RotaryEmbedding(8)
+        q = jnp.arange(64, dtype=jnp.float32).reshape(2, 4, 1, 8)
+        k = q + 0.5
+        positions = jnp.asarray([0, 1, 7, 8], dtype=jnp.int32)
+        explicit = jnp.broadcast_to(positions[None, :], (2, 4))
+
+        expected = rope(
+            q,
+            k,
+            jnp.asarray(0, dtype=jnp.int32),
+            position_ids=explicit,
+        )
+        actual = rope(
+            q,
+            k,
+            jnp.asarray(0, dtype=jnp.int32),
+            table=rope.table_from_positions(positions),
+        )
+
+        np.testing.assert_array_equal(np.asarray(actual[0]), np.asarray(expected[0]))
+        np.testing.assert_array_equal(np.asarray(actual[1]), np.asarray(expected[1]))
+
     def test_even_dim_required(self) -> None:
         """Test that odd dimension raises ValueError.
 

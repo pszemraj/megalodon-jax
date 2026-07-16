@@ -36,8 +36,11 @@ from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, layer_cache_invariant_v
 from megalodon_jax.config import AttentionDropoutMode
 from megalodon_jax.layers.complex_ema import ComplexEMA
 from megalodon_jax.layers.norms import BatchedLayerNorm, RMSNorm, _rms_normalize
-from megalodon_jax.layers.rotary import RotaryEmbedding
-from megalodon_jax.layers.segments import segment_runs_and_local_positions, valid_segment_mask
+from megalodon_jax.layers.rotary import RotaryEmbedding, RotaryTable
+from megalodon_jax.layers.segments import (
+    SegmentMetadata,
+    derive_segment_metadata,
+)
 from megalodon_jax.layers.timestep_norm import TimestepNorm
 from megalodon_jax.ops import (
     bf16_f32_dot_precision,
@@ -226,6 +229,9 @@ def attention_multi_chunk(
     dropout_mode: AttentionDropoutMode = "post_softmax",
     deterministic: bool = True,
     key: PRNGKeyArray | None = None,
+    *,
+    _segment_metadata: SegmentMetadata | None = None,
+    _rotary_table: RotaryTable | None = None,
 ) -> Float[Array, "batch seq heads value_dim"]:
     """Block-diagonal chunked attention for training.
 
@@ -250,6 +256,8 @@ def attention_multi_chunk(
     :param AttentionDropoutMode dropout_mode: Post-softmax dropout or DropKey.
     :param bool deterministic: If True, skip dropout.
     :param PRNGKeyArray | None key: PRNG key for dropout.
+    :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+    :param RotaryTable | None _rotary_table: Internal per-model-call rotary factors.
     :return jax.Array: Output tensor of shape (batch, seq, heads, value_dim).
     """
     B, L, H, Dh = q.shape
@@ -259,31 +267,43 @@ def attention_multi_chunk(
     if L == 0:
         return jnp.zeros((B, L, H, Dv), dtype=q.dtype)
 
-    if segment_ids is not None and position_ids is None:
-        # RoPE must restart at each packed document: without explicit
-        # position_ids a packed row would silently keep continuous global
-        # phases across boundaries while the mask still isolates attention.
-        _, position_ids = segment_runs_and_local_positions(segment_ids)
+    if segment_ids is not None and _segment_metadata is None:
+        _segment_metadata = derive_segment_metadata(segment_ids)
 
-    if position_ids is None:
-        local_positions = (
-            jnp.arange(L, dtype=jnp.int32) + start_index.astype(jnp.int32)
-        ) % chunk_size
-        position_ids = jnp.broadcast_to(local_positions, (B, L))
-    else:
-        position_ids = position_ids % chunk_size
+    if _rotary_table is None:
+        if segment_ids is not None and position_ids is None:
+            # RoPE must restart at each packed document: without explicit
+            # position_ids a packed row would silently keep continuous global
+            # phases across boundaries while the mask still isolates attention.
+            assert _segment_metadata is not None
+            position_ids = _segment_metadata.local_positions
+
+        if position_ids is None:
+            local_positions = (
+                jnp.arange(L, dtype=jnp.int32) + start_index.astype(jnp.int32)
+            ) % chunk_size
+            position_ids = jnp.broadcast_to(local_positions, (B, L))
+        else:
+            position_ids = position_ids % chunk_size
 
     if L <= chunk_size:
         # Single-chunk fast path avoids padding/chunk reshapes. Keep its RoPE,
         # mask, and dropout semantics in lockstep with the multi-chunk path.
-        q_rot, k_rot = rotary(q, k, start_index, position_ids=position_ids)
+        q_rot, k_rot = rotary(
+            q,
+            k,
+            start_index,
+            position_ids=position_ids,
+            table=_rotary_table,
+        )
         qk_mask = None
         if segment_ids is not None:
             # Compare contiguous runs (ids may repeat); validity from raw ids.
             # Local chunks are all 0 here (L <= chunk_size), so run equality
             # alone gives the full same-run, same-local-chunk condition.
-            seg_runs, _ = segment_runs_and_local_positions(segment_ids)
-            segment_valid = valid_segment_mask(segment_ids)
+            assert _segment_metadata is not None
+            seg_runs = _segment_metadata.run_ids
+            segment_valid = _segment_metadata.valid
             qk_mask = (
                 (seg_runs[:, :, None] == seg_runs[:, None, :])
                 & segment_valid[:, :, None]
@@ -314,13 +334,56 @@ def attention_multi_chunk(
             mask = jnp.pad(mask, ((0, 0), (0, pad_len)), constant_values=False)
         if segment_ids is not None:
             segment_ids = jnp.pad(segment_ids, ((0, 0), (0, pad_len)), constant_values=0)
-        position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        if position_ids is not None:
+            position_ids = jnp.pad(position_ids, ((0, 0), (0, pad_len)), constant_values=0)
+        if _segment_metadata is not None:
+            _segment_metadata = SegmentMetadata(
+                valid=jnp.pad(
+                    _segment_metadata.valid,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=False,
+                ),
+                boundaries=jnp.pad(
+                    _segment_metadata.boundaries,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=False,
+                ),
+                run_ids=jnp.pad(
+                    _segment_metadata.run_ids,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=0,
+                ),
+                local_positions=jnp.pad(
+                    _segment_metadata.local_positions,
+                    ((0, 0), (0, pad_len)),
+                    constant_values=0,
+                ),
+            )
+        if _rotary_table is not None:
+            _rotary_table = RotaryTable(
+                cos=jnp.pad(
+                    _rotary_table.cos,
+                    ((0, 0), (0, pad_len), (0, 0), (0, 0)),
+                    constant_values=1.0,
+                ),
+                sin=jnp.pad(
+                    _rotary_table.sin,
+                    ((0, 0), (0, pad_len), (0, 0), (0, 0)),
+                    constant_values=0.0,
+                ),
+            )
 
     L_padded = q.shape[1]
     num_chunks = L_padded // chunk_size
 
     # Apply RoPE once with absolute positions, then reshape into chunks.
-    q_rot_full, k_rot_full = rotary(q, k, start_index, position_ids=position_ids)
+    q_rot_full, k_rot_full = rotary(
+        q,
+        k,
+        start_index,
+        position_ids=position_ids,
+        table=_rotary_table,
+    )
     q_rot = q_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     k_rot = k_rot_full.reshape(B * num_chunks, chunk_size, H, Dh)
     v_chunked = v.reshape(B, num_chunks, chunk_size, H, Dv).reshape(
@@ -338,7 +401,9 @@ def attention_multi_chunk(
         # at most chunk_size consecutive positions, so keys/values from the
         # current + previous global chunk cover every allowed edge; the mask
         # keeps only same-run, same-local-chunk, valid pairs.
-        run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
+        assert _segment_metadata is not None
+        run_ids = _segment_metadata.run_ids
+        local_positions = _segment_metadata.local_positions
         local_chunks = local_positions // chunk_size
 
         def window_keys(z: jnp.ndarray, fill_value: jax.typing.ArrayLike) -> jnp.ndarray:
@@ -494,6 +559,8 @@ class ChunkedAttention(eqx.Module):
         position_ids: Int[Array, "batch seq"] | None,
         deterministic: bool,
         key: PRNGKeyArray | None,
+        segment_metadata: SegmentMetadata | None = None,
+        rotary_table: RotaryTable | None = None,
     ) -> Float[Array, "batch seq heads value_dim"]:
         """Evaluate the optional sliding extension without a cache.
 
@@ -505,19 +572,32 @@ class ChunkedAttention(eqx.Module):
         :param Int[Array, "batch seq"] | None position_ids: Optional rotary positions.
         :param bool deterministic: Whether attention dropout is disabled.
         :param PRNGKeyArray | None key: Random key used by attention dropout.
+        :param SegmentMetadata | None segment_metadata: Optional shared packed metadata.
+        :param RotaryTable | None rotary_table: Optional shared rotary factors.
         :return Float[Array, "batch seq heads value_dim"]: Sliding-attention output.
         """
         batch, length = q.shape[:2]
         if segment_ids is not None:
-            run_ids, local_positions = segment_runs_and_local_positions(segment_ids)
-            rotary_positions = local_positions if position_ids is None else position_ids
+            if segment_metadata is None:
+                segment_metadata = derive_segment_metadata(segment_ids)
+            run_ids = segment_metadata.run_ids
+            local_positions = segment_metadata.local_positions
+            rotary_positions = (
+                None
+                if rotary_table is not None
+                else (local_positions if position_ids is None else position_ids)
+            )
             token_positions = local_positions
             same_run = run_ids[:, :, None] == run_ids[:, None, :]
-            segment_valid = valid_segment_mask(segment_ids)
+            segment_valid = segment_metadata.valid
             valid_segments = segment_valid[:, :, None] & segment_valid[:, None, :]
         else:
             token_positions = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-            rotary_positions = token_positions if position_ids is None else position_ids
+            rotary_positions = (
+                None
+                if rotary_table is not None
+                else (token_positions if position_ids is None else position_ids)
+            )
             same_run = jnp.ones((batch, length, length), dtype=jnp.bool_)
             valid_segments = same_run
 
@@ -530,6 +610,7 @@ class ChunkedAttention(eqx.Module):
             k,
             jnp.asarray(0, dtype=jnp.int32),
             position_ids=rotary_positions,
+            table=rotary_table,
         )
         return attention_single_chunk(
             q_rot,
@@ -552,6 +633,7 @@ class ChunkedAttention(eqx.Module):
         v: Float[Array, "batch seq heads value_dim"],
         deterministic: bool,
         key: PRNGKeyArray | None,
+        rotary_table: RotaryTable | None = None,
     ) -> tuple[
         Float[Array, "batch seq heads value_dim"],
         AttentionCache,
@@ -564,6 +646,7 @@ class ChunkedAttention(eqx.Module):
         :param Float[Array, "batch seq heads value_dim"] v: Prompt value vectors.
         :param bool deterministic: Whether attention dropout is disabled.
         :param PRNGKeyArray | None key: Random key used by attention dropout.
+        :param RotaryTable | None rotary_table: Optional shared rotary factors.
         :return tuple: Attention output, materialized ring cache, and prompt length.
         """
         batch, length = q.shape[:2]
@@ -581,6 +664,7 @@ class ChunkedAttention(eqx.Module):
                 dropout_mode=self.attention_dropout_mode,
                 deterministic=deterministic,
                 key=key,
+                _rotary_table=rotary_table,
             )
         else:
             out = self._full_sliding_attention(
@@ -592,6 +676,7 @@ class ChunkedAttention(eqx.Module):
                 None,
                 deterministic,
                 key,
+                rotary_table=rotary_table,
             )
 
         capacity = self.cache_capacity
@@ -602,26 +687,23 @@ class ChunkedAttention(eqx.Module):
             absolute_times % self.chunk_size if self.attention_window is None else absolute_times
         )
 
-        # Recompute only the retained tail instead of widening every vectorized
-        # attention helper to retain rotated keys. XLA removes the unused query
-        # rotation below, and the bounded tail work is negligible beside prefill.
-        def rotate_key_at_position(q_t: Array, k_t: Array, position: Array) -> Array:
-            """Match the scalar-position rotation used by tokenwise decode.
-
-            :param Array q_t: Query vectors at one absolute timestep.
-            :param Array k_t: Key vectors at one absolute timestep.
-            :param Array position: Scalar rotary position for the timestep.
-            :return Array: Rotated key vectors.
-            """
-            _, k_rot = self.rotary(q_t[:, None], k_t[:, None], position)
-            return k_rot[:, 0]
-
-        k_tail_rot = jax.vmap(
-            rotate_key_at_position,
-            in_axes=(1, 1, 0),
-            out_axes=1,
+        # Recompute only the retained tail instead of retaining all rotated keys
+        # from vectorized attention. A model-level table avoids repeating trig;
+        # standalone calls derive the same bounded tail table here.
+        tail_table = (
+            RotaryTable(
+                cos=rotary_table.cos[:, tail_start:],
+                sin=rotary_table.sin[:, tail_start:],
+            )
+            if rotary_table is not None
+            else self.rotary.table_from_positions(rope_positions)
         )
-        k_tail_rot = k_tail_rot(q[:, tail_start:], k[:, tail_start:], rope_positions)
+        _, k_tail_rot = self.rotary(
+            q[:, tail_start:],
+            k[:, tail_start:],
+            jnp.asarray(0, dtype=jnp.int32),
+            table=tail_table,
+        )
         slots = absolute_times % capacity
         cache_k = (
             jnp.zeros(
@@ -656,6 +738,8 @@ class ChunkedAttention(eqx.Module):
         key: PRNGKeyArray | None = None,
         *,
         _cache_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
+        _rotary_table: RotaryTable | None = None,
     ) -> tuple[
         Float[Array, "batch seq heads value_dim"],
         AttentionCache | None,
@@ -695,6 +779,8 @@ class ChunkedAttention(eqx.Module):
                     dropout_mode=self.attention_dropout_mode,
                     deterministic=deterministic,
                     key=key,
+                    _segment_metadata=_segment_metadata,
+                    _rotary_table=_rotary_table,
                 )
             else:
                 out = self._full_sliding_attention(
@@ -706,6 +792,8 @@ class ChunkedAttention(eqx.Module):
                     position_ids,
                     deterministic,
                     key,
+                    segment_metadata=_segment_metadata,
+                    rotary_table=_rotary_table,
                 )
             return out, None, jnp.asarray(length, dtype=jnp.int32)
 
@@ -714,7 +802,7 @@ class ChunkedAttention(eqx.Module):
         # only the fixed-capacity ring state needs to be materialized.
         attention_dropout_active = not deterministic and self.attention_dropout > 0.0
         if cache is None and return_cache and not attention_dropout_active and length > 0:
-            return self._prefill(q, k, v, deterministic, key)
+            return self._prefill(q, k, v, deterministic, key, _rotary_table)
 
         capacity = self.cache_capacity
         if cache is None:
@@ -756,26 +844,38 @@ class ChunkedAttention(eqx.Module):
 
         def step(
             carry: tuple[Array, Array, Array, Array],
-            inputs: tuple[Array, Array, Array],
+            inputs: tuple[Array, ...],
         ) -> tuple[tuple[Array, Array, Array, Array], Array]:
             """Process one token and advance the ring-buffer state.
 
             :param tuple[Array, Array, Array, Array] carry: Cached keys, cached values,
                 absolute position, and dropout RNG state.
-            :param tuple[Array, Array, Array] inputs: Query, key, and value slices for one token.
+            :param tuple[Array, ...] inputs: Query, key, value, and optional rotary factors.
             :return tuple[tuple[Array, Array, Array, Array], Array]: Updated ring-buffer carry
                 and the token's attention output.
             """
             current_k, current_v, position, current_rng = carry
-            q_t, k_t, v_t = inputs
-            rope_position = (
-                position % self.chunk_size if self.attention_window is None else position
-            )
-            q_rot, k_rot = self.rotary(
-                q_t[:, None],
-                k_t[:, None],
-                rope_position,
-            )
+            q_t, k_t, v_t = inputs[:3]
+            if _rotary_table is None:
+                rope_position = (
+                    position % self.chunk_size if self.attention_window is None else position
+                )
+                q_rot, k_rot = self.rotary(
+                    q_t[:, None],
+                    k_t[:, None],
+                    rope_position,
+                )
+            else:
+                cos_t, sin_t = inputs[3:]
+                q_rot, k_rot = self.rotary(
+                    q_t[:, None],
+                    k_t[:, None],
+                    position,
+                    table=RotaryTable(
+                        cos=cos_t[:, None, :, :],
+                        sin=sin_t[:, None, :, :],
+                    ),
+                )
             write_slot = position % capacity
             current_k = current_k.at[:, write_slot].set(k_rot[:, 0])
             current_v = current_v.at[:, write_slot].set(v_t)
@@ -810,14 +910,20 @@ class ChunkedAttention(eqx.Module):
                 current_rng,
             ), output[:, 0]
 
+        scan_inputs: tuple[Array, ...] = (
+            jnp.swapaxes(q, 0, 1),
+            jnp.swapaxes(k, 0, 1),
+            jnp.swapaxes(v, 0, 1),
+        )
+        if _rotary_table is not None:
+            scan_inputs = scan_inputs + (
+                jnp.moveaxis(_rotary_table.cos, 1, 0),
+                jnp.moveaxis(_rotary_table.sin, 1, 0),
+            )
         (final_k, final_v, final_count, _), outputs = jax.lax.scan(
             step,
             (cache_k, cache_v, count, rng),
-            (
-                jnp.swapaxes(q, 0, 1),
-                jnp.swapaxes(k, 0, 1),
-                jnp.swapaxes(v, 0, 1),
-            ),
+            scan_inputs,
         )
         out = jnp.swapaxes(outputs, 0, 1)
         new_cache = (
@@ -1009,6 +1115,8 @@ class MegalodonAttention(eqx.Module):
         key: PRNGKeyArray | None = None,
         *,
         _cache_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
+        _rotary_table: RotaryTable | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Forward pass through the attention block.
 
@@ -1022,6 +1130,8 @@ class MegalodonAttention(eqx.Module):
         :param bool deterministic: If True, skip dropout.
         :param PRNGKeyArray | None key: PRNG key for dropout.
         :param bool _cache_validated: Internal signal that model cache counts were checked.
+        :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+        :param RotaryTable | None _rotary_table: Internal per-model-call rotary factors.
         :return tuple[jax.Array, LayerCache | None]: Output tensor and updated cache.
         """
         if (
@@ -1081,6 +1191,7 @@ class MegalodonAttention(eqx.Module):
             mask=mask,
             segment_ids=segment_ids,
             _state_validated=_cache_validated,
+            _segment_metadata=_segment_metadata,
         )
 
         # CEMA: (B, L, D) -> (B, D, L) -> CEMA -> (B, D, L) -> (B, L, D)
@@ -1096,6 +1207,7 @@ class MegalodonAttention(eqx.Module):
             mask=mask,
             segment_ids=segment_ids,
             use_associative_segment_scan=self.use_associative_segment_scan,
+            _segment_metadata=_segment_metadata,
         )
         y_cema = y_cema.transpose(0, 2, 1)  # (B, L, D)
 
@@ -1147,6 +1259,8 @@ class MegalodonAttention(eqx.Module):
             deterministic=deterministic,
             key=k1,
             _cache_validated=_cache_validated,
+            _segment_metadata=_segment_metadata,
+            _rotary_table=_rotary_table,
         )
 
         # Reshape attention output: (B, L, H, Dv) -> (B, L, value_dim)

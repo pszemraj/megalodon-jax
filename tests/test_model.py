@@ -2134,6 +2134,83 @@ class TestAttentionMasking:
 class TestPackedMetadata:
     """Tests for strict packed metadata plumbing in model forward/loss."""
 
+    @pytest.mark.fast
+    def test_shared_metadata_matches_layer_local_path(self, random_seed: int) -> None:
+        """Sharing derived metadata preserves packed outputs and parameter gradients."""
+        config = small_config(chunk_size=4)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray([[7, 8, 9, 10, 11, 12, 0, 0]], dtype=jnp.int32)
+        segment_ids = jnp.asarray([[1, 1, 2, 2, 2, 1, 0, 0]], dtype=jnp.int32)
+        attention_mask = segment_ids > 0
+
+        def layer_local_logits(candidate: MegalodonForCausalLM) -> jax.Array:
+            """Execute the former per-layer derivation path as an in-test oracle."""
+            decoder = candidate.model
+            hidden = decoder.embed.weight[input_ids]
+            if decoder.scale != 1.0:
+                hidden = hidden * jnp.asarray(decoder.scale, dtype=hidden.dtype)
+            hidden = hidden.astype(config.compute_dtype)
+            for layer in decoder.layers:
+                hidden, _ = layer(
+                    hidden,
+                    mask=attention_mask,
+                    segment_ids=segment_ids,
+                )
+            hidden, _ = decoder.norm(
+                hidden,
+                mask=attention_mask,
+                segment_ids=segment_ids,
+            )
+            return candidate._project_logits(hidden)
+
+        def shared_objective(candidate: MegalodonForCausalLM) -> jax.Array:
+            logits, _ = candidate(
+                input_ids,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+            )
+            return jnp.mean(jnp.square(logits))
+
+        def local_objective(candidate: MegalodonForCausalLM) -> jax.Array:
+            return jnp.mean(jnp.square(layer_local_logits(candidate)))
+
+        shared_logits, _ = model(
+            input_ids,
+            attention_mask=attention_mask,
+            segment_ids=segment_ids,
+        )
+        local_logits = layer_local_logits(model)
+        np.testing.assert_array_equal(np.asarray(shared_logits), np.asarray(local_logits))
+
+        shared_loss, shared_grads = eqx.filter_value_and_grad(shared_objective)(model)
+        local_loss, local_grads = eqx.filter_value_and_grad(local_objective)(model)
+        np.testing.assert_array_equal(np.asarray(shared_loss), np.asarray(local_loss))
+        shared_leaves = [
+            leaf for leaf in jax.tree.leaves(shared_grads) if eqx.is_inexact_array(leaf)
+        ]
+        local_leaves = [leaf for leaf in jax.tree.leaves(local_grads) if eqx.is_inexact_array(leaf)]
+        assert shared_leaves
+        for shared_grad, local_grad in zip(shared_leaves, local_leaves, strict=True):
+            np.testing.assert_array_equal(np.asarray(shared_grad), np.asarray(local_grad))
+
+    @pytest.mark.fast
+    def test_layer_stack_lowers_one_rotary_table(self, random_seed: int) -> None:
+        """A multi-layer call lowers one RoPE sin/cos pair, not one pair per layer."""
+        config = small_config(num_layers=3, chunk_size=4)
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray([[1, 2, 3, 4, 5, 6]], dtype=jnp.int32)
+        position_ids = jnp.asarray([[0, 1, 2, 3, 0, 1]], dtype=jnp.int32)
+
+        lowered = jax.jit(lambda tokens, positions: model(tokens, position_ids=positions)[0]).lower(
+            input_ids,
+            position_ids,
+        )
+        stablehlo = str(lowered.compiler_ir(dialect="stablehlo"))
+
+        assert stablehlo.count("stablehlo.sine") == 1
+        assert stablehlo.count("stablehlo.cosine") == 1
+        assert stablehlo.count("stablehlo.optimization_barrier") == 2
+
     def test_compute_loss_parity_without_effective_segmentation(self, random_seed: int) -> None:
         """Passing monotonic position_ids and single segment should match default loss."""
         config = small_config()

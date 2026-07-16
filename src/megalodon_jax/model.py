@@ -34,7 +34,12 @@ from megalodon_jax.cache import (
 )
 from megalodon_jax.config import MegalodonConfig
 from megalodon_jax.layers import MegalodonAttention, NormalizedFFN, TimestepNorm
-from megalodon_jax.layers.segments import valid_segment_mask
+from megalodon_jax.layers.rotary import RotaryTable
+from megalodon_jax.layers.segments import (
+    SegmentMetadata,
+    derive_segment_metadata,
+    valid_segment_mask,
+)
 from megalodon_jax.ops import inverted_dropout, matmul_3d_weight
 from megalodon_jax.types import LayerCache, ModelCache
 from megalodon_jax.utils import get_boundary_initializer, reinit_linear_weights
@@ -96,6 +101,8 @@ def _checkpointed_layer(
     mask: Bool[Array, "batch seq"] | None,
     segment_ids: Int[Array, "batch seq"] | None,
     position_ids: Int[Array, "batch seq"] | None,
+    segment_metadata: SegmentMetadata | None,
+    rotary_table: RotaryTable | None,
     key: PRNGKeyArray | None,
 ) -> Float[Array, "batch seq dim"]:
     """Execute layer without caching for gradient checkpointing.
@@ -110,6 +117,8 @@ def _checkpointed_layer(
     :param Int[Array, "batch seq"] | None position_ids: Optional per-token RoPE positions.
         When omitted with segment_ids given, document-local positions
         (restarting at each segment start) are derived automatically.
+    :param SegmentMetadata | None segment_metadata: Shared packed-sequence metadata.
+    :param RotaryTable | None rotary_table: Shared rotary factors for this model call.
     :param PRNGKeyArray | None key: Optional dropout key.
     :return Float[Array, "batch seq dim"]: Output activations.
     """
@@ -122,6 +131,8 @@ def _checkpointed_layer(
         return_cache=False,
         deterministic=False,
         key=key,
+        _segment_metadata=segment_metadata,
+        _rotary_table=rotary_table,
     )
     return out
 
@@ -227,6 +238,8 @@ class MegalodonBlock(eqx.Module):
         key: PRNGKeyArray | None = None,
         *,
         _cache_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
+        _rotary_table: RotaryTable | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], LayerCache | None]:
         """Apply attention + FFN with two-hop residual.
 
@@ -241,6 +254,8 @@ class MegalodonBlock(eqx.Module):
         :param bool deterministic: Whether to disable dropout.
         :param PRNGKeyArray | None key: Optional dropout key.
         :param bool _cache_validated: Internal signal that model cache counts were checked.
+        :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
+        :param RotaryTable | None _rotary_table: Internal per-model-call rotary factors.
         :raises ValueError: If cache state is requested during nondeterministic execution.
         :return tuple[Float[Array, "batch seq dim"], LayerCache | None]: Output and cache.
         """
@@ -268,6 +283,8 @@ class MegalodonBlock(eqx.Module):
             deterministic=deterministic,
             key=k_attn,
             _cache_validated=_cache_validated,
+            _segment_metadata=_segment_metadata,
+            _rotary_table=_rotary_table,
         )
 
         # FFN with two-hop residual
@@ -371,6 +388,57 @@ class MegalodonModel(eqx.Module):
             num_groups=config.norm_num_groups,
             eps=config.norm_eps,
         )
+
+    def _prepare_call_metadata(
+        self,
+        input_shape: tuple[int, int],
+        segment_ids: Int[Array, "batch seq"] | None,
+        position_ids: Int[Array, "batch seq"] | None,
+        cache: ModelCache | None,
+    ) -> tuple[SegmentMetadata | None, RotaryTable | None]:
+        """Derive packed metadata and one shared rotary table for the layer stack."""
+        _, sequence_length = input_shape
+        segment_metadata = None
+        if segment_ids is not None:
+            if segment_ids.shape != input_shape:
+                raise ValueError(
+                    f"segment_ids must have shape {input_shape}, got {segment_ids.shape}"
+                )
+            segment_metadata = derive_segment_metadata(segment_ids)
+
+        if position_ids is not None and position_ids.shape != input_shape:
+            raise ValueError(
+                f"position_ids must have shape {input_shape}, got {position_ids.shape}"
+            )
+        if not self.layers:
+            return segment_metadata, None
+
+        if position_ids is not None:
+            rotary_positions = position_ids
+        elif segment_metadata is not None:
+            rotary_positions = segment_metadata.local_positions
+        else:
+            start = jnp.asarray(0, dtype=jnp.int32)
+            if cache is not None:
+                first_layer_cache = cache.layer_caches[0]
+                if first_layer_cache is None or first_layer_cache.attn is None:
+                    raise ValueError(CACHE_INVARIANT_MESSAGE)
+                start = first_layer_cache.attn.count
+            rotary_positions = jnp.arange(sequence_length, dtype=jnp.int32) + start
+
+        inner = self.layers[0].attn.inner
+        if inner.attention_window is None:
+            rotary_positions = rotary_positions % inner.chunk_size
+        rotary_table = inner.rotary.table_from_positions(rotary_positions)
+
+        # Preserve one materialized table across the unrolled layer stack,
+        # including rematerialized layers, instead of letting optimization
+        # clone identical transcendental expressions into each block.
+        rotary_table = RotaryTable(
+            cos=jax.lax.optimization_barrier(rotary_table.cos),
+            sin=jax.lax.optimization_barrier(rotary_table.sin),
+        )
+        return segment_metadata, rotary_table
 
     def __call__(
         self,
@@ -514,6 +582,13 @@ class MegalodonModel(eqx.Module):
             layer_caches = [None] * len(self.layers)
             final_norm_state = None
 
+        segment_metadata, rotary_table = self._prepare_call_metadata(
+            input_ids.shape,
+            segment_ids,
+            position_ids,
+            cache,
+        )
+
         # Split keys for layers
         if layers_key is not None:
             keys = list(jax.random.split(layers_key, len(self.layers)))
@@ -529,7 +604,14 @@ class MegalodonModel(eqx.Module):
             if use_ckpt:
                 # Checkpointed path: disable cache during training
                 x = _checkpointed_layer(
-                    layer, x, attention_mask, segment_ids, position_ids, layer_key
+                    layer,
+                    x,
+                    attention_mask,
+                    segment_ids,
+                    position_ids,
+                    segment_metadata,
+                    rotary_table,
+                    layer_key,
                 )
                 new_caches.append(None)
             else:
@@ -544,6 +626,8 @@ class MegalodonModel(eqx.Module):
                     deterministic=deterministic,
                     key=layer_key,
                     _cache_validated=cache is not None,
+                    _segment_metadata=segment_metadata,
+                    _rotary_table=rotary_table,
                 )
                 new_caches.append(new_cache)
 
@@ -554,6 +638,7 @@ class MegalodonModel(eqx.Module):
             mask=attention_mask,
             segment_ids=segment_ids,
             _state_validated=cache is not None,
+            _segment_metadata=segment_metadata,
         )
 
         # Build output cache with stop_gradient to prevent accidental backprop

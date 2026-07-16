@@ -19,9 +19,37 @@ TimestepNorm statistic resets all derive from the same predicate, so packed
 documents stay in lockstep across the three mechanisms.
 """
 
+from typing import NamedTuple
+
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Int
+
+
+class SegmentMetadata(NamedTuple):
+    """Derived packed-sequence metadata shared by model layers.
+
+    The arrays are pure functions of ``segment_ids`` and contain no trainable
+    state. Keeping them in one pytree lets the model derive boundary-sensitive
+    inputs once per call while standalone layers can continue deriving them
+    locally.
+    """
+
+    valid: Bool[Array, "batch seq"]
+    boundaries: Bool[Array, "batch seq"]
+    run_ids: Int[Array, "batch seq"]
+    local_positions: Int[Array, "batch seq"]
+
+
+def _runs_and_local_positions(
+    segment_ids: Int[Array, "batch seq"],
+    boundaries: Bool[Array, "batch seq"],
+) -> tuple[Int[Array, "batch seq"], Int[Array, "batch seq"]]:
+    """Derive run IDs and local positions from precomputed boundaries."""
+    run_ids = jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
+    positions = jnp.arange(segment_ids.shape[1], dtype=segment_ids.dtype)[None, :]
+    run_starts = jax.lax.cummax(jnp.where(boundaries, positions, 0), axis=1)
+    return run_ids, positions - run_starts
 
 
 def valid_segment_mask(segment_ids: Int[Array, "batch seq"]) -> Bool[Array, "batch seq"]:
@@ -75,8 +103,23 @@ def segment_runs_and_local_positions(
     :param jax.Array segment_ids: Raw per-token segment ids of shape (batch, seq).
     :return tuple: (run indices starting at 1, position offset within the run).
     """
+    return _runs_and_local_positions(segment_ids, segment_boundaries(segment_ids))
+
+
+def derive_segment_metadata(
+    segment_ids: Int[Array, "batch seq"],
+) -> SegmentMetadata:
+    """Derive all reusable packed-sequence metadata in one pass.
+
+    :param Int[Array, "batch seq"] segment_ids: Per-token segment IDs (0 = padding).
+    :return SegmentMetadata: Validity, reset boundaries, contiguous run IDs, and
+        run-local token positions.
+    """
     boundaries = segment_boundaries(segment_ids)
-    run_ids = jnp.cumsum(boundaries.astype(segment_ids.dtype), axis=1)
-    positions = jnp.arange(segment_ids.shape[1], dtype=segment_ids.dtype)[None, :]
-    run_starts = jax.lax.cummax(jnp.where(boundaries, positions, 0), axis=1)
-    return run_ids, positions - run_starts
+    run_ids, local_positions = _runs_and_local_positions(segment_ids, boundaries)
+    return SegmentMetadata(
+        valid=valid_segment_mask(segment_ids),
+        boundaries=boundaries,
+        run_ids=run_ids,
+        local_positions=local_positions,
+    )

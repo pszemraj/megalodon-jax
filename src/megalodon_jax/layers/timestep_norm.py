@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from megalodon_jax.layers.segments import segment_boundaries, valid_segment_mask
+from megalodon_jax.layers.segments import SegmentMetadata, derive_segment_metadata
 from megalodon_jax.types import NormState
 
 
@@ -246,6 +246,7 @@ class TimestepNorm(eqx.Module):
         segment_ids: Int[Array, "batch seq"] | None = None,
         *,
         _state_validated: bool = False,
+        _segment_metadata: SegmentMetadata | None = None,
     ) -> tuple[Float[Array, "batch seq dim"], NormState]:
         """Normalize a sequence and return its final causal statistic state.
 
@@ -258,6 +259,7 @@ class TimestepNorm(eqx.Module):
         :param Bool[Array, "batch seq"] | None mask: Valid-token mask.
         :param Int[Array, "batch seq"] | None segment_ids: Packed-sequence ids.
         :param bool _state_validated: Internal model-path signal that cache state was checked.
+        :param SegmentMetadata | None _segment_metadata: Internal per-model-call metadata.
         :raises ValueError: If shapes or continuation values are invalid, or packed resets are
             combined with state.
         :raises TypeError: If float16 input is provided.
@@ -305,10 +307,12 @@ class TimestepNorm(eqx.Module):
                 raise ValueError(
                     f"segment_ids must have shape {(batch_size, length)}, got {segment_ids.shape}"
                 )
+            if _segment_metadata is None:
+                _segment_metadata = derive_segment_metadata(segment_ids)
             # Anchor continuation at the last real token, matching ComplexEMA.
-            segment_valid = valid_segment_mask(segment_ids)
+            segment_valid = _segment_metadata.valid
             valid = segment_valid if valid is None else valid & segment_valid
-            boundaries = segment_boundaries(segment_ids)
+            boundaries = _segment_metadata.boundaries
 
         if state is not None and not _state_validated:
             max_increment = (
