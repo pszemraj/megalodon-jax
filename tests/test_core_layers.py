@@ -40,12 +40,10 @@ class TestSegmentHelpers:
         :return None: None.
         """
         segment_ids = jnp.asarray([[1, 1, 2, 2, 1, 1], [1, 1, 1, 0, 0, 2]], dtype=jnp.int32)
-        expected = np.asarray(
-            [
-                [True, False, True, False, True, False],
-                [True, False, False, True, False, True],
-            ]
-        )
+        expected = np.asarray([
+            [True, False, True, False, True, False],
+            [True, False, False, True, False, True],
+        ])
         np.testing.assert_array_equal(np.array(segment_boundaries(segment_ids)), expected)
 
     def test_boundaries_empty_sequence(self) -> None:
@@ -186,9 +184,9 @@ class TestTimestepNorm:
 
         output, state = norm(x)
 
-        expected_output = np.asarray(
-            [[[-1.0, 1.0, -1.0, 1.0], [0.4472136, 1.3416408, 0.4472136, 1.3416408]]]
-        )
+        expected_output = np.asarray([
+            [[-1.0, 1.0, -1.0, 1.0], [0.4472136, 1.3416408, 0.4472136, 1.3416408]]
+        ])
         np.testing.assert_allclose(np.asarray(output), expected_output, atol=2e-6, rtol=2e-6)
         np.testing.assert_array_equal(np.asarray(state.count), [2])
 
@@ -390,12 +388,10 @@ class TestTimestepNorm:
         mask = None
         segment_ids = None
         if mode == "masked":
-            mask = jnp.asarray(
-                [
-                    [True, False, True, True, False, True, True],
-                    [False, True, True, False, True, True, False],
-                ]
-            )
+            mask = jnp.asarray([
+                [True, False, True, True, False, True, True],
+                [False, True, True, False, True, True, False],
+            ])
         elif mode == "packed":
             segment_ids = jnp.asarray(
                 [[0, 1, 1, 2, 2, 1, 0], [3, 3, 0, 4, 4, 4, 5]],
@@ -635,9 +631,16 @@ class TestTimestepNorm:
             dtype=jnp.bool_,
         )
         finite = jax.random.normal(jax.random.PRNGKey(37), (4, 4, 8))
-        nonfinite = jnp.asarray(
-            [jnp.nan, jnp.inf, -jnp.inf, jnp.nan, jnp.inf, -jnp.inf, jnp.nan, jnp.inf]
-        )
+        nonfinite = jnp.asarray([
+            jnp.nan,
+            jnp.inf,
+            -jnp.inf,
+            jnp.nan,
+            jnp.inf,
+            -jnp.inf,
+            jnp.nan,
+            jnp.inf,
+        ])
         x = jnp.where(valid[..., None], finite, nonfinite)
 
         def objective(values: jax.Array) -> jax.Array:
@@ -884,12 +887,10 @@ class TestTimestepNormSegmentReset:
             ],
             dtype=jnp.int32,
         )
-        mask = jnp.asarray(
-            [
-                [True, True, False, True, True, True, True, True],
-                [True, True, False, False, True, True, True, True],
-            ]
-        )
+        mask = jnp.asarray([
+            [True, True, False, True, True, True, True, True],
+            [True, True, False, False, True, True, True, True],
+        ])
 
         _, state = norm(x, mask=mask, segment_ids=segment_ids)
 

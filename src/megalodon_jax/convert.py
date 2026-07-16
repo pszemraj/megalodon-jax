@@ -51,22 +51,20 @@ def _upstream_state_dict_keys(model: MegalodonForCausalLM) -> frozenset[str]:
     for index, layer in enumerate(model.model.layers):
         attn = layer.attn
         ap = f"layers.{index}.mega"
-        keys.update(
-            {
-                f"{ap}.timenorm.prior_count",
-                f"{ap}.timenorm.prior_mean",
-                f"{ap}.timenorm.prior_logv",
-                f"{ap}.timenorm.weight",
-                f"{ap}.timenorm.bias",
-                f"{ap}.cema.alpha",
-                f"{ap}.cema.delta",
-                f"{ap}.cema.theta",
-                f"{ap}.cema.gamma",
-                f"{ap}.cema.omega",
-                f"{ap}.gamma",
-                f"{ap}.beta",
-            }
-        )
+        keys.update({
+            f"{ap}.timenorm.prior_count",
+            f"{ap}.timenorm.prior_mean",
+            f"{ap}.timenorm.prior_logv",
+            f"{ap}.timenorm.weight",
+            f"{ap}.timenorm.bias",
+            f"{ap}.cema.alpha",
+            f"{ap}.cema.delta",
+            f"{ap}.cema.theta",
+            f"{ap}.cema.gamma",
+            f"{ap}.cema.omega",
+            f"{ap}.gamma",
+            f"{ap}.beta",
+        })
         if attn.rmsnorm.gamma is not None:
             keys.add(f"{ap}.rmsnorm.weight")
         for name in ("wz", "wv", "wr", "wh1", "wh2"):

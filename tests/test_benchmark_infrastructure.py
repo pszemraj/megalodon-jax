@@ -68,13 +68,11 @@ def test_cuda_package_provenance_accepts_distribution_naming_variants(
         return versions[distribution]
 
     monkeypatch.setattr(benchmark.importlib.metadata, "version", version)
-    records = benchmark._installed_package_versions(
-        {
-            "cublas": ("nvidia-cublas-cu13", "nvidia-cublas"),
-            "plugin": ("jax-cuda13-plugin",),
-            "missing": ("not-installed",),
-        }
-    )
+    records = benchmark._installed_package_versions({
+        "cublas": ("nvidia-cublas-cu13", "nvidia-cublas"),
+        "plugin": ("jax-cuda13-plugin",),
+        "missing": ("not-installed",),
+    })
     assert records["cublas"]["installed"] == [
         {"distribution": "nvidia-cublas", "version": "13.2.0.9"}
     ]

@@ -2110,12 +2110,10 @@ class TestAttentionMasking:
         v = jax.random.normal(k3, (B, L_kv, H, Dv))
 
         # Fully masked: all keys invalid for batch 0, some valid for batch 1
-        kv_mask = jnp.array(
-            [
-                [False] * L_kv,  # Batch 0: all masked
-                [True] * 4 + [False] * 4,  # Batch 1: first 4 valid
-            ]
-        )
+        kv_mask = jnp.array([
+            [False] * L_kv,  # Batch 0: all masked
+            [True] * 4 + [False] * 4,  # Batch 1: first 4 valid
+        ])
 
         out = attention_single_chunk(q, k, v, kv_mask=kv_mask, causal=False)
 

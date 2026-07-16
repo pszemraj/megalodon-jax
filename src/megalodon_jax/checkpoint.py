@@ -601,13 +601,11 @@ def load_partial_checkpoint(
     model, report = apply_model_state_dict(model, tensors, include=include)
     source_fingerprint = metadata["config_fingerprint"]
     target_fingerprint = config_fingerprint(config)
-    report.update(
-        {
-            "source_config_fingerprint": source_fingerprint,
-            "target_config_fingerprint": target_fingerprint,
-            "exact_config_match": source_fingerprint == target_fingerprint,
-        }
-    )
+    report.update({
+        "source_config_fingerprint": source_fingerprint,
+        "target_config_fingerprint": target_fingerprint,
+        "exact_config_match": source_fingerprint == target_fingerprint,
+    })
     return model, report
 
 
@@ -707,14 +705,12 @@ def _load_cache_payload(
     allowed = {"final_norm"}
     for index in range(config.num_layers):
         prefix = f"layers.{index}"
-        allowed.update(
-            {
-                f"{prefix}.position",
-                f"{prefix}.attn",
-                f"{prefix}.norm",
-                f"{prefix}.ema",
-            }
-        )
+        allowed.update({
+            f"{prefix}.position",
+            f"{prefix}.attn",
+            f"{prefix}.norm",
+            f"{prefix}.ema",
+        })
     unknown = sorted(present - allowed)
     if unknown:
         raise ValueError(f"cache presence metadata has unknown entries: {unknown}")
@@ -731,13 +727,17 @@ def _load_cache_payload(
         if f"{prefix}.position" in present:
             expected_tensor_keys.add(f"{prefix}.position")
         if f"{prefix}.attn" in present:
-            expected_tensor_keys.update(
-                {f"{prefix}.attn.k", f"{prefix}.attn.v", f"{prefix}.attn.count"}
-            )
+            expected_tensor_keys.update({
+                f"{prefix}.attn.k",
+                f"{prefix}.attn.v",
+                f"{prefix}.attn.count",
+            })
         if f"{prefix}.norm" in present:
-            expected_tensor_keys.update(
-                {f"{prefix}.norm.count", f"{prefix}.norm.mean", f"{prefix}.norm.var"}
-            )
+            expected_tensor_keys.update({
+                f"{prefix}.norm.count",
+                f"{prefix}.norm.mean",
+                f"{prefix}.norm.var",
+            })
         if f"{prefix}.ema" in present:
             expected_tensor_keys.update({f"{prefix}.ema.real", f"{prefix}.ema.imag"})
     if "final_norm" in present:
@@ -921,12 +921,10 @@ def save_generation_state(
     destination = Path(path)
     validate_generation_state_host(state, config)
     tensors, present = _cache_tensors(state.cache)
-    tensors.update(
-        {
-            "generation.next_logits": state.next_logits,
-            "generation.finished": state.finished,
-        }
-    )
+    tensors.update({
+        "generation.next_logits": state.next_logits,
+        "generation.finished": state.finished,
+    })
     metadata = {
         "format": GENERATION_STATE_FORMAT,
         "format_version": GENERATION_STATE_FORMAT_VERSION,

@@ -1269,17 +1269,15 @@ def main() -> int:
                 loss_error = abs(float(jax_loss) - float(torch_loss.detach()))
                 step_pass = max_parameter_error <= 3e-6 and loss_error <= 2e-3
                 passed = passed and step_pass
-                step_results.append(
-                    {
-                        "step": step,
-                        "jax_loss": float(jax_loss),
-                        "torch_loss": float(torch_loss.detach()),
-                        "absolute_loss_error": loss_error,
-                        "max_abs_parameter_error": max_parameter_error,
-                        "worst_parameter": max(parameter_errors, key=parameter_errors.get),
-                        "passed": step_pass,
-                    }
-                )
+                step_results.append({
+                    "step": step,
+                    "jax_loss": float(jax_loss),
+                    "torch_loss": float(torch_loss.detach()),
+                    "absolute_loss_error": loss_error,
+                    "max_abs_parameter_error": max_parameter_error,
+                    "worst_parameter": max(parameter_errors, key=parameter_errors.get),
+                    "passed": step_pass,
+                })
 
             return (
                 passed,
@@ -1415,18 +1413,16 @@ def main() -> int:
     for path, leaf in parameters.items():
         shape = tuple(int(size) for size in leaf.shape)
         count = int(np.prod(shape, dtype=np.int64))
-        parameter_inventory.append(
-            {
-                "path": path,
-                "shape": shape,
-                "dtype": str(leaf.dtype),
-                "count": count,
-                "trainable": True,
-                "initializer": initializer_contract(path),
-                "upstream_counterpart": upstream_parameter_path(path),
-                "classification": "parameter",
-            }
-        )
+        parameter_inventory.append({
+            "path": path,
+            "shape": shape,
+            "dtype": str(leaf.dtype),
+            "count": count,
+            "trainable": True,
+            "initializer": initializer_contract(path),
+            "upstream_counterpart": upstream_parameter_path(path),
+            "classification": "parameter",
+        })
     total_parameters = sum(entry["count"] for entry in parameter_inventory)
     derived_buffers = [
         {

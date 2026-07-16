@@ -783,13 +783,11 @@ def _environment(jax: Any, eqx: Any, np: Any) -> dict[str, Any]:
         "XLA_FLAGS",
     )
     relevant_environment = {key: os.environ.get(key) for key in fixed_environment}
-    relevant_environment.update(
-        {
-            key: value
-            for key, value in sorted(os.environ.items())
-            if key.startswith("JAX_") and key not in relevant_environment
-        }
-    )
+    relevant_environment.update({
+        key: value
+        for key, value in sorted(os.environ.items())
+        if key.startswith("JAX_") and key not in relevant_environment
+    })
     nvidia_smi = _command_provenance(("nvidia-smi",))
     try:
         jax_environment_info = jax.print_environment_info(return_string=True)
@@ -1108,14 +1106,12 @@ def _cache_counts(cache: Any, jax: Any, np: Any) -> list[dict[str, Any]]:
                 child = getattr(value, field.name)
                 child_path = f"{path}.{field.name}" if path else field.name
                 if field.name in {"count", "position"} and hasattr(child, "shape"):
-                    records.append(
-                        {
-                            "path": child_path,
-                            "dtype": str(child.dtype),
-                            "shape": list(child.shape),
-                            "values": _jsonable(np.asarray(jax.device_get(child))),
-                        }
-                    )
+                    records.append({
+                        "path": child_path,
+                        "dtype": str(child.dtype),
+                        "shape": list(child.shape),
+                        "values": _jsonable(np.asarray(jax.device_get(child))),
+                    })
                 else:
                     visit(child, child_path)
             return

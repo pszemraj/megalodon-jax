@@ -55,13 +55,11 @@ step_dir.mkdir(parents=True, exist_ok=False)
 save_checkpoint(model, step_dir / "model.safetensors")
 eqx.tree_serialise_leaves(step_dir / "optimizer.eqx", opt_state)
 (step_dir / "training-state.json").write_text(
-    json.dumps(
-        {
-            "format_version": 1,
-            "step": 100,
-            "config_fingerprint": config_fingerprint(model.config),
-        }
-    )
+    json.dumps({
+        "format_version": 1,
+        "step": 100,
+        "config_fingerprint": config_fingerprint(model.config),
+    })
     + "\n",
     encoding="utf-8",
 )

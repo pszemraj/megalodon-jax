@@ -126,10 +126,12 @@ import equinox as eqx
 labels = input_ids  # For causal LM, labels = input_ids
 loss = model.compute_loss(input_ids, labels)
 
+
 # Gradient computation
 @eqx.filter_grad
 def loss_fn(model, input_ids, labels):
     return model.compute_loss(input_ids, labels)
+
 
 grads = loss_fn(model, input_ids, labels)
 ```

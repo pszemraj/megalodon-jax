@@ -928,38 +928,36 @@ class TestConversion:
         for index in range(2):
             ap = f"layers.{index}.mega"
             fp = f"layers.{index}.nffn"
-            manifest.update(
-                {
-                    f"{ap}.timenorm.prior_count": ((), torch.int64, None),
-                    f"{ap}.timenorm.prior_mean": ((2,), torch.float32, 0),
-                    f"{ap}.timenorm.prior_logv": ((2,), torch.float32, 0),
-                    f"{ap}.timenorm.weight": ((8,), torch.float32, 0),
-                    f"{ap}.timenorm.bias": ((8,), torch.float32, 0),
-                    f"{ap}.cema.alpha": ((8, 2, 1), torch.float32, 0),
-                    f"{ap}.cema.delta": ((8, 2, 1), torch.float32, 0),
-                    f"{ap}.cema.theta": ((8, 1, 1), torch.float32, 0),
-                    f"{ap}.cema.gamma": ((8, 2, 2), torch.float32, 0),
-                    f"{ap}.cema.omega": ((8, 1), torch.float32, 0),
-                    f"{ap}.rmsnorm.weight": ((8,), torch.float32, None),
-                    f"{ap}.wz.weight": ((8, 8), torch.float32, 0),
-                    f"{ap}.wz.bias": ((8,), torch.float32, 0),
-                    f"{ap}.wv.weight": ((8, 8), torch.float32, 0),
-                    f"{ap}.wv.bias": ((8,), torch.float32, 0),
-                    f"{ap}.wr.weight": ((8, 8), torch.float32, 0),
-                    f"{ap}.wr.bias": ((8,), torch.float32, 0),
-                    f"{ap}.wh1.weight": ((8, 8), torch.float32, 0),
-                    f"{ap}.wh1.bias": ((8,), torch.float32, 0),
-                    f"{ap}.wh2.weight": ((8, 8), torch.float32, 1),
-                    f"{ap}.gamma": ((2, 8), torch.float32, 1),
-                    f"{ap}.beta": ((2, 8), torch.float32, 1),
-                    f"{fp}.norm.weight": ((8,), torch.float32, None),
-                    f"{fp}.norm.bias": ((8,), torch.float32, None),
-                    f"{fp}.fc1.weight": ((12, 8), torch.float32, 0),
-                    f"{fp}.fc2.weight": ((8, 12), torch.float32, 1),
-                    f"{fp}.fc3.weight": ((12, 8), torch.float32, 0),
-                    f"{fp}.alpha": ((8,), torch.float32, None),
-                }
-            )
+            manifest.update({
+                f"{ap}.timenorm.prior_count": ((), torch.int64, None),
+                f"{ap}.timenorm.prior_mean": ((2,), torch.float32, 0),
+                f"{ap}.timenorm.prior_logv": ((2,), torch.float32, 0),
+                f"{ap}.timenorm.weight": ((8,), torch.float32, 0),
+                f"{ap}.timenorm.bias": ((8,), torch.float32, 0),
+                f"{ap}.cema.alpha": ((8, 2, 1), torch.float32, 0),
+                f"{ap}.cema.delta": ((8, 2, 1), torch.float32, 0),
+                f"{ap}.cema.theta": ((8, 1, 1), torch.float32, 0),
+                f"{ap}.cema.gamma": ((8, 2, 2), torch.float32, 0),
+                f"{ap}.cema.omega": ((8, 1), torch.float32, 0),
+                f"{ap}.rmsnorm.weight": ((8,), torch.float32, None),
+                f"{ap}.wz.weight": ((8, 8), torch.float32, 0),
+                f"{ap}.wz.bias": ((8,), torch.float32, 0),
+                f"{ap}.wv.weight": ((8, 8), torch.float32, 0),
+                f"{ap}.wv.bias": ((8,), torch.float32, 0),
+                f"{ap}.wr.weight": ((8, 8), torch.float32, 0),
+                f"{ap}.wr.bias": ((8,), torch.float32, 0),
+                f"{ap}.wh1.weight": ((8, 8), torch.float32, 0),
+                f"{ap}.wh1.bias": ((8,), torch.float32, 0),
+                f"{ap}.wh2.weight": ((8, 8), torch.float32, 1),
+                f"{ap}.gamma": ((2, 8), torch.float32, 1),
+                f"{ap}.beta": ((2, 8), torch.float32, 1),
+                f"{fp}.norm.weight": ((8,), torch.float32, None),
+                f"{fp}.norm.bias": ((8,), torch.float32, None),
+                f"{fp}.fc1.weight": ((12, 8), torch.float32, 0),
+                f"{fp}.fc2.weight": ((8, 12), torch.float32, 1),
+                f"{fp}.fc3.weight": ((12, 8), torch.float32, 0),
+                f"{fp}.alpha": ((8,), torch.float32, None),
+            })
 
         exported = export_upstream_state_dict(model)
         assert set(exported) == set(manifest)
@@ -1518,9 +1516,9 @@ class TestConversion:
             load_inference_cache(presence_path, config)
 
         partial_presence = dict(metadata)
-        partial_presence["present_json"] = json.dumps(
-            [item for item in present if item not in {"layers.0.attn", "layers.0.ema"}]
-        )
+        partial_presence["present_json"] = json.dumps([
+            item for item in present if item not in {"layers.0.attn", "layers.0.ema"}
+        ])
         partial_path = tmp_path / "partial-presence.safetensors"
         save_file(tensors, str(partial_path), metadata=partial_presence)
         with pytest.raises(ValueError, match=CACHE_INVARIANT_MESSAGE):

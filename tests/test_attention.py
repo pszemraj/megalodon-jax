@@ -550,12 +550,10 @@ class TestAttentionPrimitives:
         q = jax.random.normal(kq, (batch, length, heads, head_dim))
         k = jax.random.normal(kk, (batch, length, heads, head_dim))
         v = jax.random.normal(kv, (batch, length, heads, value_dim))
-        mask = jnp.asarray(
-            [
-                [True, False, True, True, True, True, False, True, True, False, True, True],
-                [True, True, False, True, False, True, True, True, True, True, False, True],
-            ]
-        )
+        mask = jnp.asarray([
+            [True, False, True, True, True, True, False, True, True, False, True, True],
+            [True, True, False, True, False, True, True, True, True, True, False, True],
+        ])
         rotary = RotaryEmbedding(dim=head_dim)
 
         full = attention_multi_chunk(

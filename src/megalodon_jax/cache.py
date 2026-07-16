@@ -133,19 +133,17 @@ def layer_cache_invariant_violation(
         jnp.complex64,
     )
 
-    return _any(
-        [
-            cache.position < 0,
-            cache.attn.count != cache.position,
-            jnp.any(cache.norm.count != cache.position),
-            cache.position > jnp.iinfo(jnp.int32).max - increment,
-            jnp.any(~jnp.isfinite(cache.norm.mean)),
-            jnp.any(~jnp.isfinite(cache.norm.var)),
-            jnp.any(cache.norm.var < 0.0),
-            # Allocated history at position zero is not the sparse initializer.
-            cache.position == 0,
-        ]
-    )
+    return _any([
+        cache.position < 0,
+        cache.attn.count != cache.position,
+        jnp.any(cache.norm.count != cache.position),
+        cache.position > jnp.iinfo(jnp.int32).max - increment,
+        jnp.any(~jnp.isfinite(cache.norm.mean)),
+        jnp.any(~jnp.isfinite(cache.norm.var)),
+        jnp.any(cache.norm.var < 0.0),
+        # Allocated history at position zero is not the sparse initializer.
+        cache.position == 0,
+    ])
 
 
 def classify_model_cache(
@@ -306,13 +304,11 @@ def cache_invariant_violation(
     counters = [*positions, *attention_counts, *(state.count for state in norm_states)]
     violations = [jnp.any(counter < 0) for counter in counters]
     for state in norm_states:
-        violations.extend(
-            (
-                jnp.any(~jnp.isfinite(state.mean)),
-                jnp.any(~jnp.isfinite(state.var)),
-                jnp.any(state.var < 0.0),
-            )
-        )
+        violations.extend((
+            jnp.any(~jnp.isfinite(state.mean)),
+            jnp.any(~jnp.isfinite(state.var)),
+            jnp.any(state.var < 0.0),
+        ))
     violations.extend(jnp.any(~jnp.isfinite(value)) for value in ema_states)
     if check_full_payload:
         violations.extend(jnp.any(~jnp.isfinite(value)) for value in attention_arrays)
@@ -321,13 +317,11 @@ def cache_invariant_violation(
         """Check state that affects computation when the timeline is zero."""
         pristine_checks: list[Array] = []
         for state in norm_states:
-            pristine_checks.extend(
-                (
-                    jnp.any(state.count != 0),
-                    jnp.any(state.mean != 0.0),
-                    jnp.any(state.var != 1.0),
-                )
-            )
+            pristine_checks.extend((
+                jnp.any(state.count != 0),
+                jnp.any(state.mean != 0.0),
+                jnp.any(state.var != 1.0),
+            ))
         pristine_checks.extend(jnp.any(state != 0.0) for state in ema_states)
         return _any(pristine_checks)
 

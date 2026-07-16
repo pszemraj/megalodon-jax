@@ -706,7 +706,8 @@ class ChunkedAttention(eqx.Module):
         )
         slots = absolute_times % capacity
         cache_k = (
-            jnp.zeros(
+            jnp
+            .zeros(
                 (batch, capacity, self.num_heads, self.head_dim),
                 dtype=k.dtype,
             )
@@ -714,7 +715,8 @@ class ChunkedAttention(eqx.Module):
             .set(k_tail_rot)
         )
         cache_v = (
-            jnp.zeros(
+            jnp
+            .zeros(
                 (batch, capacity, self.num_heads, self.value_head_dim),
                 dtype=v.dtype,
             )

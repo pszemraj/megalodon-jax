@@ -132,9 +132,11 @@ model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(0))
 optimizer = optax.adamw(learning_rate=1e-4, weight_decay=0.1)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
 
+
 @eqx.filter_value_and_grad
 def loss_fn(candidate, input_ids, labels, key):
     return candidate.compute_loss(input_ids, labels, deterministic=False, key=key)
+
 
 def train_step(candidate, state, input_ids, labels, key):
     loss, grads = loss_fn(candidate, input_ids, labels, key)
