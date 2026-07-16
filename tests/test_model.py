@@ -475,6 +475,104 @@ class TestMegalodonForCausalLM:
         assert jnp.isfinite(loss)
         assert loss > 0
 
+    @pytest.mark.fast
+    @pytest.mark.parametrize("share_emb", [False, True])
+    def test_memory_bounded_loss_matches_full_logits(
+        self,
+        share_emb: bool,
+        random_seed: int,
+    ) -> None:
+        """Chunked logits preserve packed loss, counts, and model gradients."""
+        config = small_config(
+            vocab_size=67,
+            num_layers=1,
+            share_emb=share_emb,
+            compute_dtype=jnp.bfloat16,
+        )
+        model = MegalodonForCausalLM(config, key=jax.random.PRNGKey(random_seed))
+        input_ids = jnp.asarray(
+            [
+                [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                [9, 8, 7, 6, 5, 4, 3, 2, 1],
+            ],
+            dtype=jnp.int32,
+        )
+        labels = input_ids.at[0, 6].set(-100)
+        attention_mask = jnp.asarray(
+            [
+                [True] * 9,
+                [True] * 8 + [False],
+            ],
+            dtype=jnp.bool_,
+        )
+        segment_ids = jnp.asarray(
+            [
+                [1, 1, 1, 1, 2, 2, 2, 2, 2],
+                [3, 3, 3, 3, 3, 4, 4, 4, 0],
+            ],
+            dtype=jnp.int32,
+        )
+
+        for reduction in ("none", "sum", "mean"):
+            expected, expected_count = model.compute_loss(
+                input_ids,
+                labels,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                reduction=reduction,
+                return_valid_count=True,
+            )
+            actual, actual_count = model.compute_loss(
+                input_ids,
+                labels,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                reduction=reduction,
+                return_valid_count=True,
+                loss_chunk_size=3,
+            )
+            np.testing.assert_allclose(
+                np.asarray(actual),
+                np.asarray(expected),
+                rtol=2e-2,
+                atol=8e-2,
+            )
+            np.testing.assert_array_equal(np.asarray(actual_count), np.asarray(expected_count))
+
+        def full_loss(candidate: MegalodonForCausalLM) -> jax.Array:
+            return candidate.compute_loss(
+                input_ids,
+                labels,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+            )
+
+        def bounded_loss(candidate: MegalodonForCausalLM) -> jax.Array:
+            return candidate.compute_loss(
+                input_ids,
+                labels,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                loss_chunk_size=3,
+            )
+
+        expected_loss, expected_grads = eqx.filter_jit(eqx.filter_value_and_grad(full_loss))(model)
+        actual_loss, actual_grads = eqx.filter_jit(eqx.filter_value_and_grad(bounded_loss))(model)
+        np.testing.assert_allclose(actual_loss, expected_loss, rtol=2e-2, atol=8e-2)
+        expected_leaves = [
+            leaf for leaf in jax.tree_util.tree_leaves(expected_grads) if eqx.is_inexact_array(leaf)
+        ]
+        actual_leaves = [
+            leaf for leaf in jax.tree_util.tree_leaves(actual_grads) if eqx.is_inexact_array(leaf)
+        ]
+        for actual, expected in zip(actual_leaves, expected_leaves, strict=True):
+            np.testing.assert_allclose(
+                np.asarray(actual),
+                np.asarray(expected),
+                rtol=2e-2,
+                atol=4e-3,
+            )
+
     def test_compute_loss_validates_label_schema(self, random_seed: int) -> None:
         """Loss labels must match inputs and use discrete token IDs."""
         config = small_config()
@@ -487,6 +585,12 @@ class TestMegalodonForCausalLM:
             model.compute_loss(input_ids, input_ids.astype(jnp.float32))
         with pytest.raises(ValueError, match="reduction must be"):
             model.compute_loss(input_ids, input_ids, reduction="median")  # type: ignore[arg-type]
+        for invalid in (True, 1.5, "4"):
+            with pytest.raises(TypeError, match="loss_chunk_size must be an integer or None"):
+                model.compute_loss(input_ids, input_ids, loss_chunk_size=invalid)  # type: ignore[arg-type]
+        for invalid in (0, -1):
+            with pytest.raises(ValueError, match="loss_chunk_size must be positive"):
+                model.compute_loss(input_ids, input_ids, loss_chunk_size=invalid)
 
 
 # -----------------------------------------------------------------------------
@@ -1545,11 +1649,12 @@ class TestEdgeCases:
         input_ids = jnp.zeros((2, 0), dtype=jnp.int32)
         labels = jnp.zeros((2, 0), dtype=jnp.int32)
 
-        loss = model.compute_loss(input_ids, labels)
+        for loss_chunk_size in (None, 2):
+            loss = model.compute_loss(input_ids, labels, loss_chunk_size=loss_chunk_size)
 
-        # Should return 0.0, not NaN
-        assert loss == 0.0, f"Empty sequence loss should be 0.0, got {loss}"
-        assert not jnp.isnan(loss), "Empty sequence loss should not be NaN"
+            # Should return 0.0, not NaN
+            assert loss == 0.0, f"Empty sequence loss should be 0.0, got {loss}"
+            assert not jnp.isnan(loss), "Empty sequence loss should not be NaN"
 
     def test_compute_loss_single_token_seq1(self, random_seed: int) -> None:
         """Test compute_loss returns 0.0 for single-token sequences (seq=1).
@@ -1568,12 +1673,13 @@ class TestEdgeCases:
         input_ids = jnp.ones((2, 1), dtype=jnp.int32)
         labels = jnp.ones((2, 1), dtype=jnp.int32)
 
-        loss = model.compute_loss(input_ids, labels)
+        for loss_chunk_size in (None, 2):
+            loss = model.compute_loss(input_ids, labels, loss_chunk_size=loss_chunk_size)
 
-        # Should return 0.0, not NaN
-        assert loss == 0.0, f"Single-token sequence loss should be 0.0, got {loss}"
-        assert not jnp.isnan(loss), "Single-token sequence loss should not be NaN"
-        assert loss.dtype == config.loss_softmax_dtype
+            # Should return 0.0, not NaN
+            assert loss == 0.0, f"Single-token sequence loss should be 0.0, got {loss}"
+            assert not jnp.isnan(loss), "Single-token sequence loss should not be NaN"
+            assert loss.dtype == config.loss_softmax_dtype
 
     def test_cache_rejects_attention_mask_metadata(self, random_seed: int) -> None:
         """Cached calls require an unmasked generation batch.

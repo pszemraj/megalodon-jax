@@ -154,6 +154,39 @@ loss_sum, valid_count = model.compute_loss(
 )
 ```
 
+## Memory-bounded loss head
+
+`compute_loss(..., loss_chunk_size=N)` is an opt-in training path for shapes where FP32 vocabulary logits constrain the usable batch or sequence length. The ordinary path materializes logits with shape `(batch, sequence, vocabulary)`; for `B=4`, `L=4096`, and `V=32000`, one such FP32 tensor is about 2 GiB before backward storage and compiler workspace.
+
+The bounded path runs the model body once, flattens the shifted hidden states across batch and sequence, and uses a static `lax.scan` to project at most `N` token states per iteration. The projection and cross-entropy body is rematerialized during backward, so vocabulary-sized chunk intermediates are recomputed instead of retained across the scan. Only the loss head is chunked: attention, CEMA, TimestepNorm, packed-document isolation, masks, label shifting, reductions, and valid-token counts keep the same contracts.
+
+```python
+loss = model.compute_loss(
+    input_ids,
+    labels,
+    segment_ids=segment_ids,
+    loss_chunk_size=64,
+)
+```
+
+`loss_chunk_size` counts shifted token states across the flattened batch, not attention chunks or documents. It must be a positive static integer and specializes the compiled loss function. `None` remains the default and preserves the unbounded full-logits path. `reduction="none"`, `"sum"`, and `"mean"` are all supported, as is `return_valid_count=True`; normal `model(...)` calls always return complete FP32 logits.
+
+Choose the largest chunk that fits the target training shape. Smaller chunks bound head intermediates more aggressively but may reduce matrix-multiplication efficiency and repeat more work during backward. Compare compiler temporaries, observed device peak, and synchronized forward/backward time rather than assuming one portable value. The production benchmark accepts the same switch:
+
+```bash
+conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
+  --repo current=. \
+  --suite training \
+  --training-operations forward_backward \
+  --training-modes plain,packed \
+  --training-lengths 2048 \
+  --training-batches 1 \
+  --loss-chunk-size 64 \
+  --output local-scratch/model-paths-loss-chunk-64.json
+```
+
+Run an otherwise identical report without `--loss-chunk-size` for the full-logits baseline. Keep model topology, dtype policy, seed, warmups, iterations, compiler configuration, and GPU workload identical between reports.
+
 ## Single-host data parallelism
 
 JAX named sharding can split only the leading batch axis while replicating the mixed-dtype model and optimizer state. Attached shardings are honored by the filtered JIT-compiled step, and the global mean in `compute_loss` reduces across the complete sharded batch. No explicit `pmean` is needed with this global-array form.

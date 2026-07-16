@@ -150,9 +150,10 @@ def test_training_case_reuses_stable_dropout_key(monkeypatch: pytest.MonkeyPatch
             key: object,
             **kwargs: object,
         ) -> jax.Array:
-            del args, kwargs
+            del args
             assert deterministic is False
             assert key is not None
+            assert kwargs["loss_chunk_size"] == 2
             observed_keys.append(np.asarray(key))
             return jnp.asarray(1.25, dtype=jnp.float32)
 
@@ -176,6 +177,7 @@ def test_training_case_reuses_stable_dropout_key(monkeypatch: pytest.MonkeyPatch
         "iterations": 1,
         "atol": 0.0,
         "rtol": 0.0,
+        "loss_chunk_size": 2,
     }
     tokens = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
     inputs = {

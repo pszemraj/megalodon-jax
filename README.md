@@ -132,6 +132,8 @@ def loss_fn(model, input_ids, labels):
 grads = loss_fn(model, input_ids, labels)
 ```
 
+When the full FP32 vocabulary logits limit training memory, opt into the rematerialized loss head with `model.compute_loss(input_ids, labels, loss_chunk_size=64)`. This bounds the number of shifted token states projected at once; ordinary `model(...)` calls still return complete logits. See [Dtypes and numerical stability](docs/dtypes-and-stability.md#memory-bounded-loss-head) for the tradeoff and benchmark procedure.
+
 ### Packed-sequence training
 
 Multiple documents can share one row by passing segment and position metadata:

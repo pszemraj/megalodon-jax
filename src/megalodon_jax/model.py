@@ -19,6 +19,7 @@ This module contains the complete model assembly:
 - MegalodonForCausalLM: Model wrapper with tied LM head
 """
 
+import operator
 from typing import Any, ClassVar, Literal
 
 import equinox as eqx
@@ -59,6 +60,33 @@ def _require_dropout_key(
             "PRNG key required when deterministic=False and dropout is enabled. "
             "Pass a key via `key=jax.random.PRNGKey(...)` or set deterministic=True."
         )
+
+
+def _loss_head_chunk(
+    model: "MegalodonForCausalLM",
+    hidden: Float[Array, "tokens dim"],
+    safe_labels: Int[Array, "tokens"],
+    valid_mask: Bool[Array, "tokens"],
+) -> Float[Array, "tokens"]:
+    """Project one hidden-state chunk and return its masked token losses."""
+    logits = model._project_logits(hidden[None, :, :])[0]
+    softmax_dtype = model.config.loss_softmax_dtype
+    log_probs = jax.nn.log_softmax(logits.astype(softmax_dtype), axis=-1)
+    target_log_probs = jnp.take_along_axis(log_probs, safe_labels[:, None], axis=-1)[:, 0]
+    return -jnp.where(
+        valid_mask,
+        target_log_probs,
+        jnp.zeros((), dtype=softmax_dtype),
+    )
+
+
+# Inside a scan, preventing CSE adds overhead without protecting distinct Python
+# call sites. Rematerialization is the desired contract: vocabulary-sized chunk
+# intermediates are recomputed during backward rather than retained across chunks.
+_rematerialized_loss_head_chunk = eqx.filter_checkpoint(
+    _loss_head_chunk,
+    prevent_cse=False,
+)
 
 
 @eqx.filter_checkpoint
@@ -607,6 +635,70 @@ class MegalodonForCausalLM(eqx.Module):
             lm_head = eqx.tree_at(lambda h: h.weight, lm_head, new_weight)
             self.lm_head = lm_head
 
+    def _project_logits(
+        self,
+        hidden: Float[Array, "batch seq dim"],
+    ) -> Float[Array, "batch seq vocab"]:
+        """Project hidden states to the configured FP32 vocabulary output."""
+        weight = self.model.embed.weight if self.tied else self.lm_head.weight
+        return matmul_3d_weight(
+            hidden,
+            weight,
+            self.config.compute_dtype,
+            self.config.accum_dtype,
+            output_dtype=jnp.float32,
+        )
+
+    def _bounded_token_loss(
+        self,
+        hidden: Float[Array, "batch seq dim"],
+        safe_labels: Int[Array, "batch seq"],
+        valid_mask: Bool[Array, "batch seq"],
+        chunk_size: int,
+    ) -> Float[Array, "batch seq"]:
+        """Evaluate rematerialized vocabulary projections over static token chunks."""
+        batch_size, sequence_length, hidden_dim = hidden.shape
+        token_count = batch_size * sequence_length
+        if token_count == 0:
+            return jnp.zeros(
+                (batch_size, sequence_length),
+                dtype=self.config.loss_softmax_dtype,
+            )
+
+        padding = (-token_count) % chunk_size
+        flat_hidden = hidden.reshape(token_count, hidden_dim)
+        flat_labels = safe_labels.reshape(token_count)
+        flat_mask = valid_mask.reshape(token_count)
+        if padding:
+            flat_hidden = jnp.pad(flat_hidden, ((0, padding), (0, 0)))
+            flat_labels = jnp.pad(flat_labels, ((0, padding),))
+            flat_mask = jnp.pad(flat_mask, ((0, padding),))
+
+        num_chunks = (token_count + padding) // chunk_size
+        hidden_chunks = flat_hidden.reshape(num_chunks, chunk_size, hidden_dim)
+        label_chunks = flat_labels.reshape(num_chunks, chunk_size)
+        mask_chunks = flat_mask.reshape(num_chunks, chunk_size)
+
+        def scan_chunk(
+            carry: None,
+            inputs: tuple[jax.Array, jax.Array, jax.Array],
+        ) -> tuple[None, jax.Array]:
+            hidden_chunk, label_chunk, mask_chunk = inputs
+            token_loss = _rematerialized_loss_head_chunk(
+                self,
+                hidden_chunk,
+                label_chunk,
+                mask_chunk,
+            )
+            return carry, token_loss
+
+        _, loss_chunks = jax.lax.scan(
+            scan_chunk,
+            None,
+            (hidden_chunks, label_chunks, mask_chunks),
+        )
+        return loss_chunks.reshape(-1)[:token_count].reshape(batch_size, sequence_length)
+
     def __call__(
         self,
         input_ids: Int[Array, "batch seq"],
@@ -644,28 +736,7 @@ class MegalodonForCausalLM(eqx.Module):
             key=key,
         )
 
-        compute_dtype = self.config.compute_dtype
-        accum_dtype = self.config.accum_dtype
-        if self.tied:
-            # Weight-tied projection
-            logits = matmul_3d_weight(
-                hidden,
-                self.model.embed.weight,
-                compute_dtype,
-                accum_dtype,
-                output_dtype=jnp.float32,
-            )
-        else:
-            # Separate LM head
-            logits = matmul_3d_weight(
-                hidden,
-                self.lm_head.weight,
-                compute_dtype,
-                accum_dtype,
-                output_dtype=jnp.float32,
-            )
-
-        return logits, cache
+        return self._project_logits(hidden), cache
 
     def compute_loss(
         self,
@@ -679,6 +750,7 @@ class MegalodonForCausalLM(eqx.Module):
         key: PRNGKeyArray | None = None,
         reduction: Literal["mean", "sum", "none"] = "mean",
         return_valid_count: bool = False,
+        loss_chunk_size: int | None = None,
     ) -> Float[Array, "..."] | tuple[Float[Array, "..."], Int[Array, ""]]:
         """Compute causal LM loss with label shifting.
 
@@ -702,6 +774,13 @@ class MegalodonForCausalLM(eqx.Module):
         accumulation across microbatches; set ``return_valid_count=True`` to
         return the corresponding valid-token denominator alongside any reduction.
 
+        Set ``loss_chunk_size`` to a positive token count to avoid materializing
+        the full ``(batch, sequence, vocabulary)`` FP32 logits tensor. The model
+        body still runs once over the complete input; only the output projection
+        and cross-entropy are scanned over rematerialized token chunks. This is a
+        memory-throughput tradeoff intended for training shapes where logits are
+        the limiting activation. It does not change the logits-returning forward API.
+
         :param Int[Array, "batch seq"] input_ids: Input token IDs.
         :param Int[Array, "batch seq"] labels: Target token IDs.
         :param Bool[Array, "batch seq"] | None attention_mask: Optional target-position
@@ -715,9 +794,12 @@ class MegalodonForCausalLM(eqx.Module):
         :param PRNGKeyArray | None key: Optional dropout key.
         :param Literal["mean", "sum", "none"] reduction: Loss reduction.
         :param bool return_valid_count: Whether to also return the number of valid targets.
-        :raises TypeError: If labels do not have an integer dtype.
+        :param int | None loss_chunk_size: Maximum shifted token states projected to the
+            vocabulary at once. ``None`` uses the ordinary full-logits path.
+        :raises TypeError: If labels do not have an integer dtype or loss_chunk_size is
+            not an integer.
         :raises ValueError: If labels do not match the input shape, reduction is invalid,
-            or dropout lacks a key.
+            loss_chunk_size is non-positive, or dropout lacks a key.
         :return Float[Array, "..."] | tuple[Float[Array, "..."], Int[Array, ""]]:
             Reduced or per-token cross-entropy, optionally paired with its valid-token count.
         """
@@ -730,20 +812,42 @@ class MegalodonForCausalLM(eqx.Module):
             raise TypeError(f"labels must have integer dtype, got {labels.dtype}")
         if reduction not in ("mean", "sum", "none"):
             raise ValueError(f"reduction must be 'mean', 'sum', or 'none', got {reduction!r}")
+        if isinstance(loss_chunk_size, bool):
+            raise TypeError("loss_chunk_size must be an integer or None, got bool")
+        if loss_chunk_size is not None:
+            try:
+                loss_chunk_size = operator.index(loss_chunk_size)
+            except TypeError as exc:
+                raise TypeError("loss_chunk_size must be an integer or None") from exc
+            if loss_chunk_size <= 0:
+                raise ValueError("loss_chunk_size must be positive")
 
-        logits, _ = self(
-            input_ids,
-            attention_mask=attention_mask,
-            segment_ids=segment_ids,
-            position_ids=position_ids,
-            cache=None,
-            return_cache=False,
-            deterministic=deterministic,
-            key=key,
-        )
+        if loss_chunk_size is None:
+            logits, _ = self(
+                input_ids,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+                cache=None,
+                return_cache=False,
+                deterministic=deterministic,
+                key=key,
+            )
+            shifted_values = logits[:, :-1, :]
+        else:
+            hidden, _ = self.model(
+                input_ids,
+                attention_mask=attention_mask,
+                segment_ids=segment_ids,
+                position_ids=position_ids,
+                cache=None,
+                return_cache=False,
+                deterministic=deterministic,
+                key=key,
+            )
+            shifted_values = hidden[:, :-1, :]
 
-        # Shift for causal LM: predict next token
-        shift_logits = logits[:, :-1, :]  # (B, L-1, V)
+        # Shift for causal LM: position i predicts position i+1.
         shift_labels = labels[:, 1:]  # (B, L-1)
 
         softmax_dtype = self.config.loss_softmax_dtype
@@ -763,7 +867,7 @@ class MegalodonForCausalLM(eqx.Module):
 
         # Validate label bounds only on positions that will be used
         # Prevents silent wrong gradients from JAX index wrapping
-        vocab_size = shift_logits.shape[-1]
+        vocab_size = self.config.effective_output_size
         # Check: any valid position has out-of-bounds label?
         has_invalid_labels = jnp.any(
             valid_mask & ((shift_labels < 0) | (shift_labels >= vocab_size))
@@ -777,17 +881,25 @@ class MegalodonForCausalLM(eqx.Module):
         # Replace ignored labels with 0 for safe indexing (will be masked out)
         safe_labels = jnp.where(valid_mask, shift_labels, 0)
 
-        # Cross-entropy loss
-        shift_logits_softmax = shift_logits.astype(softmax_dtype)
-        log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
-        B, L, _ = log_probs.shape
-
-        # Gather log prob of correct token
-        batch_idx = jnp.arange(B)[:, None]
-        seq_idx = jnp.arange(L)[None, :]
-        target_log_probs = log_probs[batch_idx, seq_idx, safe_labels]
-
-        token_loss = -jnp.where(valid_mask, target_log_probs, jnp.zeros((), dtype=softmax_dtype))
+        if loss_chunk_size is None:
+            shift_logits_softmax = shifted_values.astype(softmax_dtype)
+            log_probs = jax.nn.log_softmax(shift_logits_softmax, axis=-1)
+            batch_size, sequence_length, _ = log_probs.shape
+            batch_index = jnp.arange(batch_size)[:, None]
+            sequence_index = jnp.arange(sequence_length)[None, :]
+            target_log_probs = log_probs[batch_index, sequence_index, safe_labels]
+            token_loss = -jnp.where(
+                valid_mask,
+                target_log_probs,
+                jnp.zeros((), dtype=softmax_dtype),
+            )
+        else:
+            token_loss = self._bounded_token_loss(
+                shifted_values,
+                safe_labels,
+                valid_mask,
+                loss_chunk_size,
+            )
         valid_count = valid_mask.sum()
         if reduction == "none":
             loss = token_loss

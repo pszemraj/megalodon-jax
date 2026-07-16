@@ -359,6 +359,7 @@ def _build_cases(
         if args.atol is None and args.rtol is None
         else "explicit",
         "config_overrides": config_overrides,
+        "loss_chunk_size": args.loss_chunk_size,
         "profile_root": str(args.profile_dir.expanduser().resolve())
         if args.profile_dir is not None
         else None,
@@ -1277,6 +1278,7 @@ def _training_case(
     segments = inputs["segment_ids"] if mode == "packed" else None
     tokens = inputs["prefix"]
     labels = inputs["labels"]
+    loss_chunk_size = case.get("loss_chunk_size")
 
     def loss_function(
         candidate: Any,
@@ -1287,6 +1289,7 @@ def _training_case(
         dropout_key: Any,
         deterministic: bool,
     ) -> Any:
+        loss_kwargs = {} if loss_chunk_size is None else {"loss_chunk_size": int(loss_chunk_size)}
         return candidate.compute_loss(
             token_ids,
             target_ids,
@@ -1294,6 +1297,7 @@ def _training_case(
             segment_ids=segment_ids,
             deterministic=deterministic,
             key=dropout_key,
+            **loss_kwargs,
         )
 
     if case["operation"] == "forward":
@@ -1537,6 +1541,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--inference-batches", type=_csv_positive_ints, default=(1,))
     parser.add_argument("--training-lengths", type=_csv_positive_ints, default=(2048, 4096))
     parser.add_argument("--training-batches", type=_csv_positive_ints, default=(1, 2, 4))
+    parser.add_argument(
+        "--loss-chunk-size",
+        type=int,
+        help="Opt-in token chunk size for the memory-bounded training loss head",
+    )
     parser.add_argument("--warmups", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--timeout-seconds", type=float, default=3600.0)
@@ -1587,6 +1596,8 @@ def main() -> int:
         raise ValueError("--iterations must be positive")
     if args.timeout_seconds <= 0:
         raise ValueError("--timeout-seconds must be positive")
+    if args.loss_chunk_size is not None and args.loss_chunk_size <= 0:
+        raise ValueError("--loss-chunk-size must be positive")
     for name in ("atol", "rtol", "bf16_atol", "bf16_rtol", "fp32_atol", "fp32_rtol"):
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value < 0):
