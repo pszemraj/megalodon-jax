@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+import megalodon_jax.inference as inference_module
 from megalodon_jax import MegalodonConfig, MegalodonForCausalLM
 from megalodon_jax.cache import CACHE_INVARIANT_MESSAGE, validate_model_cache_host
 from megalodon_jax.checkpoint import (
@@ -190,6 +191,77 @@ class TestCacheUtilities:
 @pytest.mark.fast
 class TestSamplingAndGeneration:
     """Sampling primitives and generation loop."""
+
+    def test_generate_validates_before_private_compiled_core(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Invalid public controls fail eagerly without entering compiled numerics."""
+        model = MegalodonForCausalLM(tiny_config(), key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        entered = False
+
+        def forbidden_core(*args: object, **kwargs: object) -> None:
+            nonlocal entered
+            entered = True
+            raise AssertionError("compiled core must not run for invalid inputs")
+
+        monkeypatch.setattr(inference_module, "_compiled_generate_core", forbidden_core)
+        with pytest.raises(ValueError, match="top_k must be in"):
+            generate(
+                model,
+                prompt,
+                max_new_tokens=2,
+                temperature=0.0,
+                top_k=model.config.vocab_size + 1,
+            )
+        assert not entered
+        assert not hasattr(generate, "lower")
+
+    def test_private_compiled_core_matches_eager_implementation(self) -> None:
+        """The private JIT boundary preserves tokens and complete continuation state."""
+        model = MegalodonForCausalLM(tiny_config(), key=jax.random.PRNGKey(0))
+        prompt = jnp.asarray([[1, 2, 3]], dtype=jnp.int32)
+        kwargs = {
+            "temperature": 0.0,
+            "top_k": None,
+            "top_p": None,
+            "eos_token_id": 7,
+            "attention_mask": None,
+            "cache": None,
+            "state": None,
+            "return_cache": False,
+            "return_state": True,
+        }
+
+        eager = inference_module._generate_core(model, prompt, 3, None, **kwargs)
+        compiled = inference_module._compiled_generate_core(model, prompt, 3, None, **kwargs)
+        assert hasattr(inference_module._compiled_generate_core, "lower")
+
+        eager_tokens, eager_state, eager_key = eager
+        compiled_tokens, compiled_state, compiled_key = compiled
+        np.testing.assert_array_equal(np.asarray(compiled_tokens), np.asarray(eager_tokens))
+        assert isinstance(eager_state, GenerationState)
+        assert isinstance(compiled_state, GenerationState)
+        assert eager_key is None and compiled_key is None
+        assert compiled_state.eos_token_id == eager_state.eos_token_id
+        for compiled_leaf, eager_leaf in zip(
+            jax.tree.leaves(compiled_state),
+            jax.tree.leaves(eager_state),
+            strict=True,
+        ):
+            if jnp.issubdtype(eager_leaf.dtype, jnp.inexact):
+                np.testing.assert_allclose(
+                    np.asarray(compiled_leaf),
+                    np.asarray(eager_leaf),
+                    rtol=2e-5,
+                    atol=2e-5,
+                )
+            else:
+                np.testing.assert_array_equal(
+                    np.asarray(compiled_leaf),
+                    np.asarray(eager_leaf),
+                )
 
     def test_sample_token_top_k(self) -> None:
         """Test top-k sampling selects the highest logit.

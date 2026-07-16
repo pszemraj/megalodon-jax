@@ -116,6 +116,8 @@ more_tokens, state, key = generate(
 
 `GenerationState` contains the model cache, the logits for the next sampling decision, and per-row EOS status. A raw `ModelCache` returned with `return_cache=True` remains available for model-forward continuation, but is not sufficient to resume `generate()`. Generation-state persistence and cached-generation constraints are described in [JAX and PyTorch interoperability](docs/jax-torch.md#inference-state-persistence) and [Long-context streaming](docs/long-context-streaming.md#padding-and-generation).
 
+Call `generate()` directly: it keeps validation eager and fail-closed, then dispatches the validated numerical transition through a private compiled core. There is intentionally no public `generate_jit`; repeated calls reuse compilation when array shapes and static generation controls match.
+
 ### Training with loss
 
 ```python

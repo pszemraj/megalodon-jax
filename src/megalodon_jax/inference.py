@@ -273,6 +273,17 @@ def sample_token(
     """
 
     _validate_sampling(temperature, top_k, top_p, logits.shape[-1])
+    return _sample_token_validated(logits, key, temperature, top_k, top_p)
+
+
+def _sample_token_validated(
+    logits: Float[Array, "batch vocab"],
+    key: PRNGKeyArray,
+    temperature: float,
+    top_k: int | None,
+    top_p: float | None,
+) -> Int[Array, "batch"]:
+    """Sample after the eager public boundary has validated static controls."""
 
     if temperature == 0.0:
         return greedy_token(logits)
@@ -309,7 +320,12 @@ def _sample_fn(
     """
     if temperature == 0.0:
         return lambda logits, _: greedy_token(logits)
-    return functools.partial(sample_token, temperature=temperature, top_k=top_k, top_p=top_p)
+    return functools.partial(
+        _sample_token_validated,
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+    )
 
 
 def _validate_sampling(
@@ -399,7 +415,6 @@ def _generate_core(
     temperature: float = 1.0,
     top_k: int | None = None,
     top_p: float | None = None,
-    bos_token_id: int | None = None,
     eos_token_id: int | None = None,
     attention_mask: Bool[Array, "batch prompt_len"] | None = None,
     cache: ModelCache | None = None,
@@ -411,11 +426,13 @@ def _generate_core(
     GenerationState | ModelCache | None,
     PRNGKeyArray | None,
 ]:
-    """Autoregressive generation using a fixed-shape scan.
+    """Implement the validated numerical transition wrapped by ``filter_jit`` below.
 
     A ``GenerationState`` resumes directly from its stored next-token logits;
     its cache already includes every previously emitted token. If sampling is
-    enabled, the returned key is the next key for a subsequent call.
+    enabled, the returned key is the next key for a subsequent call. All host
+    validation and empty-prompt normalization occur in :func:`generate` before
+    this function is entered.
 
     :param MegalodonForCausalLM model: Model to generate from.
     :param Int[Array, "batch prompt_len"] prompt_ids: Prompt token IDs.
@@ -424,62 +441,23 @@ def _generate_core(
     :param float temperature: Sampling temperature.
     :param int | None top_k: Top-k filter.
     :param float | None top_p: Top-p filter.
-    :param int | None bos_token_id: Optional BOS token ID.
     :param int | None eos_token_id: Optional EOS token ID.
     :param Bool[Array, "batch prompt_len"] | None attention_mask: Optional mask.
     :param ModelCache | None cache: Optional model-level prefix cache.
     :param GenerationState | None state: Complete generation continuation state.
     :param bool return_cache: Whether to return the final model-level cache.
     :param bool return_state: Whether to return complete resumable generation state.
-    :raises ValueError: If inputs are invalid or missing required RNG.
     :return tuple[Int[Array, "batch total_len"], GenerationState | ModelCache | None, PRNGKeyArray | None]: Output IDs, continuation artifact, and key.
     """
-
-    if model.config.effective_output_size != model.config.vocab_size:
-        raise ValueError("generate requires effective_output_size to equal vocab_size")
-    _validate_sampling(
-        temperature,
-        top_k,
-        top_p,
-        model.config.effective_output_size,
-    )
     needs_rng = temperature != 0.0
-    if needs_rng and key is None:
-        raise ValueError("key is required when temperature > 0.")
-
     sample = _sample_fn(temperature, top_k, top_p)
     B, prompt_len = prompt_ids.shape
 
     if state is not None:
-        if prompt_len != 0:
-            raise ValueError("state continuation requires an empty prompt_ids sequence")
-        if B != state.next_logits.shape[0]:
-            raise ValueError(
-                "prompt_ids batch size must match generation state, got "
-                f"{B} and {state.next_logits.shape[0]}"
-            )
         cache = state.cache
         last_logits = state.next_logits
         finished = state.finished
     else:
-        if prompt_len == 0 and cache is not None:
-            raise ValueError(
-                "empty-prompt continuation requires GenerationState; ModelCache does not "
-                "contain next-token logits"
-            )
-        if prompt_len == 0:
-            if bos_token_id is None:
-                bos_token_id = getattr(model.config, "bos_token_id", None)
-            if bos_token_id is None:
-                raise ValueError(
-                    "prompt_ids is empty; provide bos_token_id or pass at least one token."
-                )
-            prompt_ids = jnp.full((B, 1), bos_token_id, dtype=prompt_ids.dtype)
-            # The synthetic BOS is valid and unpadded. Cached calls represent
-            # the all-valid case with no mask metadata.
-            attention_mask = None
-            prompt_len = 1
-
         needs_cache = return_cache or return_state or max_new_tokens > 1
         logits, cache = model(
             prompt_ids,
@@ -661,6 +639,11 @@ def _generate_core(
     return result, continuation, final_key
 
 
+# Keep the public API eager for fail-closed validation while compiling the
+# complete validated prompt/decode transition behind one private boundary.
+_compiled_generate_core = eqx.filter_jit(_generate_core)
+
+
 def generate(
     model: MegalodonForCausalLM,
     prompt_ids: Int[Array, "batch prompt_len"],
@@ -709,10 +692,27 @@ def generate(
     """
 
     max_new_tokens = _validate_max_new_tokens(max_new_tokens)
+    if prompt_ids.ndim != 2:
+        raise ValueError(f"prompt_ids must be rank two, got shape {prompt_ids.shape}")
+    if not jnp.issubdtype(prompt_ids.dtype, jnp.integer):
+        raise TypeError(f"prompt_ids must have integer dtype, got {prompt_ids.dtype}")
     if cache is not None and state is not None:
         raise ValueError("cache and state are mutually exclusive")
     if return_cache and return_state:
         raise ValueError("return_cache and return_state are mutually exclusive")
+    if model.config.effective_output_size != model.config.vocab_size:
+        raise ValueError("generate requires effective_output_size to equal vocab_size")
+    _validate_sampling(
+        temperature,
+        top_k,
+        top_p,
+        model.config.effective_output_size,
+    )
+    temperature = float(temperature)
+    top_k = None if top_k is None else operator.index(top_k)
+    top_p = None if top_p is None else float(top_p)
+    if temperature != 0.0 and key is None:
+        raise ValueError("key is required when temperature > 0.")
 
     bos_token_id = _validate_token_id_override(
         "bos_token_id",
@@ -733,12 +733,27 @@ def generate(
             check_full_payload=False,
         )
         if eos_token_id is None:
-            eos_token_id = state.eos_token_id
+            eos_token_id = None if state.eos_token_id is None else int(state.eos_token_id)
         elif eos_token_id != state.eos_token_id:
             raise ValueError(
                 "eos_token_id must match generation state metadata; got "
                 f"{eos_token_id} and {state.eos_token_id}"
             )
+
+    batch_size, prompt_len = prompt_ids.shape
+    if state is not None:
+        if prompt_len != 0:
+            raise ValueError("state continuation requires an empty prompt_ids sequence")
+        if batch_size != state.next_logits.shape[0]:
+            raise ValueError(
+                "prompt_ids batch size must match generation state, got "
+                f"{batch_size} and {state.next_logits.shape[0]}"
+            )
+    elif prompt_len == 0 and cache is not None:
+        raise ValueError(
+            "empty-prompt continuation requires GenerationState; ModelCache does not "
+            "contain next-token logits"
+        )
 
     if attention_mask is not None:
         attention_mask = jnp.asarray(attention_mask)
@@ -760,10 +775,34 @@ def generate(
                 "Cannot use cache with padded attention_mask. "
                 "Provide unpadded prompts for cached generation."
             )
-        if not has_padding:
+        if has_padding:
+            mask = attention_mask.astype(jnp.bool_)
+            if bool(jax.device_get(jnp.any(~jnp.any(mask, axis=1)))):
+                raise ValueError("attention_mask must contain at least one True per batch element.")
+            has_non_right_padding = jnp.any((~mask[:, :-1]) & mask[:, 1:])
+            if bool(jax.device_get(has_non_right_padding)):
+                raise ValueError(
+                    "attention_mask rows must contain a contiguous valid prefix followed by "
+                    "optional right padding"
+                )
+            attention_mask = mask
+        else:
             attention_mask = None
 
-    return _generate_core(
+    if state is None and prompt_len == 0:
+        resolved_bos = bos_token_id
+        if resolved_bos is None:
+            resolved_bos = getattr(model.config, "bos_token_id", None)
+        if resolved_bos is None:
+            raise ValueError(
+                "prompt_ids is empty; provide bos_token_id or pass at least one token."
+            )
+        prompt_ids = jnp.full((batch_size, 1), resolved_bos, dtype=prompt_ids.dtype)
+        # The synthetic BOS is valid and unpadded. Cached calls represent the
+        # all-valid case with no mask metadata.
+        attention_mask = None
+
+    return _compiled_generate_core(
         model,
         prompt_ids,
         max_new_tokens,
@@ -771,7 +810,6 @@ def generate(
         temperature=temperature,
         top_k=top_k,
         top_p=top_p,
-        bos_token_id=bos_token_id,
         eos_token_id=eos_token_id,
         attention_mask=attention_mask,
         cache=cache,
