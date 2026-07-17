@@ -8,7 +8,7 @@ Run formatting and lint checks before each commit:
 
 ```bash
 conda run --name mega-jax ruff check --fix .
-conda run --name mega-jax ruff format .
+conda run --name mega-jax ruff format --preview .
 ```
 
 The routine CPU gate covers the highest-value model, cache, conversion, and source-transcription consistency checks:
