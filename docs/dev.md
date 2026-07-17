@@ -57,7 +57,7 @@ Before the first PyPI release, create a GitHub environment named `pypi` with no 
 
 A pending publisher does not reserve the project name, so configure it immediately before the first upload. After the workflow is on the default branch, create a normal GitHub Release from the latest `main` commit. Publishing the release triggers the workflow immediately; GitHub prereleases are skipped. Do not promote an existing GitHub prerelease to a stable release by clearing its prerelease flag, because that does not emit the `published` event required by this workflow. Delete the prerelease and create a new stable GitHub Release for the same tag instead. The first PyPI release is `v0.2.1`, which produces distribution version `0.2.1` and converts the pending publisher into the project's trusted publisher.
 
-The build job has no OIDC permission. It transfers the validated artifacts to a separate `pypi` environment job whose only elevated permission is `id-token: write`; the publisher uploads with short-lived credentials and default PEP 740 attestations. PyPI files are immutable, and duplicate uploads fail rather than being silently skipped.
+The build job has no OIDC permission. It transfers the validated artifacts to a separate `pypi` environment job whose only elevated permission is `id-token: write`; the publisher uploads with short-lived credentials and default PEP 740 attestations. Workflow concurrency is scoped to the release tag so a newer release cannot replace an older pending release run. PyPI files are immutable, and duplicate uploads fail rather than being silently skipped.
 
 ## Modeling verifier
 

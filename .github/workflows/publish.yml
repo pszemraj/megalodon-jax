@@ -7,8 +7,9 @@ on:
 permissions:
   contents: read
 
+# Scope concurrency by release tag so distinct releases cannot replace an older pending run.
 concurrency:
-  group: pypi-publish
+  group: pypi-publish-${{ github.event.release.tag_name }}
   cancel-in-progress: false
 
 jobs:
