@@ -4,29 +4,30 @@ A JAX/Equinox reimplementation of [Megalodon: Efficient LLM Pretraining and Infe
 
 ## Features
 
-- Pure JAX/Equinox implementation in [src/megalodon_jax](src/megalodon_jax)
+- Pure JAX/Equinox implementation in [src/megalodon_jax](https://github.com/pszemraj/megalodon-jax/tree/main/src/megalodon_jax)
 - Core architecture: ComplexEMA, chunked rotary attention, fixed-capacity streaming caches, RMSNorm, and TimestepNorm
 - Packed-sequence training with full document isolation: `segment_ids` masks attention, resets EMA/norm state at boundaries, and excludes cross-document label pairs from the loss
 - JAX pytree caches for JIT-compatible streaming inference
 - Strict native SafeTensors checkpoints plus exact original-upstream PyTorch checkpoint conversion
 - Source-transcribed PyTorch/JAX forward, all-parameter gradient, and optimizer consistency gates without building the fused CUDA extension
-- Official released tokenizer bundle in [assets/tokenizer](assets/tokenizer), versioned in-tree for paper and released-repository reproducibility
+- Official released tokenizer bundle in [assets/tokenizer](https://github.com/pszemraj/megalodon-jax/tree/main/assets/tokenizer), versioned in-tree for paper and released-repository reproducibility
 
 ## Installation
 
-Install with pip+git for the latest version:
+PyPI provides one hardware-independent package with two supported JAX runtime profiles:
+
+| Runtime | Install command | Notes |
+| --- | --- | --- |
+| CPU / default | `pip install megalodon-jax` | Uses JAX's standard CPU-capable installation. |
+| NVIDIA CUDA 13 | `pip install "megalodon-jax[cuda13]"` | Uses JAX's pip-managed CUDA 13 plugin, PJRT, CUDA, and cuDNN wheels on Linux x86_64 or aarch64. |
+
+CUDA 12 and locally managed CUDA installations are not supported package profiles. Keep `LD_LIBRARY_PATH` unset when using the bundled CUDA 13 libraries; pointing it at another CUDA toolkit can make XLA load an incompatible library set.
+
+To install the unreleased `main` branch instead:
 
 ```sh
 pip install "git+https://github.com/pszemraj/megalodon-jax.git"
 ```
-
-On Linux with an NVIDIA CUDA 13-capable driver, install JAX's official bundled CUDA stack:
-
-```sh
-pip install "megalodon-jax[cuda13] @ git+https://github.com/pszemraj/megalodon-jax.git"
-```
-
-The `cuda13` extra installs the matching JAX plugin, PJRT, CUDA, and cuDNN wheels. Keep `LD_LIBRARY_PATH` unset when using these bundled libraries; pointing it at another CUDA toolkit can make XLA load an incompatible library set.
 
 ### Development install
 
@@ -114,7 +115,7 @@ more_tokens, state, key = generate(
 )
 ```
 
-`GenerationState` contains the model cache, the logits for the next sampling decision, and per-row EOS status. A raw `ModelCache` returned with `return_cache=True` remains available for model-forward continuation, but is not sufficient to resume `generate()`. Generation-state persistence and cached-generation constraints are described in [JAX and PyTorch interoperability](docs/jax-torch.md#inference-state-persistence) and [Long-context streaming](docs/long-context-streaming.md#padding-and-generation).
+`GenerationState` contains the model cache, the logits for the next sampling decision, and per-row EOS status. A raw `ModelCache` returned with `return_cache=True` remains available for model-forward continuation, but is not sufficient to resume `generate()`. Generation-state persistence and cached-generation constraints are described in [JAX and PyTorch interoperability](https://github.com/pszemraj/megalodon-jax/blob/main/docs/jax-torch.md#inference-state-persistence) and [Long-context streaming](https://github.com/pszemraj/megalodon-jax/blob/main/docs/long-context-streaming.md#padding-and-generation).
 
 Call `generate()` directly: it keeps validation eager and fail-closed, then dispatches the validated numerical transition through a private compiled core. There is intentionally no public `generate_jit`; repeated calls reuse compilation when array shapes and static generation controls match.
 
@@ -136,7 +137,7 @@ def loss_fn(model, input_ids, labels):
 grads = loss_fn(model, input_ids, labels)
 ```
 
-When the full FP32 vocabulary logits limit training memory, opt into the rematerialized loss head with `model.compute_loss(input_ids, labels, loss_chunk_size=64)`. This bounds the number of shifted token states projected at once; ordinary `model(...)` calls still return complete logits. See [Dtypes and numerical stability](docs/dtypes-and-stability.md#memory-bounded-loss-head) for the tradeoff and benchmark procedure.
+When the full FP32 vocabulary logits limit training memory, opt into the rematerialized loss head with `model.compute_loss(input_ids, labels, loss_chunk_size=64)`. This bounds the number of shifted token states projected at once; ordinary `model(...)` calls still return complete logits. See [Dtypes and numerical stability](https://github.com/pszemraj/megalodon-jax/blob/main/docs/dtypes-and-stability.md#memory-bounded-loss-head) for the tradeoff and benchmark procedure.
 
 ### Packed-sequence training
 
@@ -160,11 +161,11 @@ loss = model.compute_loss(
 )
 ```
 
-See [Packed-sequence training](docs/long-context-streaming.md#packed-sequence-training) for isolation, boundary, padding, cache, and loss semantics.
+See [Packed-sequence training](https://github.com/pszemraj/megalodon-jax/blob/main/docs/long-context-streaming.md#packed-sequence-training) for isolation, boundary, padding, cache, and loss semantics.
 
 ## Documentation
 
-The [documentation index](docs/README.md) covers the normative upstream-parity and production contracts, streaming and packed execution, precision, ComplexEMA, checkpoint interoperability, paper/source differences, tests, and benchmarks.
+The [documentation index](https://github.com/pszemraj/megalodon-jax/blob/main/docs/README.md) covers the normative upstream-parity and production contracts, streaming and packed execution, precision, ComplexEMA, checkpoint interoperability, paper/source differences, tests, and benchmarks.
 
 ### Source layout
 

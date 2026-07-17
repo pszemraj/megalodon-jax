@@ -33,6 +33,32 @@ conda run --name mega-jax pytest -m torch_ref
 
 Hosted CI is intentionally limited to Ruff lint/format checks and the CPU fast gate on Python 3.11 and 3.13 with the minimum supported JAX and Equinox versions. It does not run the unmarked full suite, the complete `torch_ref` parity suite, original-upstream conversion round-trips, the source-backed modeling verifier, or the GPU benchmark matrix. A few `torch_ref` tests also belong to the fast subset, but their presence does not make CI a full parity run. Run the complete local suite and the relevant manual gates before merging modeling changes; the sections below give the source-verifier and GPU benchmark commands.
 
+## Packaging and PyPI releases
+
+PyPI receives one pure-Python wheel and one source distribution. A default installation uses the ordinary JAX dependency and is the supported CPU profile; `megalodon-jax[cuda13]` adds JAX's pip-managed CUDA 13 plugin, PJRT, CUDA, and cuDNN wheels. The project does not expose CUDA 12 or locally managed CUDA package profiles. Optional PyTorch tooling can install its own CUDA dependencies independently, so validate the active JAX plugin and backend rather than treating every CUDA 12 vendor wheel in a development environment as a JAX dependency.
+
+Build and validate the same artifacts locally before a release:
+
+```bash
+conda run --name mega-jax python -m pip install build twine
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MEGALODON_JAX=0.2.1 conda run --name mega-jax python -m build
+conda run --name mega-jax python -m twine check --strict dist/*
+```
+
+Production versions come only from Git tags. The release workflow accepts a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`, then verifies that the wheel and source distribution report the tag without the leading `v`. It has no manual-dispatch, tag-push, TestPyPI, or API-token path.
+
+Before the first PyPI release, create a GitHub environment named `pypi` with no required reviewer and restrict deployments to tags matching `v*`. Then register a pending publisher at <https://pypi.org/manage/account/publishing/> with these exact values:
+
+- PyPI project name: `megalodon-jax`
+- GitHub owner: `pszemraj`
+- GitHub repository: `megalodon-jax`
+- Workflow filename: `publish.yml`
+- Environment name: `pypi`
+
+A pending publisher does not reserve the project name, so configure it immediately before the first upload. After the workflow is on the default branch, create a normal GitHub Release from the latest `main` commit. Publishing the release triggers the workflow immediately; GitHub prereleases are skipped. The first PyPI release is `v0.2.1`, which produces distribution version `0.2.1` and converts the pending publisher into the project's trusted publisher.
+
+The build job has no OIDC permission. It transfers the validated artifacts to a separate `pypi` environment job whose only elevated permission is `id-token: write`; the publisher uploads with short-lived credentials and default PEP 740 attestations. PyPI files are immutable, and duplicate uploads fail rather than being silently skipped.
+
 ## Modeling verifier
 
 `tools/verify_modeling_correctness.py` runs the [independent references, source-transcription checks, and source anchors](jax-torch.md#parity-gates). A release-quality run supplies the released source checkout and enables the slower executable checks:
