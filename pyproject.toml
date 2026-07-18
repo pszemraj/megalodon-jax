@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "megalodon-jax"
-description = "JAX/Equinox impl of Megalodon for efficient, JIT-compiled training and inference"
+description = "JAX/Equinox implementation of Megalodon for efficient long-context training and inference"
 authors = [
   { name = "Peter Szemraj", email = "peterszemraj+megalodon@gmail.com" },
 ]
@@ -42,7 +42,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/pszemraj/megalodon-jax"
-Repository = "https://github.com/pszemraj/megalodon-jax"
+Documentation = "https://github.com/pszemraj/megalodon-jax/blob/main/docs/README.md"
+Issues = "https://github.com/pszemraj/megalodon-jax/issues"
 
 [project.optional-dependencies]
 cuda13 = [
