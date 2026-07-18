@@ -1,6 +1,9 @@
 # Dtypes and numerical stability
 
-Megalodon JAX supports FP32 and BF16 compute. Ordinary embedding and projection parameters may use FP32 or BF16 storage, while precision-sensitive parameters and accumulation remain FP32. Float16 is intentionally unsupported because the EMA, FFT, normalization, and long-context state paths are not reliable in that range.
+Megalodon JAX supports FP32 and BF16 compute. Ordinary embedding and projection parameters may use FP32 or BF16 storage, while precision-sensitive parameters and accumulation remain FP32.
+
+> [!IMPORTANT]
+> Float16 is never supported — the EMA, FFT, normalization, and long-context state paths are not reliable in that range, and config validation rejects it. Select BF16 through `MegalodonConfig`; never blanket-cast the model tree (see [Do not cast the model tree](#do-not-cast-the-model-tree)).
 
 These are intentional JAX policies, not a promise to reproduce the released trainer's FairScale/FSDP1 storage mechanics. The normative distinction between released-model parity and supported precision policy is in [Upstream parity and production contracts](upstream-parity-contract.md#precision-policies).
 
@@ -55,7 +58,7 @@ config = MegalodonConfig(
 
 The split keeps FP32 where it is numerically useful without materially eroding compact storage. In the exact paper-7B configuration, the sensitive subset is 9,445,376 of 7,385,817,088 parameters (0.127885%). Keeping that subset FP32 costs 18,890,752 bytes, about 18 MiB, over an unsupported all-BF16 tree.
 
-A canonical packed `B=4, L=2048` forward/backward audit with gradient checkpointing and BF16 compute measured the storage choice directly. Both policies produced finite loss and every gradient and passed the independent packed-loss reference. GB below means 10^9 bytes.
+A canonical packed `B=4, L=2048` forward/backward audit with gradient checkpointing and BF16 compute measured the storage choice directly. Both policies produced finite loss and gradients and passed the independent packed-loss reference. GB below means 10^9 bytes.
 
 | Ordinary parameter storage | Parameter storage | Compiler peak | Compiler temporary | Measured peak device | Synchronized runtime |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -78,7 +81,7 @@ Use BF16 only on accelerators with native BF16 support. There is no FP16 fallbac
 - Fresh BF16 ordinary parameters are sampled with the configured initializer in FP32 and then cast to BF16, avoiding the coarse random grid produced by direct BF16 sampling.
 - FP32 matrix contractions request JAX's per-operation `HIGHEST` precision, so NVIDIA GPUs do not silently substitute TensorFloat-32 products. BF16 contractions retain BF16 inputs with FP32 accumulation.
 - BF16 result buffers are selected by consumer. Biasless projections whose public output is BF16 and the attention probability-times-value contraction return BF16 directly while using the explicit `BF16_BF16_F32` contraction algorithm. Biasful projections retain an FP32 result through bias addition and downcast once afterward. The language-model head also retains its required FP32 output.
-- Attention QK scores remain FP32 because masking and the default softmax consume FP32. The resulting probabilities return to `compute_dtype` before dropout and the value contraction, matching the released mixed-precision boundary; producing BF16 QK scores would add a conversion back to FP32 and change the softmax input.
+- Attention QK scores are always FP32 because they accumulate in `accum_dtype`, which config validation fixes at FP32; a BF16 `attention_softmax_dtype` casts the scores only afterward. The resulting probabilities return to `compute_dtype` before dropout and the value contraction, matching the released mixed-precision boundary.
 - KV cache tensors follow `compute_dtype`; norm state remains FP32 and EMA state remains complex64.
 - Returned logits are always FP32, matching the original released model.
 - Parameter gradients follow parameter storage: ordinary gradients are BF16 in compact storage mode, while sensitive gradients remain FP32.
@@ -94,7 +97,7 @@ Do not blanket-cast the model to BF16:
 model = jax.tree.map(lambda x: x.astype(jnp.bfloat16), model)
 ```
 
-Select BF16 compute and storage through `MegalodonConfig`. The constructors apply `param_dtype` only to ordinary parameters and preserve the FP32-sensitive subset. `audit_sensitive_param_dtypes` is available as a defensive check:
+Select BF16 compute and storage through `MegalodonConfig`. The model constructors apply `param_dtype` only to ordinary parameters and preserve the FP32-sensitive subset. `audit_sensitive_param_dtypes` is available as a defensive check:
 
 ```python
 from megalodon_jax.precision import audit_sensitive_param_dtypes
@@ -213,9 +216,7 @@ compiled_train_step = eqx.filter_jit(train_step)
 model, opt_state, loss = compiled_train_step(model, opt_state, input_ids, labels, key)
 ```
 
-`eqx.filter_shard` applies the JAX sharding only to array leaves, leaves static Python metadata alone, and preserves every leaf's configured dtype. This example assumes one host and a batch whose leading dimension divides evenly over its local devices; multi-host input assembly also needs process-aware data loading.
-
-Compact BF16 storage is intentional pure-BF16 updating for ordinary parameters: their gradients and applied updates are quantized to BF16. Promoting optimizer accumulators does not create an FP32 master copy of the parameters. Use `param_dtype=jnp.float32` with BF16 compute when FP32 master-parameter update fidelity is required.
+`eqx.filter_shard` applies the JAX sharding only to array leaves, ignores static Python metadata, and preserves every leaf's configured dtype. This example assumes one host and a batch whose leading dimension divides evenly over its local devices; multi-host input assembly also needs process-aware data loading.
 
 ## Checkpoint dtypes
 

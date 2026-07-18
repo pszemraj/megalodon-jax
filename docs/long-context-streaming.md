@@ -1,8 +1,8 @@
 # Long-context streaming
 
-Megalodon carries long-range signal through stateful CEMA and TimestepNorm without retaining a global KV cache. Attention uses local KV support: released chunk-local behavior by default or an optional sliding window.
+Megalodon carries long-range signal through stateful CEMA and TimestepNorm without retaining a global KV cache. Attention only sees a local window of keys and values: chunk-local by default, matching the released implementation ("released" throughout these docs means the original released PyTorch/CUDA source), or an optional fixed-width sliding window.
 
-Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention stays chunk-local by default; EMA/Norm carry the full history. A sliding KV window is an optional extension.
+The examples below assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention stays chunk-local; CEMA and TimestepNorm carry the full history.
 
 ## Chunked attention and stateful memory
 
@@ -15,36 +15,23 @@ flowchart LR
         MX1 -->|Z/Q/K| Z1
         TN1 -->|V| V1
         MX1 -->|Gate/Input| G1
-        Z1 -->|"Local attn (KV: chunk 1 window)"| O1
+        Z1 -->|"Local attn (KV: chunk-local or sliding window)"| O1
         O1 -->|Gate+Proj| Y1
     end
 
-    subgraph Chunk2["Chunk 2 (t=1025-2048)"]
-        A2[Tokens 1025-2048] -->|"TimestepNorm (running stats)"| TN2
-        TN2 -->|"CEMA (init = h_prev)"| C2[CEMA output]
-        C2 -->|RMSNorm| MX2[mx]
-        MX2 -->|Z/Q/K| Z2
-        TN2 -->|V| V2
-        MX2 -->|Gate/Input| G2
-        Z2 -->|"Local attn (KV: chunk-local)"| O2
-        O2 -->|Gate+Proj| Y2
+    subgraph ChunkK["Chunk k > 1 (t = 1025, ...)"]
+        AK[Later tokens] -->|"TimestepNorm (running stats)"| TNK
+        TNK -->|"CEMA (init = h_prev)"| CK[CEMA output]
+        CK -->|RMSNorm| MXK[mx]
+        MXK -->|Z/Q/K| ZK
+        TNK -->|V| VK
+        MXK -->|Gate/Input| GK
+        ZK -->|"Local attn (KV: chunk-local or sliding window)"| OK
+        OK -->|Gate+Proj| YK
     end
 
-    subgraph ChunkN["Chunk N (t > 2048)"]
-        AN[Tokens ...] -->|"TimestepNorm (running stats)"| TNN
-        TNN -->|"CEMA (init = h_prev)"| CN[CEMA output]
-        CN -->|RMSNorm| MXN[mx]
-        MXN -->|Z/Q/K| ZN
-        TNN -->|V| VN
-        MXN -->|Gate/Input| GN
-        ZN -->|"Local attn (KV: chunk-local or sliding window)"| ON
-        ON -->|Gate+Proj| YN
-    end
-
-    C1 -.-> C2
-    C2 -.-> CN
-    TN1 -.-> TN2
-    TN2 -.-> TNN
+    C1 -.-> CK
+    TN1 -.-> TNK
 ```
 
 - **Long-range path:** CEMA state `h` and TimestepNorm running statistics propagate across all chunks in O(1) state memory.
@@ -57,9 +44,8 @@ sequenceDiagram
     participant Cache as KV Cache (window)
     participant State as EMA + TN state
     participant Block as Attn Block
-    Note over Cache: attention_window=None => released chunk-local mode<br/>attention_window=W => fixed W-token sliding window
 
-    Loop for each streaming update
+    loop for each streaming update
         Block->>State: TimestepNorm (update running mean/var)
         State-->>Block: stats for this chunk
         Block->>State: CEMA (init with h_prev)
@@ -78,34 +64,30 @@ sequenceDiagram
 
 ## Cache integrity and indexing
 
-Top-level `ModelCache` values use exactly two schemas: the sparse initializer has `None` for every layer and final normalization state, while a continuation contains every attention, TimestepNorm, CEMA, and final-normalization component. Direct `MegalodonBlock` calls separately accept either an empty `LayerCache()` or complete layer state on one nonnegative timeline. Model and block entry points reject partial or misaligned state, invalid array schemas, non-finite normalization values, and negative variances; model entry also checks compact EMA state. Cache input or output requires deterministic inference. Persistence additionally validates the full K/V payload as described in [Inference state persistence](jax-torch.md#inference-state-persistence).
+Top-level `ModelCache` values use exactly two schemas: the sparse initializer has `None` for every layer and final normalization state, while a continuation contains every attention, TimestepNorm, CEMA, and final-normalization component. Direct `MegalodonBlock` calls separately accept either an empty `LayerCache()` or complete layer state on one nonnegative timeline. Validation is fail-closed:
+
+- Model and block entry points reject partial or misaligned state, invalid array schemas, non-finite normalization values, and negative variances.
+- Model entry additionally checks EMA state for finiteness.
+- Cache input or output requires deterministic inference.
+- Persistence validates the full K/V payload as described in [Inference state persistence](jax-torch.md#inference-state-persistence).
 
 `index_cache(cache, indices)` reorders or duplicates allocated batch state for beam search. Indices must be a rank-one int32 array within the allocated batch range; repeated, reordered, and empty selections are supported. A sparse cache without allocated batch state accepts only an empty selection.
 
 ## RoPE offsets
 
-```mermaid
-flowchart TD
-    subgraph RoPE
-        P0[Position counter] -->|start_index for chunk| R1["RoPE apply(Q,K)"]
-        R1 --> O[Attention]
-        O --> P1[Update position counter]
-    end
-```
-
 - The cache tracks absolute token count. Released chunk-local mode derives RoPE position as `absolute_position % chunk_size`, matching the source's per-chunk coordinate restart. Sliding-window mode uses absolute positions so retained keys and new queries remain in one coordinate system.
-- The model resolves those positions once per call, evaluates one FP32 cosine/sine table, and passes the derived table through every layer. An optimization barrier keeps the table outside rematerialized blocks instead of cloning the same transcendental work per layer. This changes neither coordinates nor checkpoint contents: standalone attention modules still derive the same factors locally, and cached model calls build the table from the already-validated shared cache timeline.
+- The model resolves positions once per call, evaluates one FP32 cosine/sine table, and shares it across every layer (an optimization barrier keeps it outside rematerialized blocks). This is a performance optimization only: coordinates and checkpoint contents are unchanged, and standalone attention modules still derive the same factors locally.
 
 ## Training and inference
 
 - **Training:** `attention_window=None` gives released block-diagonal attention per chunk; setting `attention_window` opts into sliding attention. CEMA uses FFT when no state or packed reset is required.
-- **Inference:** pristine prefill uses vectorized attention and FFT CEMA outputs while materializing final continuation state. Calls with nonzero history use sequential CEMA and tokenwise ring updates. RoPE restarts per source chunk in faithful mode and remains absolute in sliding mode.
+- **Inference:** pristine prefill uses vectorized attention and FFT CEMA outputs while materializing final continuation state. Calls with nonzero history use tokenwise attention ring updates; CEMA uses the sequential recurrence for cached chunks shorter than 32 tokens and FFT plus an initial-state bias otherwise (see [EMA implementation](ema-implementation.md#execution-paths)). RoPE restarts per source chunk in chunk-local mode and remains absolute in sliding mode.
 
 ## Packed-sequence training
 
 `segment_ids` isolates contiguous documents across attention, CEMA, TimestepNorm, RoPE, gradients, and shifted loss pairs. Positive values identify real tokens and zero identifies padding. Raw IDs may be reused for non-adjacent documents because boundaries are defined by changes between neighboring IDs, not by global ID equality.
 
-At model entry, `segment_ids` is converted once into a small derived pytree containing validity, reset boundaries, contiguous-run IDs, and run-local positions. Every layer's attention, CEMA, and TimestepNorm plus the final TimestepNorm consume that same pytree. This is an internal reuse optimization rather than a second metadata contract; direct layer calls derive identical values locally, and the regression suite compares outputs and parameter gradients between the shared and layer-local paths.
+At model entry, `segment_ids` is converted once into a small derived pytree (validity, reset boundaries, contiguous-run IDs, run-local positions) that every layer's attention, CEMA, and TimestepNorm consume. This is an internal optimization only; direct layer calls derive identical values locally, and the regression suite verifies outputs and gradients match between the two paths.
 
 A minimal one-row packing recipe is below. Documents must already be tokenized and include any desired BOS/EOS tokens; packing does not manufacture boundary tokens. A production bin-packer can choose document groups for each row, then apply the same metadata construction.
 
@@ -154,7 +136,7 @@ loss = model.compute_loss(
 
 `labels = input_ids` is correct because `compute_loss` shifts labels internally and removes cross-segment target pairs. Segment zero removes padded targets independently of the numeric `pad_token_id`; the explicit attention mask also prevents padding from entering model state. Omit `position_ids` to get document-local RoPE positions automatically.
 
-- Packed metadata is training-only. `segment_ids` and `position_ids` are rejected whenever a cache is supplied or requested.
+- Packed metadata is training-only. `segment_ids` and `position_ids` are rejected whenever `return_cache=True` or a complete (non-sparse) cache is supplied; the sparse zero-history `ModelCache` is treated as no cache.
 - When `position_ids` is omitted, RoPE positions restart automatically at each contiguous document boundary.
 - Chunk boundaries re-anchor at each document, so a document beginning partway through a physical batch chunk has the same block-diagonal attention pattern as an independent run.
 - CEMA and TimestepNorm reset at every boundary. Trailing padding does not replace the returned state of the last real token, and an all-padding row returns fresh state.
@@ -164,15 +146,16 @@ The segmented CEMA path and its memory/speed tradeoff are described in [EMA impl
 
 ## Padding and generation
 
-- In this JAX implementation, cached decoding does not support padding because cache validity is not tracked per position.
+> [!IMPORTANT]
+> Cached decoding does not support padded batches because cache validity is not tracked per position. Batch variable-length prompts by equal unpadded length, or generate them separately when a cache is required.
+
 - `generate()` rejects padded `attention_mask` when cached generation is requested (`max_new_tokens > 1`, `return_cache=True`, `return_state=True`, or a cache/state is provided).
 - Model calls require every `attention_mask` row to be a contiguous valid prefix followed by optional right padding. Left padding and interior masked holes are rejected because shifting physical chunk boundaries changes released chunk-local semantics. `generate()` accepts right padding only for a single uncached generated token; direct noncached model calls support right-padded training batches.
-- Batch variable-length prompts by equal unpadded length or generate them separately when a cache is required.
 - Pass `attention_mask=None` when every token is valid. `generate()` canonicalizes an all-True mask to `None`; direct model calls retain an array-valued mask and therefore use the general masked TimestepNorm path.
 - An empty prompt without prior state is replaced by the explicit `bos_token_id` argument or the model configuration's BOS token.
 - Exact generator continuation uses `GenerationState` with an empty `(batch, 0)` prompt. The state cache includes every emitted token, `next_logits` contains the logits produced after the final token, and `finished` plus static EOS metadata preserves fixed-shape mixed-batch stopping. The explicit PRNG key returned by `generate()` remains separate and must be passed to the resumed call for exact stochastic continuation.
-- `generate()` remains the eager public boundary: it validates shapes, sampling controls, special-token metadata, continuation state, and padding rules before entering a private `eqx.filter_jit` numerical core. The generation length, sampling policy, EOS choice, artifact form, and model configuration are static compilation inputs; model/cache/prompt/key arrays are dynamic. Reusing the same shapes and static controls reuses the compiled program, while changing them intentionally specializes a new one. No public `generate_jit` alias exists.
-- A raw `ModelCache` is model-forward continuation state only. It deliberately remains available through `cache=` and `return_cache=True`, but it cannot resume `generate()` because it has neither next-token logits nor per-row EOS status. Replaying the final token against such a cache would duplicate that token, so empty-prompt continuation requires `GenerationState` rather than accepting a raw cache.
+- `generate()` is the eager public boundary: it validates shapes, sampling controls, special-token metadata, continuation state, and padding rules before entering a private `eqx.filter_jit` core. Generation length, sampling policy, EOS choice, artifact form, and model configuration are static compilation inputs; model/cache/prompt/key arrays are dynamic. Reusing the same shapes and static controls reuses the compiled program. No public `generate_jit` alias exists.
+- A raw `ModelCache` (from `cache=`/`return_cache=True`) is model-forward continuation state only: it lacks next-token logits and per-row EOS status, so it cannot resume `generate()`. Empty-prompt continuation requires `GenerationState`.
 - `max_new_tokens` must be a positive, non-boolean integer. Explicit BOS and EOS overrides must be integer IDs within `vocab_size`.
 - `generate()` requires the output width to equal `vocab_size` so every generated ID is valid for the next embedding lookup.
 - Batched generation is fixed-shape. After one row emits EOS, that row continues with synthetic EOS tokens until the batch completes; a returned raw cache or `GenerationState.cache` matches the full rectangular result, not the row trimmed at its first EOS.

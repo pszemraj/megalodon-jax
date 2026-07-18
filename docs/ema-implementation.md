@@ -23,6 +23,8 @@ The JAX version provides four execution paths:
 
 ### Path selection
 
+The dispatch below is the fine-grained version of the same four paths, split by the conditions that select them:
+
 - **Segmented** when `segment_ids` is provided (incompatible with `h_init`; training-only)
 - **FFT output only** when `h_init is None` and `return_state is False`
 - **Sequential output/state** when `h_init` is provided and the static sequence length is below 32
@@ -42,7 +44,7 @@ For an incoming state `h_init`, the released source computes long-chunk outputs 
 h_L = q**L * h_init + p * sum(x[L - 1 - j] * q**j, j=0..L-1)
 ```
 
-The JAX path uses explicit real/imaginary multiply-reductions instead of a complex batched dot because the latter caused an excessive cuBLAS autotuning allocation at target shapes. Coefficient powers are generated in blocks of at most 4,096 positions and each final-state block is reduced immediately. The 32-token switch is shape-static, so it does not add data-dependent dispatch inside a compiled call. It keeps tokenwise generation on the low-overhead recurrence while removing a serial sequence loop from prompt prefill and substantial cache updates.
+The JAX path uses explicit real/imaginary multiply-reductions instead of a complex batched dot because the latter caused an excessive cuBLAS autotuning allocation at target shapes. Coefficient powers are generated in blocks of at most 4,096 positions and each final-state block is reduced immediately. The 32-token switch is shape-static, so it does not add data-dependent dispatch inside a compiled call. It keeps tokenwise generation on the low-overhead recurrence while removing a serial sequence loop from prompt prefill and from substantial cache updates.
 
 ## Segmented path
 

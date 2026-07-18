@@ -19,7 +19,7 @@ restored = load_checkpoint("model.safetensors", key=jax.random.PRNGKey(1))
 
 Native format v2 stores the complete configuration, a configuration fingerprint, the tensor manifest, parameter names, and dtype policy. Loading is strict. Metadata-free files, legacy layouts, missing tensors, extra tensors, changed shapes, and changed dtypes are rejected.
 
-Model and inference-cache writes use a same-directory temporary file followed by atomic replacement.
+Model, inference-cache, and generation-state writes use a same-directory temporary file followed by atomic replacement.
 
 Partial restore is explicit and cannot silently fall back:
 
@@ -103,7 +103,14 @@ model = load_upstream_checkpoint(
 
 Directories produced by the original consolidation workflow are also accepted when they contain `consolidate_config.json` and the declared `consolidated.pth` or `consolidated.NN.pth` shards. Raw FSDP directories and SafeTensors from unrelated schemas are refused.
 
-The loader validates the complete exact key set, source tensor shapes, model-parallel merge axes, CEMA real/complex representation, RoPE frequencies, plus-one normalization storage, projection bias topology, tied-output equality, and configuration compatibility. When `share_emb=True`, the separately serialized embedding and output tensors must be bit-identical because they represent one logical upstream parameter; approximate equality is deliberately rejected.
+The loader validates:
+
+- the complete exact key set and source tensor shapes;
+- model-parallel merge axes and the CEMA real/complex representation;
+- RoPE frequencies, plus-one normalization storage, and projection bias topology;
+- tied-output equality and configuration compatibility.
+
+When `share_emb=True`, the separately serialized embedding and output tensors must be bit-identical because they represent one logical upstream parameter; approximate equality is deliberately rejected.
 
 For an already loaded original state dictionary:
 
@@ -125,7 +132,10 @@ state_dict = export_upstream_state_dict(model)
 torch.save(state_dict, "consolidated.pth")
 ```
 
-Weights use the original `(out_features, in_features)` layout without speculative transposes. Ordinary tensors follow the model's `param_dtype` by default and may use the exporter's explicit `dtype` override; CEMA, normalization, RoPE, and other sensitive tensors remain FP32. CEMA gamma is reassembled as real/imag pairs, omega regains its singleton axis, and tied output weights are emitted as an equal clone so serialization does not depend on shared storage.
+- Weights use the original `(out_features, in_features)` layout without speculative transposes.
+- Ordinary tensors follow the model's `param_dtype` by default; the exporter's explicit `dtype` argument can cast them. CEMA, normalization, RoPE, and other sensitive tensors remain FP32.
+- CEMA gamma is reassembled as real/imag pairs, and omega regains its singleton axis.
+- Tied output weights are emitted as an equal clone so serialization does not depend on shared storage.
 
 ## Compatibility boundary
 
@@ -144,7 +154,7 @@ save_inference_cache(cache, "cache.safetensors", config)
 cache = load_inference_cache("cache.safetensors", config)
 ```
 
-Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are model-forward continuation artifacts, not portable model checkpoints and not complete `generate()` continuation state.
+Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are model-forward continuation artifacts — not portable model checkpoints, and not complete `generate()` continuation state.
 
 Persist `GenerationState` when generation itself must resume without replaying a token:
 
@@ -163,4 +173,6 @@ The load-bearing core-math checks use independent NumPy references for TimestepN
 
 `tests/test_upstream_parity.py` uses a small differentiable Torch transcription of the released equations. It compares full logits, every trainable upstream-schema gradient, and short optimizer trajectories, but it was written alongside this JAX port and is not an independent oracle. Agreement demonstrates consistency between the two implementations; disagreement identifies a divergence that must be investigated rather than proving which side is correct.
 
-`tools/verify_modeling_correctness.py` additionally reads a local upstream source path when it is available; without one it runs repository-only checks and reports source-anchoring checks as skipped. The strict conversion regression uses a hand-authored released-source manifest for keys, shapes, dtypes, literal RoPE frequencies, and model-parallel partition axes. No check imports another Megalodon package or builds the fused extension, and no released trained checkpoint is available for a ground-truth logits comparison. Fused CUDA is checked at source level only.
+`tools/verify_modeling_correctness.py` additionally reads a local upstream source path when it is available; without one it runs repository-only checks and reports source-anchoring checks as skipped. The strict conversion regression uses a hand-authored released-source manifest for keys, shapes, dtypes, literal RoPE frequencies, and model-parallel partition axes.
+
+No check imports another Megalodon package or builds the fused extension; fused CUDA is checked at source level only. No released trained checkpoint is available, so there is no ground-truth logits comparison.

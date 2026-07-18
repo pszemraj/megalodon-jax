@@ -21,7 +21,7 @@ Use atomic commits with conventional commit messages. We will be working in a br
 Run commands in the conda env: `conda run --name mega-jax {command}`
 (Not needed for agentic tools like `read_file` — only for actual shell execution.)
 
-- Platform: linux-64, CUDA 12.9 available — use the GPU for tests/modeling.
+- Platform: linux-64, CUDA 12.9 system toolkit available — use the GPU for tests/modeling. (JAX runs on the pip-managed `cuda13` runtime per `docs/installation.md`; the system toolkit version does not determine the JAX runtime.)
 - You can install packages into this env freely.
 - Long-running commands are fine; use long timeouts as needed.
 

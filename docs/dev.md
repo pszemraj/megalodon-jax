@@ -31,7 +31,13 @@ The `torch_ref` marker selects the [source-transcribed PyTorch consistency check
 conda run --name mega-jax pytest -m torch_ref
 ```
 
-Hosted CI is intentionally limited to Ruff lint/format checks, a distribution build and default-CPU wheel smoke test, and the CPU fast gate on Python 3.11 and 3.13 with the minimum supported JAX and Equinox versions. It does not run the unmarked full suite, the complete `torch_ref` parity suite, original-upstream conversion round-trips, the source-backed modeling verifier, or the GPU benchmark matrix. A few `torch_ref` tests also belong to the fast subset, but their presence does not make CI a full parity run. Run the complete local suite and the relevant manual gates before merging modeling changes; the sections below give the source-verifier and GPU benchmark commands.
+Hosted CI runs:
+
+- Ruff lint and format checks;
+- a distribution build with a default-CPU wheel smoke test;
+- the CPU fast gate on Python 3.11 and 3.13 with the minimum supported JAX and Equinox versions.
+
+CI does not run the unmarked full suite, the complete `torch_ref` parity suite, original-upstream conversion round-trips, the source-backed modeling verifier, or the GPU benchmark matrix. (A few `torch_ref` tests belong to the fast subset, but that does not make CI a full parity run.) Run the complete local suite and the relevant manual gates before merging modeling changes; the sections below give the source-verifier and GPU benchmark commands.
 
 ## Packaging and PyPI releases
 
@@ -46,6 +52,8 @@ conda run --name mega-jax python -m twine check --strict dist/*
 ```
 
 Production versions come only from Git tags. The release workflow builds the commit recorded by the published release event rather than re-resolving its tag at job time. It accepts a stable `v`-prefixed PEP 440 tag whose recorded commit is contained in `main`, then verifies that the wheel and source distribution report the tag without the leading `v`. It has no manual-dispatch, tag-push, TestPyPI, or API-token path.
+
+### One-time release setup
 
 Before the first PyPI release, create a GitHub environment named `pypi` with no required reviewer and restrict deployments to tags matching `v*`. Then register a pending publisher at <https://pypi.org/manage/account/publishing/> with these exact values:
 
