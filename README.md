@@ -61,7 +61,7 @@ The [documentation index](https://github.com/pszemraj/megalodon-jax/blob/main/do
 
 ## Related
 
-- [Original Megalodon](https://github.com/XuezheMax/megalodon) — released PyTorch/CUDA source
+- [Original Megalodon](https://github.com/XuezheMax/megalodon) - released PyTorch/CUDA source
 
 ## Citation
 

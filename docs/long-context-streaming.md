@@ -4,6 +4,18 @@ Megalodon carries long-range signal through stateful CEMA and TimestepNorm witho
 
 The examples below assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention stays chunk-local; CEMA and TimestepNorm carry the full history.
 
+---
+
+- [Chunked attention and stateful memory](#chunked-attention-and-stateful-memory)
+- [Optional sliding KV window](#optional-sliding-kv-window)
+- [Cache integrity and indexing](#cache-integrity-and-indexing)
+- [RoPE offsets](#rope-offsets)
+- [Training and inference](#training-and-inference)
+- [Packed-sequence training](#packed-sequence-training)
+- [Padding and generation](#padding-and-generation)
+
+---
+
 ## Chunked attention and stateful memory
 
 ```mermaid

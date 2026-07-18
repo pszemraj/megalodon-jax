@@ -3,9 +3,22 @@
 Megalodon JAX supports FP32 and BF16 compute. Ordinary embedding and projection parameters may use FP32 or BF16 storage, while precision-sensitive parameters and accumulation remain FP32.
 
 > [!IMPORTANT]
-> Float16 is never supported — the EMA, FFT, normalization, and long-context state paths are not reliable in that range, and config validation rejects it. Select BF16 through `MegalodonConfig`; never blanket-cast the model tree (see [Do not cast the model tree](#do-not-cast-the-model-tree)).
+> Float16 is never supported - the EMA, FFT, normalization, and long-context state paths are not reliable in that range, and config validation rejects it. Select BF16 through `MegalodonConfig`; never blanket-cast the model tree (see [Do not cast the model tree](#do-not-cast-the-model-tree)).
 
 These are intentional JAX policies, not a promise to reproduce the released trainer's FairScale/FSDP1 storage mechanics. The normative distinction between released-model parity and supported precision policy is in [Upstream parity and production contracts](upstream-parity-contract.md#precision-policies).
+
+---
+
+- [Supported policies](#supported-policies)
+- [Fixed precision behavior](#fixed-precision-behavior)
+- [Do not cast the model tree](#do-not-cast-the-model-tree)
+- [Training loop](#training-loop)
+- [Memory-bounded loss head](#memory-bounded-loss-head)
+- [Single-host data parallelism](#single-host-data-parallelism)
+- [Checkpoint dtypes](#checkpoint-dtypes)
+- [Troubleshooting](#troubleshooting)
+
+---
 
 ## Supported policies
 
@@ -61,9 +74,9 @@ The split keeps FP32 where it is numerically useful without materially eroding c
 A canonical packed `B=4, L=2048` forward/backward audit with gradient checkpointing and BF16 compute measured the storage choice directly. Both policies produced finite loss and gradients and passed the independent packed-loss reference. GB below means 10^9 bytes.
 
 | Ordinary parameter storage | Parameter storage | Compiler peak | Compiler temporary | Measured peak device | Synchronized runtime |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| FP32 | 0.686 GB | 3.385 GB | 2.013 GB | 3.458 GB | 541.486 ms |
-| BF16 | 0.345 GB | 2.711 GB | 2.021 GB | 2.948 GB | 544.811 ms |
+| -------------------------- | ----------------: | ------------: | -----------------: | -------------------: | -------------------: |
+| FP32                       |          0.686 GB |      3.385 GB |           2.013 GB |             3.458 GB |           541.486 ms |
+| BF16                       |          0.345 GB |      2.711 GB |           2.021 GB |             2.948 GB |           544.811 ms |
 
 These single-iteration measurements are decision evidence for the canonical model and tested device, not portable memory limits or performance guarantees. They show that compact storage nearly halves parameter bytes and lowers observed total memory without materially changing runtime; compiler temporaries remain dominated by execution rather than parameter storage.
 
@@ -179,7 +192,7 @@ loss = model.compute_loss(
 Choose the largest chunk that fits the target training shape. Smaller chunks bound head intermediates more aggressively but may reduce matrix-multiplication efficiency and repeat more work during backward. Compare compiler temporaries, observed device peak, and synchronized forward/backward time rather than assuming one portable value. The production benchmark accepts the same switch:
 
 ```bash
-conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
+python benchmarks/benchmark_model_paths.py \
   --repo current=. \
   --suite training \
   --training-operations forward_backward \

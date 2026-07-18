@@ -34,18 +34,18 @@ names differ.
 Examples::
 
     # Current checkout, full default matrix.
-    conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
+    python benchmarks/benchmark_model_paths.py \
         --repo current=. \
         --output local-scratch/model-paths-current.json
 
     # Compare clean current/main worktrees with the default XLA configuration.
-    conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
+    python benchmarks/benchmark_model_paths.py \
         --repo current=. --repo main=/tmp/megalodon-jax-main \
         --suite inference --inference-lengths 64,512,2048,4096 \
         --output local-scratch/model-paths-current-vs-main.json
 
     # Small smoke run. The normal model remains canonical unless overridden.
-    conda run --name mega-jax python benchmarks/benchmark_model_paths.py \
+    python benchmarks/benchmark_model_paths.py \
         --repo current=. --suite inference --inference-operations noncached \
         --inference-lengths 8 --warmups 0 --iterations 1 --allow-dirty \
         --config-json '{"vocab_size":128,"model_dim":32,"num_layers":1,\

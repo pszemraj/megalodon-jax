@@ -154,7 +154,7 @@ save_inference_cache(cache, "cache.safetensors", config)
 cache = load_inference_cache("cache.safetensors", config)
 ```
 
-Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are model-forward continuation artifacts — not portable model checkpoints, and not complete `generate()` continuation state.
+Cache files are bound to the full configuration fingerprint and validate the exact presence/tensor schema, fixed KV capacity, batch consistency, layer count, every state dtype/shape, and the mirrored attention position/count invariant. They are model-forward continuation artifacts - not portable model checkpoints, and not complete `generate()` continuation state.
 
 Persist `GenerationState` when generation itself must resume without replaying a token:
 
