@@ -41,13 +41,13 @@ Build and validate the same artifacts locally before a release:
 
 ```bash
 conda run --name mega-jax python -m pip install build twine
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MEGALODON_JAX=0.2.1 conda run --name mega-jax python -m build
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MEGALODON_JAX=0.5.0 conda run --name mega-jax python -m build
 conda run --name mega-jax python -m twine check --strict dist/*
 ```
 
 Production versions come only from Git tags. The release workflow builds the commit recorded by the published release event rather than re-resolving its tag at job time. It accepts a stable `v`-prefixed PEP 440 tag whose recorded commit is contained in `main`, then verifies that the wheel and source distribution report the tag without the leading `v`. It has no manual-dispatch, tag-push, TestPyPI, or API-token path.
 
-Before the first PyPI release, create a GitHub environment named `pypi` with no required reviewer and restrict deployments to tags matching `v*`. Then register a pending publisher at <https://pypi.org/manage/account/publishing/> with these exact values:
+Before the first PyPI release, create a GitHub environment named `pypi` with no required reviewer and restrict deployments to tags matching `v*`. Enable GitHub release immutability before publishing; it applies only to future releases. Then register a pending publisher at <https://pypi.org/manage/account/publishing/> with these exact values:
 
 - PyPI project name: `megalodon-jax`
 - GitHub owner: `pszemraj`
@@ -55,9 +55,9 @@ Before the first PyPI release, create a GitHub environment named `pypi` with no 
 - Workflow filename: `publish.yml`
 - Environment name: `pypi`
 
-A pending publisher does not reserve the project name, so configure it immediately before the first upload. After the workflow is on the default branch, create a normal GitHub Release from the latest `main` commit. Publishing the release triggers the workflow immediately; GitHub prereleases are skipped. Do not promote an existing GitHub prerelease to a stable release by clearing its prerelease flag, because that does not emit the `published` event required by this workflow. Delete the prerelease and create a new stable GitHub Release for the same tag instead. The first PyPI release is `v0.2.1`, which produces distribution version `0.2.1` and converts the pending publisher into the project's trusted publisher.
+A pending publisher does not reserve the project name, so configure it immediately before the first upload. After the workflow is on the default branch and the external settings above are ready, create a normal GitHub Release from the latest `main` commit. Publishing the release triggers the workflow immediately; GitHub prereleases are skipped. If prerelease testing is needed, use a distinct PEP 440 prerelease tag such as `v0.5.0rc1`, then publish the stable `v0.5.0` tag as a separate release. Do not publish a stable-version tag as a GitHub prerelease or plan to reuse a published tag: immutable release tags cannot be moved or reused. The first PyPI release is `v0.5.0`, which produces distribution version `0.5.0` and converts the pending publisher into the project's trusted publisher.
 
-The build job has no OIDC permission. It transfers the validated artifacts to a separate `pypi` environment job whose only elevated permission is `id-token: write`; the publisher uploads with short-lived credentials and default PEP 740 attestations. Workflow concurrency is scoped to the release tag so a newer release cannot replace an older pending release run. PyPI files are immutable, and duplicate uploads fail rather than being silently skipped.
+The build job has no OIDC permission. It transfers the validated artifacts to a separate `pypi` environment job whose only elevated permission is `id-token: write`; the publisher uploads with short-lived credentials and default PEP 740 attestations. GitHub release immutability independently locks the source tag and release assets at publication and produces a GitHub release attestation. Workflow concurrency is scoped to the release tag so a newer release cannot replace an older pending release run. PyPI files are immutable, and duplicate uploads fail rather than being silently skipped.
 
 ## Modeling verifier
 
