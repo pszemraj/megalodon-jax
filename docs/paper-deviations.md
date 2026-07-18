@@ -2,6 +2,21 @@
 
 Paper theory, released checkpoint semantics, and intentional JAX extensions are treated as separate compatibility targets. [Upstream parity and production contracts](upstream-parity-contract.md) defines the normative boundary between them.
 
+## Named model presets
+
+Preset names are explicit because the paper 7B configuration and the released configurations are not interchangeable. With `vocab_size=32_000`, the exact trainable counts are:
+
+| Factory | SwiGLU | Chunk | RoPE base | Tied | Parameters |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `from_upstream_mega200m` | no | 2,048 | 10,000 | no | 220,627,968 |
+| `from_upstream_mega1_3b` | no | 2,048 | 10,000 | no | 1,342,832,640 |
+| `from_upstream_mega1_3b_pg19` | yes | 2,048 | 10,000 | yes | 1,327,628,288 |
+| `from_upstream_mega7_1b` | no | 2,048 | 10,000 | no | 7,117,381,632 |
+| `from_upstream_mega7_3b` | yes | 2,048 | 10,000 | no | 7,385,817,088 |
+| `from_paper_7b` | yes | 4,096 | 100,000 | no | 7,385,817,088 |
+
+`from_7b()` intentionally raises because its historical definition mixed incompatible upstream presets. Use `config.parameter_count_breakdown()` for exact counts at another vocabulary size or output width. Output tying is controlled only by the explicit `share_emb` field; it is never inferred from matching shapes.
+
 ## Released-source compatibility choices
 
 - **CEMA coefficient placement.** Paper equation (2) can be read as applying phase to both input and recurrence terms. The released implementation uses real `p = sigmoid(alpha)` and places phase in complex `q = polar(1 - alpha * delta, theta)`. JAX follows the released behavior so original checkpoints retain their meaning.
