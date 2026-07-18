@@ -45,7 +45,7 @@ SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MEGALODON_JAX=0.2.1 conda run --name mega-jax
 conda run --name mega-jax python -m twine check --strict dist/*
 ```
 
-Production versions come only from Git tags. The release workflow accepts a stable `v`-prefixed PEP 440 tag whose commit is contained in `main`, then verifies that the wheel and source distribution report the tag without the leading `v`. It has no manual-dispatch, tag-push, TestPyPI, or API-token path.
+Production versions come only from Git tags. The release workflow builds the commit recorded by the published release event rather than re-resolving its tag at job time. It accepts a stable `v`-prefixed PEP 440 tag whose recorded commit is contained in `main`, then verifies that the wheel and source distribution report the tag without the leading `v`. It has no manual-dispatch, tag-push, TestPyPI, or API-token path.
 
 Before the first PyPI release, create a GitHub environment named `pypi` with no required reviewer and restrict deployments to tags matching `v*`. Then register a pending publisher at <https://pypi.org/manage/account/publishing/> with these exact values:
 
