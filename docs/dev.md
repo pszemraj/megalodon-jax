@@ -78,9 +78,9 @@ The verifier writes explicit skipped results and exits nonzero when an executed 
 
 `benchmarks/benchmark_model_paths.py` measures synchronized production inference and training paths in isolated worker processes. Compilation is reported separately from runtime, and the output records repository revisions, configuration, environment, correctness checks, median, p90, and memory data.
 
-### Reference optimization environment
+### Benchmark comparability
 
-The 2026-07 optimization work is pinned to the [recorded reference environment](optimization-reference-environment.txt): RTX 5090, NVIDIA driver 595.71.05, Python 3.12.13, JAX/jaxlib 0.10.2 with the pip-managed CUDA 13 plugin stack, and Equinox 0.13.8. The snapshot records the complete resolved Python package set at base revision `4445209`. It is benchmark provenance rather than a replacement for the supported dependency ranges in `pyproject.toml`; do not mix a driver, CUDA, Python, JAX, Equinox, or attention-backend change into a comparison against this optimization series.
+Performance comparisons are meaningful only under a consistent hardware and software setup. Record the repository revision, accelerator, core dependency versions, attention backend, and compiler settings with each result; after changing any of them, establish a new baseline.
 
 The benchmark evidence rules implement the normative [upstream parity and production contracts](upstream-parity-contract.md), including the requirement that packed CEMA be both isolated and useful at downstream training shapes.
 
