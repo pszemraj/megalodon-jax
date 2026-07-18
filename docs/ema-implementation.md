@@ -23,6 +23,8 @@ The JAX version provides four execution paths:
 
 ### Path selection
 
+The dispatch below is the fine-grained version of the same four paths, split by the conditions that select them:
+
 - **Segmented** when `segment_ids` is provided (incompatible with `h_init`; training-only)
 - **FFT output only** when `h_init is None` and `return_state is False`
 - **Sequential output/state** when `h_init` is provided and the static sequence length is below 32
@@ -42,7 +44,7 @@ For an incoming state `h_init`, the released source computes long-chunk outputs 
 h_L = q**L * h_init + p * sum(x[L - 1 - j] * q**j, j=0..L-1)
 ```
 
-The JAX path uses explicit real/imaginary multiply-reductions instead of a complex batched dot because the latter caused an excessive cuBLAS autotuning allocation at target shapes. Coefficient powers are generated in blocks of at most 4,096 positions and each final-state block is reduced immediately. The 32-token switch is shape-static, so it does not add data-dependent dispatch inside a compiled call. It keeps tokenwise generation on the low-overhead recurrence while removing a serial sequence loop from prompt prefill and substantial cache updates.
+The JAX path uses explicit real/imaginary multiply-reductions instead of a complex batched dot because the latter caused an excessive cuBLAS autotuning allocation at target shapes. Coefficient powers are generated in blocks of at most 4,096 positions and each final-state block is reduced immediately. The 32-token switch is shape-static, so it does not add data-dependent dispatch inside a compiled call. It keeps tokenwise generation on the low-overhead recurrence while removing a serial sequence loop from prompt prefill and from substantial cache updates.
 
 ## Segmented path
 
@@ -62,26 +64,26 @@ The sequential path has a compact forward carry, but automatic differentiation c
 The hybrid continuation boundary was measured at `B=1, D=1024, N=16` on the reference RTX 5090. These figures are decision evidence rather than portable thresholds.
 
 | Cached chunk length | FFT/bias/parallel-state | Sequential recurrence |
-|---:|---:|---:|
-| 1 | 0.075 ms | 0.053 ms |
-| 32 | 0.074 ms | 0.232 ms |
-| 512 | 0.262 ms | 2.945 ms |
-| 2,048 | 1.291 ms | 11.46 ms |
+| ------------------: | ----------------------: | --------------------: |
+|                   1 |                0.075 ms |              0.053 ms |
+|                  32 |                0.074 ms |              0.232 ms |
+|                 512 |                0.262 ms |              2.945 ms |
+|               2,048 |                1.291 ms |              11.46 ms |
 
 The production benchmark confirmed the effect on the canonical 12-layer, 171M-parameter model with FP32 ordinary storage and BF16 compute at `B=1, L=2048`. Each row passed the operation's independent correctness gate.
 
-| Production cache operation | Before hybrid | Hybrid | Compiler temporary before | Compiler temporary hybrid |
-|---|---:|---:|---:|---:|
-| Pristine prefill | 87.73 ms | 14.47 ms | 293.8 MB | 326.4 MB |
-| Continuation, 37 tokens | 12.79 ms | 12.25 ms | 85.4 MB | 6.3 MB |
-| Decode, 1 token | 3.11 ms | 3.20 ms | 0.04 MB | 0.04 MB |
+| Production cache operation | Before hybrid |   Hybrid | Compiler temporary before | Compiler temporary hybrid |
+| -------------------------- | ------------: | -------: | ------------------------: | ------------------------: |
+| Pristine prefill           |      87.73 ms | 14.47 ms |                  293.8 MB |                  326.4 MB |
+| Continuation, 37 tokens    |      12.79 ms | 12.25 ms |                   85.4 MB |                    6.3 MB |
+| Decode, 1 token            |       3.11 ms |  3.20 ms |                   0.04 MB |                   0.04 MB |
 
 The mapped/scanned power-block schedule was also compiled well beyond the 4,096-token block boundary. These are isolated single-layer component measurements with full parameter and input differentiation, not full-model feasibility claims.
 
-| Isolated shape | Pristine prefill | Continuation | Full forward/backward |
-|---|---:|---:|---:|
-| `B=1, D=1024, N=16, L=32768` | 13.82 ms / 806 MB | 15.87 ms / 940 MB | 19.81 ms / 1,342 MB |
-| `B=1, D=4096, N=16, L=16384` | 21.39 ms / 2,418 MB | 25.39 ms / 2,417 MB | 30.35 ms / 3,359 MB |
+| Isolated shape               |    Pristine prefill |        Continuation | Full forward/backward |
+| ---------------------------- | ------------------: | ------------------: | --------------------: |
+| `B=1, D=1024, N=16, L=32768` |   13.82 ms / 806 MB |   15.87 ms / 940 MB |   19.81 ms / 1,342 MB |
+| `B=1, D=4096, N=16, L=16384` | 21.39 ms / 2,418 MB | 25.39 ms / 2,417 MB |   30.35 ms / 3,359 MB |
 
 Each cell reports synchronized runtime and compiler temporary memory; every result and gradient was finite. The temporary sizes are consistent with one rematerialized power block plus FFT/output workspace rather than a retained `D * N * L` complex tensor.
 

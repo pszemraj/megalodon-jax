@@ -17,10 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
           cache: pip
@@ -29,6 +29,136 @@ jobs:
         run: ruff check .
       - name: Check preview formatting
         run: ruff format --preview --check .
+
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install packaging tools
+        run: python -m pip install build packaging twine
+      - name: Build distributions
+        run: python -m build
+      - name: Check distribution metadata
+        run: python -m twine check --strict dist/*
+      - name: Validate wheel runtime profiles
+        run: |
+          python - <<'PY'
+          from email.parser import BytesParser
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          from packaging.requirements import Requirement
+          from packaging.specifiers import SpecifierSet
+          from packaging.utils import canonicalize_name
+
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found {wheels!r}")
+          if len(sdists) != 1:
+              raise SystemExit(f"expected one sdist, found {sdists!r}")
+
+          wheel = wheels[0]
+          if not wheel.name.endswith("-py3-none-any.whl"):
+              raise SystemExit(f"expected a py3-none-any wheel, found {wheel.name!r}")
+          with ZipFile(wheel) as archive:
+              metadata_paths = [
+                  name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+              ]
+              wheel_paths = [
+                  name for name in archive.namelist() if name.endswith(".dist-info/WHEEL")
+              ]
+              if len(metadata_paths) != 1:
+                  raise SystemExit(
+                      f"expected one .dist-info/METADATA in {wheel}, found {metadata_paths!r}"
+                  )
+              if len(wheel_paths) != 1:
+                  raise SystemExit(
+                      f"expected one .dist-info/WHEEL in {wheel}, found {wheel_paths!r}"
+                  )
+              metadata_path = metadata_paths[0]
+              wheel_path = wheel_paths[0]
+              metadata = BytesParser().parsebytes(archive.read(metadata_path))
+              wheel_metadata = archive.read(wheel_path).decode()
+
+          if metadata["Name"] != "megalodon-jax":
+              raise SystemExit(f"unexpected wheel project name: {metadata['Name']!r}")
+          if "Root-Is-Purelib: true" not in wheel_metadata:
+              raise SystemExit(f"{wheel} is not marked as a purelib wheel")
+          if "Tag: py3-none-any" not in wheel_metadata:
+              raise SystemExit(f"{wheel} does not declare the py3-none-any compatibility tag")
+
+          requirements = [Requirement(value) for value in metadata.get_all("Requires-Dist", [])]
+          jax_requirements = [
+              requirement
+              for requirement in requirements
+              if canonicalize_name(requirement.name) == "jax"
+          ]
+          base = [requirement for requirement in jax_requirements if requirement.marker is None]
+          cuda13 = [
+              requirement
+              for requirement in jax_requirements
+              if requirement.extras == {"cuda13"}
+              and requirement.marker is not None
+              and requirement.marker.evaluate({"extra": "cuda13"})
+          ]
+          if len(base) != 1:
+              raise SystemExit(
+                  f"expected one unmarked base JAX requirement, found {jax_requirements!r}"
+              )
+          if len(cuda13) != 1:
+              raise SystemExit(
+                  f"expected one cuda13-extra JAX requirement, found {jax_requirements!r}"
+              )
+
+          # Keep this independent of pyproject.toml so a JAX-bound change requires an explicit
+          # review of the supported runtime profiles rather than silently weakening this gate.
+          expected_jax_specifier = SpecifierSet(">=0.10.2,<0.11")
+          if base[0].specifier != expected_jax_specifier:
+              raise SystemExit(
+                  f"base JAX requirement has {base[0].specifier}, expected {expected_jax_specifier}"
+              )
+          if cuda13[0].specifier != expected_jax_specifier:
+              raise SystemExit(
+                  "cuda13 JAX requirement has "
+                  f"{cuda13[0].specifier}, expected {expected_jax_specifier}"
+              )
+          if "cuda13" not in metadata.get_all("Provides-Extra", []):
+              raise SystemExit("wheel metadata does not provide the cuda13 extra")
+
+          unsupported = [
+              requirement
+              for requirement in jax_requirements
+              if "cuda12" in str(requirement).lower()
+              or "cuda13-local" in str(requirement).lower()
+          ]
+          if unsupported:
+              raise SystemExit(f"unsupported JAX runtime profiles found: {unsupported!r}")
+          PY
+      - name: Install and smoke-test the default CPU profile
+        run: |
+          python -m pip install dist/*.whl
+          cd /tmp
+          JAX_PLATFORMS=cpu python - <<'PY'
+          import importlib.metadata
+
+          import jax
+          import jax.numpy as jnp
+          import megalodon_jax
+
+          assert importlib.metadata.version("megalodon-jax")
+          assert megalodon_jax.__file__ is not None
+          assert jax.default_backend() == "cpu"
+          result = (jnp.ones((2, 2)) @ jnp.ones((2, 2))).block_until_ready()
+          assert result.tolist() == [[2.0, 2.0], [2.0, 2.0]]
+          PY
 
   fast-correctness:
     runs-on: ubuntu-latest
@@ -44,10 +174,10 @@ jobs:
             jax: "0.10.2"
             equinox: "0.13.8"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
